@@ -27,14 +27,12 @@ jobs:
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "./tauri-app/src-tauri -> target"
+          workspaces: "./src-tauri -> target"
 
       - name: Install frontend dependencies
-        working-directory: tauri-app
         run: npm install
 
       - name: Sync tag version to project
-        working-directory: tauri-app
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
@@ -65,7 +63,6 @@ jobs:
           $tauriConfig | ConvertTo-Json -Depth 20 | Set-Content $tauriConfigPath -Encoding utf8
 
       - name: Build Windows installer
-        working-directory: tauri-app
         run: npm run tauri:build
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -75,7 +72,7 @@ jobs:
       - name: Generate latest.json
         shell: pwsh
         run: |
-          $bundleDir = "tauri-app/src-tauri/target/release/bundle/nsis"
+          $bundleDir = "src-tauri/target/release/bundle/nsis"
           $sigPath = Get-ChildItem -Path $bundleDir -Filter "*.sig" | Select-Object -First 1
           if ($null -eq $sigPath) { Write-Error "Signature file not found"; exit 1 }
           $sig = Get-Content -Path $sigPath.FullName -Raw
@@ -101,9 +98,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            tauri-app/src-tauri/target/release/bundle/nsis/*.exe
-            tauri-app/src-tauri/target/release/bundle/nsis/*.zip
-            tauri-app/src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.zip
+            src-tauri/target/release/bundle/nsis/*.sig
             latest.json
           draft: false
           prerelease: false
