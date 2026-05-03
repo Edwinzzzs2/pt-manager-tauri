@@ -24,27 +24,6 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Clear local proxy settings
-        shell: pwsh
-        run: |
-          $proxyNames = @(
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "CARGO_HTTP_PROXY"
-          )
-
-          foreach ($name in $proxyNames) {
-            "$name=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
-          }
-
-          git config --global --unset-all http.proxy 2>$null
-          git config --global --unset-all https.proxy 2>$null
-
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
         with:
