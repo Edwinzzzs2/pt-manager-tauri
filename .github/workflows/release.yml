@@ -30,7 +30,7 @@ jobs:
           workspaces: "./src-tauri -> target"
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm install
 
       - name: Sync tag version to project
         shell: pwsh
