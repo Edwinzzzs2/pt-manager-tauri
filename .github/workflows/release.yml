@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./tauri-app/src-tauri -> target"
+
+      - name: Install frontend dependencies
+        working-directory: tauri-app
+        run: npm install
+
+      - name: Sync tag version to project
+        working-directory: tauri-app
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+
+          npm version $version --no-git-tag-version
+
+          $cargoPath = "src-tauri/Cargo.toml"
+          $lines = Get-Content $cargoPath
+          $inPackage = $false
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\[package\]$') {
+              $inPackage = $true
+              continue
+            }
+            if ($inPackage -and $lines[$i] -match '^\[') {
+              break
+            }
+            if ($inPackage -and $lines[$i] -match '^version\s*=') {
+              $lines[$i] = "version = `"$version`""
+              break
+            }
+          }
+          Set-Content -Path $cargoPath -Value $lines -Encoding utf8
+
+          $tauriConfigPath = "src-tauri/tauri.conf.json"
+          $tauriConfig = Get-Content $tauriConfigPath -Raw | ConvertFrom-Json
+          $tauriConfig.version = $version
+          $tauriConfig | ConvertTo-Json -Depth 20 | Set-Content $tauriConfigPath -Encoding utf8
+
+      - name: Build Windows installer
+        working-directory: tauri-app
+        run: npm run tauri:build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Generate latest.json
+        shell: pwsh
+        run: |
+          $bundleDir = "tauri-app/src-tauri/target/release/bundle/nsis"
+          $sigPath = Get-ChildItem -Path $bundleDir -Filter "*.sig" | Select-Object -First 1
+          if ($null -eq $sigPath) { Write-Error "Signature file not found"; exit 1 }
+          $sig = Get-Content -Path $sigPath.FullName -Raw
+
+          $exePath = Get-ChildItem -Path $bundleDir -Filter "*.exe" | Select-Object -First 1
+          if ($null -eq $exePath) { Write-Error "Installer .exe not found"; exit 1 }
+          $exeName = $exePath.Name
+
+          $latestJson = @{
+            version = $env:GITHUB_REF_NAME
+            notes = "Update to $($env:GITHUB_REF_NAME)"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = $sig.Trim()
+                url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$exeName"
+              }
+            }
+          }
+          $latestJson | ConvertTo-Json -Depth 5 -Compress | Set-Content "latest.json" -Encoding utf8
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tauri-app/src-tauri/target/release/bundle/nsis/*.exe
+            tauri-app/src-tauri/target/release/bundle/nsis/*.zip
+            tauri-app/src-tauri/target/release/bundle/nsis/*.sig
+            latest.json
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
