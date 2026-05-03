@@ -63,7 +63,7 @@ jobs:
           $tauriConfig | ConvertTo-Json -Depth 20 | Set-Content $tauriConfigPath -Encoding utf8
 
       - name: Build Windows installer
-        run: npm run tauri:build
+        run: npm run tauri -- build
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
