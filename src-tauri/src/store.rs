@@ -24,6 +24,9 @@ pub struct Site {
 pub struct AppConfig {
     pub sites: Vec<Site>,
     pub cron: String,
+    /// 在 Cron 触发时间基础上额外偏移的分钟数（可为负数）
+    #[serde(default)]
+    pub cron_offset_minutes: i64,
     pub cdp_port: u16,
     pub visit_duration: u64,
     pub random_delay: bool,
@@ -48,6 +51,7 @@ impl Default for AppConfig {
         Self {
             sites: vec![],
             cron: "0 9 * * *".to_string(),
+            cron_offset_minutes: 0,
             cdp_port: 9222,
             visit_duration: 30,
             random_delay: true,

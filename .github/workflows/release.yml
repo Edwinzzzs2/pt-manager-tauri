@@ -63,21 +63,20 @@ jobs:
           $tauriConfig | ConvertTo-Json -Depth 20 | Set-Content $tauriConfigPath -Encoding utf8
 
       - name: Build Windows installer
-        run: npm run tauri -- build
+        run: npm run tauri:build
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Generate latest.json
         shell: pwsh
         run: |
-          $bundleDir = "src-tauri/target/release/bundle/nsis"
-          $sigPath = Get-ChildItem -Path $bundleDir -Filter "*.sig" | Select-Object -First 1
+          $sigPath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.sig" | Select-Object -First 1
           if ($null -eq $sigPath) { Write-Error "Signature file not found"; exit 1 }
           $sig = Get-Content -Path $sigPath.FullName -Raw
 
-          $exePath = Get-ChildItem -Path $bundleDir -Filter "*.exe" | Select-Object -First 1
+          # Tauri 2 NSIS builds produce a .exe installer (not .zip), find it directly
+          $exePath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
           if ($null -eq $exePath) { Write-Error "Installer .exe not found"; exit 1 }
           $exeName = $exePath.Name
 

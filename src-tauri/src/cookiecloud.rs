@@ -66,31 +66,18 @@ pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
     ))
 }
 
-/// CookieCloud 返回的数据按域名分组；这里只挑出当前站点需要的 Cookie，再转换成 CDP 入参。
+/// 把 CookieCloud 返回的所有 cookie 转换成 CDP 入参，直接全量写入 Chrome。
 pub fn cookies_for_sites(
     cookie_data: Value,
-    sites: &[Site],
+    _sites: &[Site],
 ) -> Result<Vec<CdpCookieParam>, String> {
     let data = serde_json::from_value::<HashMap<String, Vec<CookieCloudCookie>>>(cookie_data)
         .map_err(|err| format!("CookieCloud cookie_data 格式解析失败：{}", err))?;
-    let site_hosts = sites
-        .iter()
-        .filter_map(|site| host_from_url(&site.url))
-        .collect::<Vec<_>>();
-    if site_hosts.is_empty() {
-        return Err("请先配置至少一个有效站点 URL".to_string());
-    }
 
     let mut result = Vec::new();
-    for (domain_key, cookies) in data {
+    for (domain_key, cookies) in &data {
         for cookie in cookies {
             let domain = cookie.domain.clone().unwrap_or_else(|| domain_key.clone());
-            if !site_hosts
-                .iter()
-                .any(|site_host| domain_matches(site_host, &domain))
-            {
-                continue;
-            }
 
             let Some(url) = cookie_url(
                 &domain,
@@ -100,21 +87,25 @@ pub fn cookies_for_sites(
                 continue;
             };
             result.push(CdpCookieParam {
-                name: cookie.name,
-                value: cookie.value,
+                name: cookie.name.clone(),
+                value: cookie.value.clone(),
                 url,
                 domain: if cookie.host_only.unwrap_or(false) {
                     None
                 } else {
                     Some(domain)
                 },
-                path: cookie.path,
+                path: cookie.path.clone(),
                 secure: cookie.secure,
                 http_only: cookie.http_only,
                 same_site: normalize_same_site(cookie.same_site.as_deref()),
                 expires: cookie.expiration_date,
             });
         }
+    }
+
+    if result.is_empty() {
+        return Err("CookieCloud 数据为空，未获取到任何 Cookie".to_string());
     }
 
     Ok(result)
@@ -309,31 +300,8 @@ fn parse_payload(text: &str) -> Result<Value, String> {
     }
 }
 
-fn host_from_url(url: &str) -> Option<String> {
-    let without_scheme = url
-        .trim()
-        .strip_prefix("https://")
-        .or_else(|| url.trim().strip_prefix("http://"))?;
-    let host = without_scheme
-        .split(['/', ':', '?', '#'])
-        .next()?
-        .trim()
-        .to_ascii_lowercase();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host)
-    }
-}
 
-fn domain_matches(site_host: &str, cookie_domain: &str) -> bool {
-    let normalized = cookie_domain
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    !normalized.is_empty()
-        && (site_host == normalized || site_host.ends_with(&format!(".{}", normalized)))
-}
+
 
 fn cookie_url(domain: &str, secure: bool, path: Option<&str>) -> Option<String> {
     let host = domain.trim().trim_start_matches('.');

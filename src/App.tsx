@@ -34,6 +34,7 @@ type Site = {
 type AppConfig = {
   sites: Site[];
   cron: string;
+  cron_offset_minutes: number;
   cdp_port: number;
   visit_duration: number;
   random_delay: boolean;
@@ -75,6 +76,7 @@ type TabKey = "dashboard" | "sites" | "settings" | "logs";
 const defaultConfig: AppConfig = {
   sites: [],
   cron: "0 9 * * *",
+  cron_offset_minutes: 0,
   cdp_port: 9222,
   visit_duration: 30,
   random_delay: true,
@@ -305,6 +307,7 @@ function App() {
       visit_duration: Math.max(5, Number(settingsDraft.visit_duration) || 30),
       log_retention: clampNumber(Number(settingsDraft.log_retention) || 500, 50, 5000),
       cron: settingsDraft.cron.trim() || defaultConfig.cron,
+      cron_offset_minutes: Number(settingsDraft.cron_offset_minutes) || 0,
     };
 
     setBusy(true);
@@ -934,7 +937,22 @@ function SettingsPanel({
             <span>Cron 表达式</span>
             <input
               onChange={(event) => onChange({ ...draft, cron: event.target.value })}
+              placeholder="0 9 * * *"
               value={draft.cron}
+            />
+          </label>
+          <label>
+            <span>执行时间偏移（分钟）</span>
+            <input
+              min={-1440}
+              max={1440}
+              onChange={(event) =>
+                onChange({ ...draft, cron_offset_minutes: Number(event.target.value) })
+              }
+              placeholder="0"
+              title="在 Cron 计划时间基础上提前（负数）或延后（正数）的分钟数，例如 -5 表示提前 5 分钟"
+              type="number"
+              value={draft.cron_offset_minutes}
             />
           </label>
           <label>

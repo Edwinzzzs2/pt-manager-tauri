@@ -7,6 +7,8 @@
     "dev": "vite",
     "desktop": "tauri dev",
     "tauri:dev": "tauri dev",
+    "tauri:build": "scripts\\tauri-build.cmd",
+    "tauri:build:raw": "tauri build",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
