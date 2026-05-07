@@ -79,7 +79,9 @@ jobs:
           # Tauri 2 NSIS builds produce a .exe installer (not .zip), find it directly
           $exePath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
           if ($null -eq $exePath) { Write-Error "Installer .exe not found"; exit 1 }
-          $exeName = $exePath.Name
+          $safeExeName = "PT-Manager-$env:GITHUB_REF_NAME-x64-setup.exe"
+          $safeExePath = Join-Path $exePath.DirectoryName $safeExeName
+          Move-Item -LiteralPath $exePath.FullName -Destination $safeExePath -Force
 
           $latestJson = @{
             version = $env:GITHUB_REF_NAME
@@ -88,7 +90,7 @@ jobs:
             platforms = @{
               "windows-x86_64" = @{
                 signature = $sig.Trim()
-                url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$exeName"
+                url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$safeExeName"
               }
             }
           }
