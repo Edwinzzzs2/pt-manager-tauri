@@ -132,8 +132,8 @@ async fn run_keepalive_inner(
                 push_log(
                     logs,
                     LogEntry::success(format!(
-                        "保活前 CookieCloud 自动同步完成：匹配 {} 个，写入 {} 个",
-                        matched, imported
+                        "保活前 CookieCloud 自动同步完成：{} 条 Cookie 已写入（共 {} 条匹配）",
+                        imported, matched
                     )),
                 )
                 .await;
@@ -352,6 +352,13 @@ async fn sync_cookiecloud_before_keepalive(
         }
     };
     let imported = CdpClient::new(active_port).set_cookies(&cookie_params).await?;
+
+    // Cookie 写入后刷新已打开的站点页面，使新 Cookie 在保活执行前立即生效。
+    let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
+    CdpClient::new(active_port)
+        .reload_tabs_for_sites(&site_urls)
+        .await;
+
     Ok((cookie_params.len(), imported))
 }
 

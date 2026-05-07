@@ -66,23 +66,53 @@ pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
     ))
 }
 
-/// 把 CookieCloud 返回的所有 cookie 转换成 CDP 入参，直接全量写入 Chrome。
+/// 只把 CookieCloud 中与已配置站点域名匹配的 Cookie 转换成 CDP 入参。
 pub fn cookies_for_sites(
     cookie_data: Value,
-    _sites: &[Site],
+    sites: &[Site],
 ) -> Result<Vec<CdpCookieParam>, String> {
     let data = serde_json::from_value::<HashMap<String, Vec<CookieCloudCookie>>>(cookie_data)
         .map_err(|err| format!("CookieCloud cookie_data 格式解析失败：{}", err))?;
+
+    // 提取所有配置站点的 host，用于域名匹配过滤。
+    let site_hosts: Vec<String> = sites
+        .iter()
+        .filter_map(|s| host_from_url(&s.url))
+        .collect();
 
     let mut result = Vec::new();
     for (domain_key, cookies) in &data {
         for cookie in cookies {
             let domain = cookie.domain.clone().unwrap_or_else(|| domain_key.clone());
+            let cookie_host = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+
+            // 只保留与配置站点域名匹配的 Cookie（任一条件满足即可）：
+            // 1. 完全相同
+            // 2. 站点是 Cookie 域的子域名（如站点 pt.example.com，Cookie 域 example.com）
+            // 3. Cookie 是站点域的子域名（如站点 example.com，Cookie 域 sub.example.com）
+            let matched = site_hosts.iter().any(|site_host| {
+                site_host == &cookie_host
+                    || site_host.ends_with(&format!(".{}", cookie_host))
+                    || cookie_host.ends_with(&format!(".{}", site_host))
+            });
+            if !matched {
+                continue;
+            }
+
+            let is_secure = cookie.secure.unwrap_or(false);
+            let same_site = normalize_same_site(cookie.same_site.as_deref());
+
+            // Chrome 规范：SameSite=None 的 Cookie 必须同时标记 Secure=true，
+            // 否则 Network.setCookie 会静默返回 success:false。
+            let effective_secure = if same_site.as_deref() == Some("None") {
+                Some(true)
+            } else {
+                cookie.secure
+            };
 
             let Some(url) = cookie_url(
                 &domain,
-                cookie.secure.unwrap_or(false),
-                cookie.path.as_deref(),
+                is_secure,
             ) else {
                 continue;
             };
@@ -96,19 +126,33 @@ pub fn cookies_for_sites(
                     Some(domain)
                 },
                 path: cookie.path.clone(),
-                secure: cookie.secure,
+                secure: effective_secure,
                 http_only: cookie.http_only,
-                same_site: normalize_same_site(cookie.same_site.as_deref()),
+                same_site,
                 expires: cookie.expiration_date,
             });
         }
     }
 
     if result.is_empty() {
-        return Err("CookieCloud 数据为空，未获取到任何 Cookie".to_string());
+        return Err("CookieCloud 未匹配到当前已配置站点的 Cookie，请确认站点 URL 与 CookieCloud 中的域名一致".to_string());
     }
 
     Ok(result)
+}
+
+/// 从 URL 中提取小写 host。
+fn host_from_url(url: &str) -> Option<String> {
+    let without_scheme = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    let host = without_scheme
+        .split(['/', ':', '?', '#'])
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty() { None } else { Some(host) }
 }
 
 fn request_cookiecloud_payload(endpoint: &str, password: &str) -> Result<Value, String> {
@@ -303,15 +347,16 @@ fn parse_payload(text: &str) -> Result<Value, String> {
 
 
 
-fn cookie_url(domain: &str, secure: bool, path: Option<&str>) -> Option<String> {
+fn cookie_url(domain: &str, secure: bool) -> Option<String> {
     let host = domain.trim().trim_start_matches('.');
     if host.is_empty() {
         return None;
     }
 
+    // 通配域名（原始以 '.' 开头）的 url 只需要 scheme://host/，
+    // 不能带具体 path，否则 Chrome 可能因路径不匹配而拒绝写入。
     let scheme = if secure { "https" } else { "http" };
-    let path = path.unwrap_or("/");
-    Some(format!("{}://{}{}", scheme, host, path))
+    Some(format!("{}://{}/", scheme, host))
 }
 
 fn percent_encode(value: &str) -> String {

@@ -279,6 +279,50 @@ impl CdpClient {
         Ok(imported)
     }
 
+    /// Cookie 写入后，对 Chrome 中已打开的目标站点页面执行刷新，
+    /// 使新 Cookie 立即生效——否则用户看到的仍是旧的未登录状态。
+    pub async fn reload_tabs_for_sites(&self, site_urls: &[String]) {
+        let response = match self.request("GET", "/json/list", Duration::from_secs(5)) {
+            Ok(resp) => resp,
+            Err(_) => return,
+        };
+        if !(200..300).contains(&response.status) {
+            return;
+        }
+        let tabs = match serde_json::from_str::<Vec<CdpTab>>(&response.body) {
+            Ok(tabs) => tabs,
+            Err(_) => return,
+        };
+
+        for tab in tabs
+            .iter()
+            .filter(|tab| tab.tab_type.as_deref() == Some("page"))
+        {
+            let Some(tab_url) = tab.url.as_deref() else {
+                continue;
+            };
+            let Some(tab_host) = host_from_url(tab_url) else {
+                continue;
+            };
+            let matches = site_urls.iter().any(|site_url| {
+                host_from_url(site_url)
+                    .map(|site_host| site_host == tab_host)
+                    .unwrap_or(false)
+            });
+            if !matches {
+                continue;
+            }
+
+            let Some(ws_url) = tab.web_socket_debugger_url.as_deref() else {
+                continue;
+            };
+            if let Ok(mut ws) = CdpWebSocket::connect(ws_url, Duration::from_secs(5)) {
+                // 忽略刷新失败，不影响主流程
+                let _ = ws.call("Page.reload", serde_json::json!({}));
+            }
+        }
+    }
+
     async fn page_websocket_url(&self) -> Result<String, String> {
         if let Some(url) = self.find_page_websocket_url()? {
             return Ok(url);

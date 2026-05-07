@@ -214,39 +214,146 @@ async fn import_cookiecloud_cookies(
             return Err(format!("Cookie 已拉取，但写入 Chrome 失败：{}", err));
         }
     };
+
+    // Cookie 写入成功后，刷新 Chrome 中已打开的站点页面，使新 Cookie 立即生效。
+    let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
+    CdpClient::new(active_port)
+        .reload_tabs_for_sites(&site_urls)
+        .await;
+
     let result = CookieCloudSyncResult {
         matched_cookies: cookie_params.len(),
         imported_cookies,
     };
+    // 日志里的站点数按实际能使用这些 Cookie 的配置站点计算，避免把未匹配站点也报成成功。
+    let site_match = cookie_site_match_summary(&config.sites, &cookie_params);
+    let (_, detail) = cookie_summary(&cookie_params);
     push_log(
         &state.logs,
         LogEntry::success(format!(
-            "CookieCloud 同步完成：匹配 {} 个，写入 {} 个；{}",
+            "CookieCloud 同步完成：{} 个站点，共 {} 条 Cookie，成功写入 {} 条；{}；{}",
+            site_match.matched_count,
             result.matched_cookies,
             result.imported_cookies,
-            cookie_summary(&cookie_params)
+            site_match.detail,
+            detail
         )),
     )
     .await;
     Ok(result)
 }
 
-fn cookie_summary(cookies: &[crate::cdp::CdpCookieParam]) -> String {
+struct CookieSiteMatchSummary {
+    matched_count: usize,
+    detail: String,
+}
+
+fn cookie_site_match_summary(
+    sites: &[crate::store::Site],
+    cookies: &[crate::cdp::CdpCookieParam],
+) -> CookieSiteMatchSummary {
+    let matched = sites
+        .iter()
+        .filter(|site| site_has_cookie_match(site, cookies))
+        .map(|site| site.name.clone())
+        .collect::<Vec<_>>();
+    let unmatched = sites
+        .iter()
+        .filter(|site| !site_has_cookie_match(site, cookies))
+        .map(|site| site.name.clone())
+        .collect::<Vec<_>>();
+
+    let mut parts = Vec::new();
+    if !matched.is_empty() {
+        parts.push(format!("匹配站点：{}", matched.join(", ")));
+    }
+    if !unmatched.is_empty() {
+        parts.push(format!("未匹配站点：{}", unmatched.join(", ")));
+    }
+
+    CookieSiteMatchSummary {
+        matched_count: matched.len(),
+        detail: parts.join("；"),
+    }
+}
+
+fn site_has_cookie_match(site: &crate::store::Site, cookies: &[crate::cdp::CdpCookieParam]) -> bool {
+    let Some(site_host) = host_from_url(&site.url) else {
+        return false;
+    };
+
+    cookies.iter().any(|cookie| {
+        let Some(cookie_host) = cookie_host(cookie) else {
+            return false;
+        };
+        site_host == cookie_host
+            || site_host.ends_with(&format!(".{}", cookie_host))
+            || cookie_host.ends_with(&format!(".{}", site_host))
+    })
+}
+
+fn cookie_host(cookie: &crate::cdp::CdpCookieParam) -> Option<String> {
+    let raw = cookie
+        .domain
+        .as_deref()
+        .unwrap_or_else(|| cookie.url.as_str());
+    normalize_host(raw)
+}
+
+fn host_from_url(url: &str) -> Option<String> {
+    let without_scheme = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    normalize_host(without_scheme)
+}
+
+fn normalize_host(value: &str) -> Option<String> {
+    let host = value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches('.')
+        .split(['/', ':', '?', '#'])
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// 返回 (站点域名数, 详情文本)。按纯 host 分组（去掉 scheme），避免同域的 http/https Cookie 分成两条。
+fn cookie_summary(cookies: &[crate::cdp::CdpCookieParam]) -> (usize, String) {
     let mut grouped = std::collections::BTreeMap::<String, Vec<String>>::new();
     for cookie in cookies {
-        // 只记录 Cookie 名称和域名，避免把敏感的 Cookie 值写进日志。
-        let domain = cookie
+        // 优先用 domain 字段；host_only Cookie 没有 domain，用 url 但只取 host 部分。
+        let raw = cookie
             .domain
             .as_deref()
-            .unwrap_or_else(|| cookie.url.as_str())
+            .unwrap_or_else(|| cookie.url.as_str());
+        // 去掉 scheme（http:// / https://）、前缀点、端口和路径，只保留纯 host。
+        let host = raw
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
             .trim_start_matches('.')
-            .to_string();
+            .split(['/', ':', '?', '#'])
+            .next()
+            .unwrap_or(raw)
+            .to_ascii_lowercase();
+        if host.is_empty() {
+            continue;
+        }
         grouped
-            .entry(domain)
+            .entry(host)
             .or_default()
             .push(cookie.name.clone());
     }
 
+    let site_count = grouped.len();
     let details = grouped
         .into_iter()
         .map(|(domain, mut names)| {
@@ -256,7 +363,7 @@ fn cookie_summary(cookies: &[crate::cdp::CdpCookieParam]) -> String {
         })
         .collect::<Vec<_>>()
         .join("；");
-    format!("详情：{}", details)
+    (site_count, format!("详情：{}", details))
 }
 
 fn is_connection_refused(message: &str) -> bool {
