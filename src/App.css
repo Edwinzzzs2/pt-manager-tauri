@@ -582,6 +582,10 @@ input:focus {
   align-self: stretch;
 }
 
+.settings-form > label:not(.switch-row) {
+  grid-template-rows: auto 38px;
+}
+
 .cookiecloud-panel .panel-heading {
   align-items: flex-end;
 }
@@ -607,16 +611,62 @@ label {
 .switch-row {
   grid-template-columns: 1fr auto;
   align-items: center;
-  padding: 0 12px;
+  min-height: 57px;
+  padding: 8px 12px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--subtle-surface-soft);
+  cursor: pointer;
+}
+
+.switch-row:hover {
+  border-color: var(--accent-soft-border);
+  background: var(--subtle-surface);
+}
+
+.switch-row span {
+  align-self: center;
+  color: var(--color-fg);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .switch-row input {
-  width: 18px;
-  height: 18px;
-  accent-color: var(--color-success);
+  position: relative;
+  width: 42px;
+  height: 24px;
+  border: 1px solid var(--color-border-light);
+  border-radius: 999px;
+  appearance: none;
+  background: var(--color-bg-hover);
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+
+.switch-row input::before {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--color-fg-muted);
+  content: "";
+  transition: transform 0.16s ease, background 0.16s ease;
+}
+
+.switch-row input:checked {
+  border-color: var(--color-success);
+  background: var(--success-soft-bg);
+}
+
+.switch-row input:checked::before {
+  background: var(--color-success);
+  transform: translateX(18px);
+}
+
+.switch-row input:focus {
+  box-shadow: 0 0 0 3px var(--accent-focus-ring);
 }
 
 .settings-save {
