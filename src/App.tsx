@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { getVersion } from "@tauri-apps/api/app";
+import { getVersion, setTheme as setTauriTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
@@ -10,6 +11,7 @@ import {
   Clock3,
   Download,
   ListChecks,
+  Moon,
   PauseCircle,
   Play,
   Plus,
@@ -19,6 +21,7 @@ import {
   Settings,
   ShieldCheck,
   Square,
+  Sun,
   Trash2,
   XCircle,
   type LucideIcon,
@@ -72,6 +75,10 @@ type CookieCloudSyncResult = {
 };
 
 type TabKey = "dashboard" | "sites" | "settings" | "logs";
+type ColorMode = "dark" | "light";
+
+const themeStorageKey = "pt-manager-theme";
+const releaseTag = import.meta.env.VITE_RELEASE_TAG as string | undefined;
 
 const defaultConfig: AppConfig = {
   sites: [],
@@ -97,8 +104,22 @@ const navItems: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
   { key: "logs", label: "日志", icon: Clock3 },
 ];
 
+function readStoredTheme(): ColorMode {
+  const stored = window.localStorage.getItem(themeStorageKey);
+  return stored === "light" ? "light" : "dark";
+}
+
+async function resolveDisplayVersion() {
+  const tag = releaseTag?.trim();
+  if (tag) {
+    return tag;
+  }
+  return getVersion();
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
+  const [colorMode, setColorMode] = useState<ColorMode>(() => readStoredTheme());
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [settingsDraft, setSettingsDraft] = useState<AppConfig>(defaultConfig);
   const [status, setStatus] = useState<AppStatus | null>(null);
@@ -115,6 +136,13 @@ function App() {
   const [error, setError] = useState<string | null>(null);
 
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = colorMode;
+    window.localStorage.setItem(themeStorageKey, colorMode);
+    setTauriTheme(colorMode).catch(showError);
+    getCurrentWindow().setTheme(colorMode).catch(showError);
+  }, [colorMode]);
 
   async function refreshConfig() {
     const next = await invoke<AppConfig>("get_config");
@@ -136,9 +164,7 @@ function App() {
     refreshConfig().catch(showError);
     refreshStatus().catch(showError);
     refreshLogs().catch(showError);
-    getVersion()
-      .then((version) => setAppVersion(version))
-      .catch(showError);
+    resolveDisplayVersion().then(setAppVersion).catch(showError);
 
     const timer = window.setInterval(() => {
       refreshStatus().catch(showError);
@@ -150,6 +176,10 @@ function App() {
 
   function showError(err: unknown) {
     setError(err instanceof Error ? err.message : String(err));
+  }
+
+  function toggleColorMode() {
+    setColorMode((mode) => (mode === "dark" ? "light" : "dark"));
   }
 
   async function runNow() {
@@ -437,6 +467,14 @@ function App() {
             <h1>{pageTitle(activeTab)}</h1>
           </div>
           <div className="topbar-actions">
+            <button
+              className="icon-button theme-toggle"
+              onClick={toggleColorMode}
+              title={colorMode === "dark" ? "切换白色模式" : "切换黑色模式"}
+              type="button"
+            >
+              {colorMode === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+            </button>
             <button
               className="primary-action"
               disabled={busy || status?.is_running}

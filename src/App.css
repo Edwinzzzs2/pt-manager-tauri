@@ -4,8 +4,8 @@
   width: 100vw;
   height: 100vh;
   background:
-    linear-gradient(135deg, rgba(21, 128, 61, 0.18), transparent 32%),
-    linear-gradient(315deg, rgba(59, 130, 246, 0.16), transparent 30%),
+    linear-gradient(135deg, var(--shell-gradient-a), transparent 32%),
+    linear-gradient(315deg, var(--shell-gradient-b), transparent 30%),
     var(--color-bg);
 }
 
@@ -15,7 +15,7 @@
   gap: 28px;
   padding: 22px 16px;
   border-right: 1px solid var(--color-border);
-  background: rgba(10, 10, 12, 0.82);
+  background: var(--sidebar-surface);
   backdrop-filter: blur(18px);
 }
 
@@ -113,7 +113,7 @@ button span,
   padding: 12px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--subtle-surface);
 }
 
 .version-card {
@@ -122,7 +122,7 @@ button span,
   padding: 12px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.025);
+  background: var(--subtle-surface-soft);
 }
 
 .version-card span {
@@ -150,14 +150,14 @@ button span,
 }
 
 .version-card button:hover {
-  background: rgba(59, 130, 246, 0.18);
+  background: var(--accent-soft-bg-hover);
 }
 
 .dot {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.06);
+  box-shadow: 0 0 0 5px var(--subtle-surface-strong);
 }
 
 .dot.ok {
@@ -166,7 +166,7 @@ button span,
 
 .dot.standby {
   background: var(--color-warning);
-  box-shadow: 0 0 0 5px rgba(245, 158, 11, 0.1);
+  box-shadow: 0 0 0 5px var(--warning-soft-ring);
 }
 
 .dot.danger {
@@ -220,10 +220,29 @@ h2 {
 }
 
 .primary-action,
-.danger-action,
 .site-form button,
-.row-actions button,
 .settings-save,
+.row-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 8px;
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  cursor: pointer;
+}
+
+.primary-action:hover,
+.site-form button:hover,
+.row-actions button:hover,
+.settings-save:hover {
+  background: var(--color-accent-hover);
+}
+
+.danger-action,
 .icon-button,
 button.ghost {
   display: inline-flex;
@@ -233,26 +252,16 @@ button.ghost {
   min-height: 38px;
   padding: 0 14px;
   border-radius: 8px;
-  background: var(--color-accent);
   cursor: pointer;
 }
 
-.primary-action:hover,
-.danger-action:hover,
-.site-form button:hover,
-.row-actions button:hover,
-.settings-save:hover,
-button.ghost:hover {
-  background: var(--color-accent-hover);
-}
-
 .danger-action {
-  background: rgba(239, 68, 68, 0.18);
-  color: #fecaca;
+  background: var(--danger-soft-bg);
+  color: var(--danger-soft-fg);
 }
 
 .danger-action:hover {
-  background: rgba(239, 68, 68, 0.28);
+  background: var(--danger-soft-bg-hover);
 }
 
 button:disabled {
@@ -264,7 +273,18 @@ button:disabled {
   width: 38px;
   height: 38px;
   padding: 0;
-  background: var(--color-bg-hover);
+  background: var(--ghost-button-bg);
+  color: var(--ghost-button-fg);
+}
+
+.icon-button:hover,
+button.ghost:hover {
+  background: var(--ghost-button-bg-hover);
+}
+
+button.ghost {
+  background: var(--ghost-button-bg);
+  color: var(--ghost-button-fg);
 }
 
 .error-banner {
@@ -272,10 +292,10 @@ button:disabled {
   align-items: flex-start;
   gap: 10px;
   padding: 12px 14px;
-  border: 1px solid rgba(239, 68, 68, 0.34);
+  border: 1px solid var(--danger-soft-border);
   border-radius: 8px;
-  background: rgba(239, 68, 68, 0.13);
-  color: #fecaca;
+  background: var(--danger-soft-bg);
+  color: var(--danger-soft-fg);
   line-height: 1.55;
 }
 
@@ -283,7 +303,7 @@ button:disabled {
   flex: 0 0 auto;
   margin-left: auto;
   background: transparent;
-  color: #fecaca;
+  color: var(--danger-soft-fg);
   cursor: pointer;
 }
 
@@ -309,8 +329,8 @@ button:disabled {
 .site-row {
   border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: rgba(24, 24, 27, 0.82);
-  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.18);
+  background: var(--panel-surface);
+  box-shadow: 0 18px 42px var(--panel-shadow);
 }
 
 .metric-card {
@@ -376,8 +396,8 @@ button:disabled {
   padding: 14px;
   border: 1px solid var(--color-border-light);
   border-radius: 8px;
-  background: #060607;
-  color: #bbf7d0;
+  background: var(--command-bg);
+  color: var(--command-fg);
   font-family: var(--font-mono);
   white-space: normal;
   word-break: break-all;
@@ -416,7 +436,7 @@ button:disabled {
   padding: 6px 10px;
   border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--subtle-surface);
   cursor: help;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
@@ -463,7 +483,7 @@ input {
 
 input:focus {
   border-color: var(--color-accent);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.16);
+  box-shadow: 0 0 0 3px var(--accent-focus-ring);
 }
 
 .site-list {
@@ -507,20 +527,21 @@ input:focus {
 
 .row-actions button.ghost,
 .ghost {
-  background: var(--color-bg-hover);
+  background: var(--ghost-button-bg);
+  color: var(--ghost-button-fg);
 }
 
 .install-action {
-  background: rgba(245, 158, 11, 0.16) !important;
-  color: #fde68a;
+  background: var(--warning-soft-bg) !important;
+  color: var(--warning-soft-fg);
 }
 
 .danger-button {
   width: 38px;
   height: 38px;
   padding: 0;
-  background: rgba(239, 68, 68, 0.15) !important;
-  color: #fecaca;
+  background: var(--danger-soft-bg) !important;
+  color: var(--danger-soft-fg);
 }
 
 .empty-state {
@@ -589,7 +610,7 @@ label {
   padding: 0 12px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--subtle-surface-soft);
 }
 
 .switch-row input {
@@ -683,15 +704,15 @@ label {
   padding: 7px 10px;
   border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--subtle-surface);
   cursor: help;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
 .compact-log-row:hover,
 .log-row:hover {
-  border-color: rgba(59, 130, 246, 0.35);
-  background: rgba(59, 130, 246, 0.08);
+  border-color: var(--accent-soft-border);
+  background: var(--accent-soft-bg);
 }
 
 .log-row p {
@@ -719,18 +740,18 @@ label {
 }
 
 .badge.success {
-  background: rgba(34, 197, 94, 0.14);
-  color: #86efac;
+  background: var(--success-soft-bg);
+  color: var(--success-soft-fg);
 }
 
 .badge.error {
-  background: rgba(239, 68, 68, 0.16);
-  color: #fca5a5;
+  background: var(--danger-soft-bg);
+  color: var(--danger-soft-fg);
 }
 
 .badge.info {
-  background: rgba(59, 130, 246, 0.16);
-  color: #93c5fd;
+  background: var(--accent-soft-bg);
+  color: var(--accent-soft-fg);
 }
 
 @media (max-width: 1040px) {
