@@ -128,12 +128,12 @@ async fn run_keepalive_inner(
 
     if config.auto_sync_cookie {
         match sync_cookiecloud_before_keepalive(config, logs, task_cancel_requested).await {
-            Ok((matched, imported)) => {
+            Ok((parsed, imported)) => {
                 push_log(
                     logs,
                     LogEntry::success(format!(
-                        "保活前 CookieCloud 自动同步完成：{} 条 Cookie 已写入（共 {} 条匹配）",
-                        imported, matched
+                        "保活前 CookieCloud 自动同步完成：{} 条 Cookie 已写入（共解析 {} 条）",
+                        imported, parsed
                     )),
                 )
                 .await;
@@ -338,9 +338,9 @@ async fn sync_cookiecloud_before_keepalive(
     })
     .await
     .map_err(|err| err.to_string())??;
-    let cookie_params = cookiecloud::cookies_for_sites(cookie_data, &config.sites)?;
+    let cookie_params = cookiecloud::cookies_from_cookiecloud(cookie_data, &config.sites)?;
     if cookie_params.is_empty() {
-        return Err("CookieCloud 未匹配到当前站点的 Cookie".to_string());
+        return Err("CookieCloud 未解析到可同步的 Cookie".to_string());
     }
 
     let cdp = CdpClient::new(config.cdp_port);
@@ -351,7 +351,10 @@ async fn sync_cookiecloud_before_keepalive(
             cdp.ensure_available_with_progress(&[], &progress).await?.port
         }
     };
-    let imported = CdpClient::new(active_port).set_cookies(&cookie_params).await?;
+    let imported = CdpClient::new(active_port)
+        .set_cookies(&cookie_params)
+        .await?
+        .len();
 
     // Cookie 写入后刷新已打开的站点页面，使新 Cookie 在保活执行前立即生效。
     let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();

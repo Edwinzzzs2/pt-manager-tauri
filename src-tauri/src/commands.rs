@@ -171,9 +171,9 @@ async fn import_cookiecloud_cookies(
     config: &AppConfig,
     cookies: serde_json::Value,
 ) -> Result<CookieCloudSyncResult, String> {
-    let cookie_params = cookiecloud::cookies_for_sites(cookies, &config.sites)?;
+    let cookie_params = cookiecloud::cookies_from_cookiecloud(cookies, &config.sites)?;
     if cookie_params.is_empty() {
-        let message = "CookieCloud 未匹配到当前站点的 Cookie".to_string();
+        let message = "CookieCloud 未解析到可同步的 Cookie".to_string();
         push_log(&state.logs, LogEntry::error(message.clone())).await;
         return Err(message);
     }
@@ -192,8 +192,8 @@ async fn import_cookiecloud_cookies(
         }
     };
 
-    let imported_cookies = match CdpClient::new(active_port).set_cookies(&cookie_params).await {
-        Ok(count) => count,
+    let imported_cookie_params = match CdpClient::new(active_port).set_cookies(&cookie_params).await {
+        Ok(cookies) => cookies,
         Err(err) if is_connection_refused(&err) => {
             push_log(
                 &state.logs,
@@ -223,15 +223,15 @@ async fn import_cookiecloud_cookies(
 
     let result = CookieCloudSyncResult {
         matched_cookies: cookie_params.len(),
-        imported_cookies,
+        imported_cookies: imported_cookie_params.len(),
     };
-    // 日志里的站点数按实际能使用这些 Cookie 的配置站点计算，避免把未匹配站点也报成成功。
-    let site_match = cookie_site_match_summary(&config.sites, &cookie_params);
-    let (_, detail) = cookie_summary(&cookie_params);
+    // 日志里的站点数按成功写入的 Cookie 计算，避免把 CDP 拒绝写入的 Cookie 也报成可用。
+    let site_match = cookie_site_match_summary(&config.sites, &imported_cookie_params);
+    let (_, detail) = cookie_summary(&imported_cookie_params);
     push_log(
         &state.logs,
         LogEntry::success(format!(
-            "CookieCloud 同步完成：{} 个站点，共 {} 条 Cookie，成功写入 {} 条；{}；{}",
+            "CookieCloud 同步完成：匹配 {} 个站点，共解析 {} 条 Cookie，成功写入 {} 条；{}；{}",
             site_match.matched_count,
             result.matched_cookies,
             result.imported_cookies,
@@ -363,7 +363,12 @@ fn cookie_summary(cookies: &[crate::cdp::CdpCookieParam]) -> (usize, String) {
         })
         .collect::<Vec<_>>()
         .join("；");
-    (site_count, format!("详情：{}", details))
+    let detail = if details.is_empty() {
+        "导入 Cookie：无".to_string()
+    } else {
+        format!("导入 Cookie：{}", details)
+    };
+    (site_count, detail)
 }
 
 fn is_connection_refused(message: &str) -> bool {

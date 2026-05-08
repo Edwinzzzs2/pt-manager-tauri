@@ -253,14 +253,17 @@ impl CdpClient {
             .map(|tab| tab.id)
     }
 
-    pub async fn set_cookies(&self, cookies: &[CdpCookieParam]) -> Result<usize, String> {
+    pub async fn set_cookies(
+        &self,
+        cookies: &[CdpCookieParam],
+    ) -> Result<Vec<CdpCookieParam>, String> {
         if cookies.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         let websocket_url = self.page_websocket_url().await?;
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
-        let mut imported = 0;
+        let mut imported = Vec::new();
 
         for cookie in cookies {
             let params = serde_json::to_value(cookie)
@@ -272,7 +275,7 @@ impl CdpClient {
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
             if success {
-                imported += 1;
+                imported.push(cookie.clone());
             }
         }
 

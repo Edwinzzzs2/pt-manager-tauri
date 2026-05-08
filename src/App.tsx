@@ -10,6 +10,8 @@ import {
   CheckCircle2,
   Clock3,
   Download,
+  Eye,
+  EyeOff,
   ListChecks,
   Moon,
   PauseCircle,
@@ -960,6 +962,8 @@ function SettingsPanel({
   onSyncCookieCloud: () => void;
   taskRunning: boolean;
 }) {
+  const [showCookiePassword, setShowCookiePassword] = useState(false);
+
   return (
     <div className="settings-stack">
       <section className="panel settings-card">
@@ -1047,12 +1051,6 @@ function SettingsPanel({
           </label>
         </details>
 
-        <div className="settings-actions">
-          <button className="primary-action settings-save" disabled={busy} onClick={onSave} type="button">
-            <Save size={18} />
-            <span>保存设置</span>
-          </button>
-        </div>
       </section>
 
       <section className="panel settings-card cookiecloud-panel">
@@ -1101,16 +1099,26 @@ function SettingsPanel({
           </label>
           <label>
             <span>密码</span>
-            <input
-              onChange={(event) =>
-                onChange({
-                  ...draft,
-                  cookiecloud: { ...draft.cookiecloud, password: event.target.value },
-                })
-              }
-              type="password"
-              value={draft.cookiecloud.password}
-            />
+            <div className="password-field">
+              <input
+                onChange={(event) =>
+                  onChange({
+                    ...draft,
+                    cookiecloud: { ...draft.cookiecloud, password: event.target.value },
+                  })
+                }
+                type={showCookiePassword ? "text" : "password"}
+                value={draft.cookiecloud.password}
+              />
+              <button
+                aria-label={showCookiePassword ? "隐藏密码" : "显示密码"}
+                onClick={() => setShowCookiePassword((value) => !value)}
+                title={showCookiePassword ? "隐藏密码" : "显示密码"}
+                type="button"
+              >
+                {showCookiePassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
           </label>
           <label className="switch-row">
             <span>保活前自动同步</span>
@@ -1122,6 +1130,13 @@ function SettingsPanel({
           </label>
         </div>
       </section>
+
+      <div className="settings-actions settings-actions-bottom">
+        <button className="primary-action settings-save" disabled={busy} onClick={onSave} type="button">
+          <Save size={18} />
+          <span>保存全部设置</span>
+        </button>
+      </div>
     </div>
   );
 }

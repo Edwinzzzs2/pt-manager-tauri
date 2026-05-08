@@ -486,6 +486,44 @@ input:focus {
   box-shadow: 0 0 0 3px var(--accent-focus-ring);
 }
 
+.password-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.password-field input {
+  padding-right: 43px;
+}
+
+.password-field button {
+  position: absolute;
+  right: 4px;
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+}
+
+.password-field button:hover {
+  background: var(--ghost-button-bg-hover);
+  color: var(--color-fg);
+}
+
+.password-field:focus-within input {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--accent-focus-ring);
+}
+
+.password-field input:focus {
+  box-shadow: none;
+}
+
 .site-list {
   display: grid;
   gap: 10px;
@@ -678,6 +716,11 @@ label {
   align-items: center;
   justify-content: flex-start;
   padding-top: 2px;
+}
+
+.settings-actions-bottom {
+  padding: 2px 0 6px;
+  border-top: 1px solid var(--color-border);
 }
 
 .advanced-settings {

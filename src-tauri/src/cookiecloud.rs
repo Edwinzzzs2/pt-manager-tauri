@@ -66,36 +66,20 @@ pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
     ))
 }
 
-/// 只把 CookieCloud 中与已配置站点域名匹配的 Cookie 转换成 CDP 入参。
-pub fn cookies_for_sites(
+/// 把 CookieCloud 返回的 Cookie 全部转换成 CDP 入参；站点匹配只用于同步日志统计。
+pub fn cookies_from_cookiecloud(
     cookie_data: Value,
-    sites: &[Site],
+    _sites: &[Site],
 ) -> Result<Vec<CdpCookieParam>, String> {
     let data = serde_json::from_value::<HashMap<String, Vec<CookieCloudCookie>>>(cookie_data)
         .map_err(|err| format!("CookieCloud cookie_data 格式解析失败：{}", err))?;
 
-    // 提取所有配置站点的 host，用于域名匹配过滤。
-    let site_hosts: Vec<String> = sites
-        .iter()
-        .filter_map(|s| host_from_url(&s.url))
-        .collect();
-
     let mut result = Vec::new();
     for (domain_key, cookies) in &data {
         for cookie in cookies {
-            let domain = cookie.domain.clone().unwrap_or_else(|| domain_key.clone());
+            let domain = cookie_domain(cookie, domain_key);
             let cookie_host = domain.trim().trim_start_matches('.').to_ascii_lowercase();
-
-            // 只保留与配置站点域名匹配的 Cookie（任一条件满足即可）：
-            // 1. 完全相同
-            // 2. 站点是 Cookie 域的子域名（如站点 pt.example.com，Cookie 域 example.com）
-            // 3. Cookie 是站点域的子域名（如站点 example.com，Cookie 域 sub.example.com）
-            let matched = site_hosts.iter().any(|site_host| {
-                site_host == &cookie_host
-                    || site_host.ends_with(&format!(".{}", cookie_host))
-                    || cookie_host.ends_with(&format!(".{}", site_host))
-            });
-            if !matched {
+            if cookie_host.is_empty() {
                 continue;
             }
 
@@ -135,24 +119,21 @@ pub fn cookies_for_sites(
     }
 
     if result.is_empty() {
-        return Err("CookieCloud 未匹配到当前已配置站点的 Cookie，请确认站点 URL 与 CookieCloud 中的域名一致".to_string());
+        return Err("CookieCloud 未解析到可同步的 Cookie，请确认 CookieCloud 中已有 Cookie 数据".to_string());
     }
 
     Ok(result)
 }
 
-/// 从 URL 中提取小写 host。
-fn host_from_url(url: &str) -> Option<String> {
-    let without_scheme = url
+fn cookie_domain(cookie: &CookieCloudCookie, domain_key: &str) -> String {
+    cookie
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(domain_key)
         .trim()
-        .strip_prefix("https://")
-        .or_else(|| url.trim().strip_prefix("http://"))?;
-    let host = without_scheme
-        .split(['/', ':', '?', '#'])
-        .next()?
-        .trim()
-        .to_ascii_lowercase();
-    if host.is_empty() { None } else { Some(host) }
+        .to_string()
 }
 
 fn request_cookiecloud_payload(endpoint: &str, password: &str) -> Result<Value, String> {
