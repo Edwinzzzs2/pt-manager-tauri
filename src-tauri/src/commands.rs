@@ -235,8 +235,8 @@ async fn import_cookiecloud_cookies(
         matched_local_storages: local_storage_item_count(&sync_data.local_storages),
         imported_local_storages: local_storage_item_count(&imported_local_storages),
     };
-    // 日志里的站点数按成功写入的数据计算，Cookie 或 Local Storage 任一命中都算站点匹配。
-    let site_match = site_match_summary(&config.sites, &imported_cookie_params, &imported_local_storages);
+    // 匹配站点按 CookieCloud 解析命中统计；写入数量另算，方便区分“没匹配到”和“匹配到但写入失败”。
+    let site_match = site_match_summary(&config.sites, &sync_data.cookies, &sync_data.local_storages);
     let (_, detail) = cookie_summary(&imported_cookie_params);
     let storage_detail = local_storage_summary(&imported_local_storages);
     push_log(
@@ -348,9 +348,21 @@ fn normalize_host(value: &str) -> Option<String> {
 }
 
 fn hosts_match(site_host: &str, data_host: &str) -> bool {
-    site_host == data_host
-        || site_host.ends_with(&format!(".{}", data_host))
-        || data_host.ends_with(&format!(".{}", site_host))
+    match_host(site_host) == match_host(data_host)
+}
+
+fn match_host(value: &str) -> String {
+    let host = value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches('.')
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    host.strip_prefix("www.").unwrap_or(&host).to_string()
 }
 
 /// 返回 (站点域名数, 详情文本)。按纯 host 分组（去掉 scheme），避免同域的 http/https Cookie 分成两条。

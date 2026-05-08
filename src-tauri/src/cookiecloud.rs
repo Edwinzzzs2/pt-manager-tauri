@@ -76,10 +76,10 @@ pub fn fetch_sync_payload(config: &CookieCloudConfig) -> Result<Value, String> {
     ))
 }
 
-/// 把 CookieCloud 返回的 Cookie 和 localStorage 全部转换成 CDP 入参；站点匹配只用于同步日志统计。
+/// 只把 CookieCloud 中严格匹配已配置站点的 Cookie 和 localStorage 转换成 CDP 入参。
 pub fn sync_data_from_cookiecloud(
     payload: Value,
-    _sites: &[Site],
+    sites: &[Site],
 ) -> Result<CookieCloudSyncData, String> {
     let has_payload_shape =
         payload.get("cookie_data").is_some() || payload.get("local_storage_data").is_some();
@@ -91,14 +91,14 @@ pub fn sync_data_from_cookiecloud(
         payload.clone()
     };
     let local_storage_data = payload.get("local_storage_data").cloned();
-    let cookies = cookies_from_cookie_data(cookie_data)?;
+    let cookies = cookies_from_cookie_data(cookie_data, sites)?;
     let local_storages = match local_storage_data {
-        Some(value) => local_storages_from_cookiecloud(value)?,
+        Some(value) => local_storages_from_cookiecloud(value, sites)?,
         None => Vec::new(),
     };
 
     if cookies.is_empty() && local_storages.is_empty() {
-        return Err("CookieCloud 未解析到可同步的 Cookie 或 Local Storage，请确认 CookieCloud 中已有数据".to_string());
+        return Err("CookieCloud 未匹配到已配置站点的 Cookie 或 Local Storage，请确认站点 URL 与 CookieCloud 域名一致".to_string());
     }
 
     Ok(CookieCloudSyncData {
@@ -107,16 +107,26 @@ pub fn sync_data_from_cookiecloud(
     })
 }
 
-fn cookies_from_cookie_data(cookie_data: Value) -> Result<Vec<CdpCookieParam>, String> {
+fn cookies_from_cookie_data(
+    cookie_data: Value,
+    sites: &[Site],
+) -> Result<Vec<CdpCookieParam>, String> {
     let data = serde_json::from_value::<HashMap<String, Vec<CookieCloudCookie>>>(cookie_data)
         .map_err(|err| format!("CookieCloud cookie_data 格式解析失败：{}", err))?;
+    let site_match_hosts = site_targets(sites)
+        .into_iter()
+        .map(|target| target.match_host)
+        .collect::<Vec<_>>();
 
     let mut result = Vec::new();
     for (domain_key, cookies) in &data {
         for cookie in cookies {
             let domain = cookie_domain(cookie, domain_key);
-            let cookie_host = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+            let cookie_host = match_host(&domain);
             if cookie_host.is_empty() {
+                continue;
+            }
+            if !site_match_hosts.contains(&cookie_host) {
                 continue;
             }
 
@@ -160,11 +170,13 @@ fn cookies_from_cookie_data(cookie_data: Value) -> Result<Vec<CdpCookieParam>, S
 
 fn local_storages_from_cookiecloud(
     local_storage_data: Value,
+    sites: &[Site],
 ) -> Result<Vec<CdpLocalStorageParam>, String> {
     let data = serde_json::from_value::<HashMap<String, Value>>(local_storage_data)
         .map_err(|err| format!("CookieCloud local_storage_data 格式解析失败：{}", err))?;
 
-    let mut result = Vec::new();
+    let site_targets = site_targets(sites);
+    let mut source_items = Vec::new();
     for (domain_key, value) in data {
         let host = normalize_cookie_host(&domain_key);
         if host.is_empty() {
@@ -174,14 +186,46 @@ fn local_storages_from_cookiecloud(
         if items.is_empty() {
             continue;
         }
-        result.push(CdpLocalStorageParam {
-            origin: format!("https://{}", host),
-            host,
-            items,
-        });
+        source_items.push((host, items));
     }
 
-    Ok(result)
+    Ok(site_targets
+        .iter()
+        .filter_map(|target| {
+            let items = source_items
+                .iter()
+                .find(|(source_host, _)| source_host == &target.write_host)
+                .or_else(|| {
+                    source_items
+                        .iter()
+                        .find(|(source_host, _)| match_host(source_host) == target.match_host)
+                })?
+                .1
+                .clone();
+            Some(local_storage_param(target, &items))
+        })
+        .collect())
+}
+
+struct SiteTarget {
+    write_host: String,
+    match_host: String,
+    origin: String,
+}
+
+fn site_targets(sites: &[Site]) -> Vec<SiteTarget> {
+    sites
+        .iter()
+        .filter_map(|site| site_target_from_url(&site.url))
+        .collect()
+}
+
+fn local_storage_param(target: &SiteTarget, items: &[CdpLocalStorageEntry]) -> CdpLocalStorageParam {
+    CdpLocalStorageParam {
+        origin: target.origin.clone(),
+        host: target.write_host.clone(),
+        items: items.to_vec(),
+    }
 }
 
 fn local_storage_items(value: Value) -> Vec<CdpLocalStorageEntry> {
@@ -245,6 +289,29 @@ fn normalize_cookie_host(value: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
+}
+
+fn site_target_from_url(url: &str) -> Option<SiteTarget> {
+    let clean = url.trim();
+    let (scheme, without_scheme) = clean
+        .strip_prefix("https://")
+        .map(|rest| ("https", rest))
+        .or_else(|| clean.strip_prefix("http://").map(|rest| ("http", rest)))?;
+    let host = normalize_cookie_host(without_scheme);
+    if host.is_empty() {
+        None
+    } else {
+        Some(SiteTarget {
+            origin: format!("{}://{}", scheme, host),
+            match_host: match_host(&host),
+            write_host: host,
+        })
+    }
+}
+
+fn match_host(value: &str) -> String {
+    let host = normalize_cookie_host(value);
+    host.strip_prefix("www.").unwrap_or(&host).to_string()
 }
 
 fn request_cookiecloud_payload(endpoint: &str, password: &str) -> Result<Value, String> {

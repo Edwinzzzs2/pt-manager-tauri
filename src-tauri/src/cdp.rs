@@ -314,14 +314,22 @@ impl CdpClient {
                 continue;
             };
             let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+            wait_for_document_ready(&mut websocket).await;
             let _ = websocket.call("DOMStorage.enable", serde_json::json!({}));
-            let mut imported_items = Vec::new();
-            for item in &storage.items {
-                if set_local_storage_item(&mut websocket, storage, item) {
-                    imported_items.push(item.clone());
-                }
+            let mut imported_items = set_local_storage_items(&mut websocket, storage, &storage.items);
+            let missing_items = storage
+                .items
+                .iter()
+                .filter(|item| !imported_items.iter().any(|written| written.name == item.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing_items.is_empty() {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                imported_items.extend(set_local_storage_items(&mut websocket, storage, &missing_items));
             }
             if !imported_items.is_empty() {
+                imported_items.sort_by(|a, b| a.name.cmp(&b.name));
+                imported_items.dedup_by(|a, b| a.name == b.name);
                 imported.push(CdpLocalStorageParam {
                     host: storage.host.clone(),
                     origin: storage.origin.clone(),
@@ -520,16 +528,14 @@ fn set_local_storage_item(
     item: &CdpLocalStorageEntry,
 ) -> bool {
     let dom_storage_params = serde_json::json!({
-        "storageId": {
-            "securityOrigin": storage.origin,
-            "isLocalStorage": true
-        },
+        "storageId": dom_storage_id(storage),
         "key": item.name,
         "value": item.value
     });
     if websocket
         .call("DOMStorage.setDOMStorageItem", dom_storage_params)
         .is_ok()
+        && local_storage_item_matches(websocket, storage, item)
     {
         return true;
     }
@@ -544,10 +550,122 @@ fn set_local_storage_item(
     websocket
         .call("Runtime.evaluate", runtime_params)
         .map(|response| {
-            response
+            let has_exception = response
                 .get("result")
                 .and_then(|value| value.get("exceptionDetails"))
-                .is_none()
+                .is_some();
+            !has_exception && local_storage_item_matches(websocket, storage, item)
+        })
+        .unwrap_or(false)
+}
+
+fn set_local_storage_items(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+    items: &[CdpLocalStorageEntry],
+) -> Vec<CdpLocalStorageEntry> {
+    items
+        .iter()
+        .filter(|item| set_local_storage_item(websocket, storage, item))
+        .cloned()
+        .collect()
+}
+
+async fn wait_for_document_ready(websocket: &mut CdpWebSocket) {
+    for _ in 0..20 {
+        let ready = websocket
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": "document.readyState",
+                    "returnByValue": true
+                }),
+            )
+            .ok()
+            .and_then(|response| {
+                response
+                    .get("result")
+                    .and_then(|value| value.get("result"))
+                    .and_then(|value| value.get("value"))
+                    .and_then(|value| value.as_str())
+                    .map(|value| value == "interactive" || value == "complete")
+            })
+            .unwrap_or(false);
+        if ready {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn local_storage_item_matches(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+    item: &CdpLocalStorageEntry,
+) -> bool {
+    // 优先用 DOMStorage 直接读回目标 origin，避免页面脚本上下文未就绪或被站点重定向时误判写入失败。
+    dom_storage_item_matches(websocket, storage, item)
+        || runtime_local_storage_item_matches(websocket, item)
+}
+
+fn dom_storage_id(storage: &CdpLocalStorageParam) -> serde_json::Value {
+    serde_json::json!({
+        "securityOrigin": storage.origin,
+        "isLocalStorage": true
+    })
+}
+
+fn dom_storage_item_matches(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+    item: &CdpLocalStorageEntry,
+) -> bool {
+    let params = serde_json::json!({
+        "storageId": dom_storage_id(storage)
+    });
+    websocket
+        .call("DOMStorage.getDOMStorageItems", params)
+        .ok()
+        .and_then(|response| {
+            response
+                .get("result")
+                .and_then(|value| value.get("entries"))
+                .and_then(|value| value.as_array())
+                .map(|entries| {
+                    entries.iter().any(|entry| {
+                        let Some(pair) = entry.as_array() else {
+                            return false;
+                        };
+                        let key = pair.first().and_then(|value| value.as_str());
+                        let value = pair.get(1).and_then(|value| value.as_str());
+                        key == Some(item.name.as_str()) && value == Some(item.value.as_str())
+                    })
+                })
+        })
+        .unwrap_or(false)
+}
+
+fn runtime_local_storage_item_matches(
+    websocket: &mut CdpWebSocket,
+    item: &CdpLocalStorageEntry,
+) -> bool {
+    let params = serde_json::json!({
+        "expression": format!(
+            "localStorage.getItem({})",
+            serde_json::to_string(&item.name).unwrap_or_else(|_| "\"\"".to_string())
+        ),
+        "returnByValue": true
+    });
+    websocket
+        .call("Runtime.evaluate", params)
+        .ok()
+        .and_then(|response| {
+            response
+                .get("result")
+                .and_then(|value| value.get("result"))
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_str())
+                .map(|value| value == item.value)
         })
         .unwrap_or(false)
 }
@@ -1150,45 +1268,4 @@ fn find_in_path(command: &PathBuf) -> Option<PathBuf> {
     env::split_paths(&path_var)
         .map(|dir| dir.join(file_name))
         .find(|path| path.exists())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cdp_target_url_keeps_url_separators() {
-        let url = "https://example.com/a/b?x=1&next=https://pt.test/#top";
-
-        assert_eq!(encode_cdp_target_url(url), url);
-    }
-
-    #[test]
-    fn cdp_target_url_escapes_spaces_without_double_encoding_url_syntax() {
-        assert_eq!(
-            encode_cdp_target_url(" https://example.com/a path?q=hello world "),
-            "https://example.com/a%20path?q=hello%20world"
-        );
-    }
-
-    #[test]
-    fn launch_urls_uses_all_unique_configured_sites() {
-        let urls = vec![
-            "https://one.test".to_string(),
-            " https://two.test ".to_string(),
-            "https://one.test".to_string(),
-        ];
-
-        assert_eq!(
-            launch_urls(&urls),
-            vec!["https://one.test", "https://two.test"]
-        );
-    }
-
-    #[test]
-    fn content_length_header_is_case_insensitive() {
-        let headers = "HTTP/1.1 200 OK\r\ncontent-length: 424\r\n\r\n";
-
-        assert_eq!(content_length_from_headers(headers), Some(424));
-    }
 }

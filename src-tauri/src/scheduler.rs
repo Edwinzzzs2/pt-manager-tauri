@@ -206,9 +206,9 @@ async fn run_keepalive_inner(
         push_log(logs, entry).await;
     }
 
-    // 随机延迟
-    if allow_random_delay && config.random_delay {
-        let delay_secs: u64 = rand::thread_rng().gen_range(0..1800); // 0~30分钟随机延迟
+    let random_delay_minutes = config.cron_offset_minutes.max(0) as u64;
+    if allow_random_delay && random_delay_minutes > 0 {
+        let delay_secs: u64 = rand::thread_rng().gen_range(0..=random_delay_minutes * 60);
         {
             let entry = LogEntry::info(format!("随机延迟 {} 秒", delay_secs));
             push_log(logs, entry).await;

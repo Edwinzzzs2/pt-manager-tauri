@@ -12,6 +12,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  HelpCircle,
   ListChecks,
   Moon,
   PauseCircle,
@@ -87,7 +88,7 @@ const releaseTag = import.meta.env.VITE_RELEASE_TAG as string | undefined;
 const defaultConfig: AppConfig = {
   sites: [],
   cron: "0 9 * * *",
-  cron_offset_minutes: 0,
+  cron_offset_minutes: 30,
   cdp_port: 9222,
   visit_duration: 30,
   random_delay: true,
@@ -341,7 +342,8 @@ function App() {
       visit_duration: Math.max(5, Number(settingsDraft.visit_duration) || 30),
       log_retention: clampNumber(Number(settingsDraft.log_retention) || 500, 50, 5000),
       cron: settingsDraft.cron.trim() || defaultConfig.cron,
-      cron_offset_minutes: Number(settingsDraft.cron_offset_minutes) || 0,
+      cron_offset_minutes: clampNumber(Number(settingsDraft.cron_offset_minutes) || 0, 0, 1440),
+      random_delay: Number(settingsDraft.cron_offset_minutes) > 0,
     };
 
     setBusy(true);
@@ -502,64 +504,66 @@ function App() {
           </div>
         </header>
 
-        {error ? (
-          <div className="error-banner">
-            <XCircle size={18} />
-            <span>{error}</span>
-            <button onClick={() => setError(null)} type="button">
-              关闭
-            </button>
-          </div>
-        ) : null}
+        <div className="workspace-scroll">
+          {error ? (
+            <div className="error-banner">
+              <XCircle size={18} />
+              <span>{error}</span>
+              <button onClick={() => setError(null)} type="button">
+                关闭
+              </button>
+            </div>
+          ) : null}
 
-        {activeTab === "dashboard" ? (
-          <Dashboard
-            cdpBusy={cdpBusy}
-            config={config}
-            lastLog={lastVisibleLog}
-            onEnsureCdp={ensureCdp}
-            onOpenChromeDownload={openChromeDownload}
-            recentLogs={logs.slice(-5).reverse()}
-            status={status}
-            onRefresh={() => {
-              refreshStatus().catch(showError);
-              refreshLogs().catch(showError);
-            }}
-          />
-        ) : null}
+          {activeTab === "dashboard" ? (
+            <Dashboard
+              cdpBusy={cdpBusy}
+              config={config}
+              lastLog={lastVisibleLog}
+              onEnsureCdp={ensureCdp}
+              onOpenChromeDownload={openChromeDownload}
+              recentLogs={logs.slice(-5).reverse()}
+              status={status}
+              onRefresh={() => {
+                refreshStatus().catch(showError);
+                refreshLogs().catch(showError);
+              }}
+            />
+          ) : null}
 
-        {activeTab === "sites" ? (
-          <SitesPanel
-            busy={busy}
-            config={config}
-            editingSite={editingSite}
-            editingSiteId={editingSiteId}
-            newSite={newSite}
-            onAdd={addSite}
-            onCancelEdit={() => setEditingSiteId(null)}
-            onEditChange={setEditingSite}
-            onNewSiteChange={setNewSite}
-            onRemove={removeSite}
-            onSave={saveSite}
-            onStartEdit={startEdit}
-          />
-        ) : null}
+          {activeTab === "sites" ? (
+            <SitesPanel
+              busy={busy}
+              config={config}
+              editingSite={editingSite}
+              editingSiteId={editingSiteId}
+              newSite={newSite}
+              onAdd={addSite}
+              onCancelEdit={() => setEditingSiteId(null)}
+              onEditChange={setEditingSite}
+              onNewSiteChange={setNewSite}
+              onRemove={removeSite}
+              onSave={saveSite}
+              onStartEdit={startEdit}
+            />
+          ) : null}
 
-        {activeTab === "settings" ? (
-          <SettingsPanel
-            busy={busy}
-            cookieSyncBusy={cookieSyncBusy}
-            draft={settingsDraft}
-            onChange={setSettingsDraft}
-            onSave={saveSettings}
-            onSyncCookieCloud={syncCookieCloud}
-            taskRunning={!!status?.is_running}
-          />
-        ) : null}
+          {activeTab === "settings" ? (
+            <SettingsPanel
+              busy={busy}
+              cookieSyncBusy={cookieSyncBusy}
+              draft={settingsDraft}
+              onChange={setSettingsDraft}
+              onSave={saveSettings}
+              onSyncCookieCloud={syncCookieCloud}
+              taskRunning={!!status?.is_running}
+            />
+          ) : null}
 
-        {activeTab === "logs" ? (
-          <LogsPanel logs={logs} onClear={clearLogs} onRefresh={refreshLogs} />
-        ) : null}
+          {activeTab === "logs" ? (
+            <LogsPanel logs={logs} onClear={clearLogs} onRefresh={refreshLogs} />
+          ) : null}
+        </div>
       </section>
     </main>
   );
@@ -869,7 +873,7 @@ function SitesPanel({
   onStartEdit: (site: Site) => void;
 }) {
   return (
-    <div className="content-stack">
+    <div className="content-stack sites-stack">
       <section className="panel site-form">
         <input
           onChange={(event) => onNewSiteChange({ ...newSite, name: event.target.value })}
@@ -887,7 +891,7 @@ function SitesPanel({
         </button>
       </section>
 
-      <section className="site-list">
+      <section className="site-list site-list-scroll">
         {config.sites.length === 0 ? (
           <div className="empty-state">暂无站点</div>
         ) : (
@@ -968,15 +972,16 @@ function SettingsPanel({
 
   return (
     <div className="settings-stack">
-      <section className="panel settings-card">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Keepalive</p>
-            <h2>任务设置</h2>
+      <div className="settings-scroll">
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Keepalive</p>
+              <h2>任务设置</h2>
+            </div>
           </div>
-        </div>
 
-        <div className="settings-form">
+          <div className="settings-form">
           <label>
             <span>Cron 表达式</span>
             <input
@@ -986,15 +991,24 @@ function SettingsPanel({
             />
           </label>
           <label>
-            <span>执行时间偏移（分钟）</span>
+            <span className="label-with-help">
+              随机延迟上限（分钟）
+              <span
+                className="help-tip"
+                title="计划触发后随机等待 0 到该数值分钟；填 0 表示按 Cron 准点执行。"
+                tabIndex={0}
+              >
+                <HelpCircle size={14} />
+              </span>
+            </span>
             <input
-              min={-1440}
+              min={0}
               max={1440}
               onChange={(event) =>
                 onChange({ ...draft, cron_offset_minutes: Number(event.target.value) })
               }
               placeholder="0"
-              title="在 Cron 计划时间基础上提前（负数）或延后（正数）的分钟数，例如 -5 表示提前 5 分钟"
+              title="计划触发后随机延迟 0 到该数值分钟；0 表示不随机延迟"
               type="number"
               value={draft.cron_offset_minutes}
             />
@@ -1023,14 +1037,6 @@ function SettingsPanel({
             />
           </label>
           <label className="switch-row">
-            <span>随机延迟</span>
-            <input
-              checked={draft.random_delay}
-              onChange={(event) => onChange({ ...draft, random_delay: event.target.checked })}
-              type="checkbox"
-            />
-          </label>
-          <label className="switch-row">
             <span>开机自启</span>
             <input
               checked={draft.auto_launch}
@@ -1038,9 +1044,9 @@ function SettingsPanel({
               type="checkbox"
             />
           </label>
-        </div>
+          </div>
 
-        <details className="advanced-settings">
+          <details className="advanced-settings">
           <summary>手动端口（可选）</summary>
           <label>
             <span>Chrome 调试端口</span>
@@ -1051,15 +1057,24 @@ function SettingsPanel({
               value={draft.cdp_port}
             />
           </label>
-        </details>
+          </details>
 
-      </section>
+        </section>
 
-      <section className="panel settings-card cookiecloud-panel">
+        <section className="panel settings-card cookiecloud-panel">
         <div className="panel-heading">
           <div>
             <p className="eyebrow">CookieCloud</p>
-            <h2>Cookie 同步</h2>
+            <div className="title-with-help">
+              <h2>Cookie 同步</h2>
+              <span
+                className="help-tip"
+                title="浏览器安装插件CookieCloud配合，本软件填写同一CookieCloud 地址、UUID、密码。先在插件保存同步域名关键词并点手动同步，再回到本软件点同步 Cookie；本软件会导入 Cookie 和 Local Storage。"
+                tabIndex={0}
+              >
+                <HelpCircle size={16} />
+              </span>
+            </div>
           </div>
           <div className="row-actions">
             <button
@@ -1131,7 +1146,8 @@ function SettingsPanel({
             />
           </label>
         </div>
-      </section>
+        </section>
+      </div>
 
       <div className="settings-actions settings-actions-bottom">
         <button className="primary-action settings-save" disabled={busy} onClick={onSave} type="button">
