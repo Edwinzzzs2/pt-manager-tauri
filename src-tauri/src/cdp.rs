@@ -314,7 +314,7 @@ impl CdpClient {
                 continue;
             };
             let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
-            wait_for_document_ready(&mut websocket).await;
+            ensure_storage_page_ready(&mut websocket, storage).await;
             let _ = websocket.call("DOMStorage.enable", serde_json::json!({}));
             let mut imported_items = set_local_storage_items(&mut websocket, storage, &storage.items);
             let missing_items = storage
@@ -522,41 +522,27 @@ impl CdpClient {
     }
 }
 
-fn set_local_storage_item(
+fn set_dom_storage_item(
     websocket: &mut CdpWebSocket,
     storage: &CdpLocalStorageParam,
     item: &CdpLocalStorageEntry,
 ) -> bool {
-    let dom_storage_params = serde_json::json!({
-        "storageId": dom_storage_id(storage),
-        "key": item.name,
-        "value": item.value
-    });
-    if websocket
-        .call("DOMStorage.setDOMStorageItem", dom_storage_params)
-        .is_ok()
-        && local_storage_item_matches(websocket, storage, item)
-    {
-        return true;
+    for storage_id in dom_storage_ids(websocket, storage) {
+        let dom_storage_params = serde_json::json!({
+            "storageId": storage_id,
+            "key": &item.name,
+            "value": &item.value
+        });
+        if websocket
+            .call("DOMStorage.setDOMStorageItem", dom_storage_params)
+            .is_ok()
+            && local_storage_item_matches(websocket, storage, item)
+        {
+            return true;
+        }
     }
 
-    let runtime_params = serde_json::json!({
-        "expression": format!(
-            "localStorage.setItem({}, {})",
-            serde_json::to_string(&item.name).unwrap_or_else(|_| "\"\"".to_string()),
-            serde_json::to_string(&item.value).unwrap_or_else(|_| "\"\"".to_string())
-        )
-    });
-    websocket
-        .call("Runtime.evaluate", runtime_params)
-        .map(|response| {
-            let has_exception = response
-                .get("result")
-                .and_then(|value| value.get("exceptionDetails"))
-                .is_some();
-            !has_exception && local_storage_item_matches(websocket, storage, item)
-        })
-        .unwrap_or(false)
+    false
 }
 
 fn set_local_storage_items(
@@ -564,38 +550,146 @@ fn set_local_storage_items(
     storage: &CdpLocalStorageParam,
     items: &[CdpLocalStorageEntry],
 ) -> Vec<CdpLocalStorageEntry> {
-    items
+    let mut imported = runtime_set_local_storage_items(websocket, storage, items);
+    let missing_items = items
         .iter()
-        .filter(|item| set_local_storage_item(websocket, storage, item))
+        .filter(|item| !imported.iter().any(|written| written.name == item.name))
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+
+    imported.extend(
+        missing_items
+            .iter()
+            .filter(|item| set_dom_storage_item(websocket, storage, item))
+            .cloned(),
+    );
+    imported.sort_by(|a, b| a.name.cmp(&b.name));
+    imported.dedup_by(|a, b| a.name == b.name);
+    imported
 }
 
-async fn wait_for_document_ready(websocket: &mut CdpWebSocket) {
+async fn ensure_storage_page_ready(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+) {
+    if wait_for_storage_host_ready(websocket, storage).await {
+        return;
+    }
+
+    let _ = websocket.call("Page.enable", serde_json::json!({}));
+    let _ = websocket.call(
+        "Page.navigate",
+        serde_json::json!({
+            "url": storage.origin
+        }),
+    );
+    let _ = wait_for_storage_host_ready(websocket, storage).await;
+}
+
+async fn wait_for_storage_host_ready(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+) -> bool {
     for _ in 0..20 {
-        let ready = websocket
-            .call(
-                "Runtime.evaluate",
-                serde_json::json!({
-                    "expression": "document.readyState",
-                    "returnByValue": true
-                }),
-            )
-            .ok()
-            .and_then(|response| {
-                response
-                    .get("result")
-                    .and_then(|value| value.get("result"))
-                    .and_then(|value| value.get("value"))
-                    .and_then(|value| value.as_str())
-                    .map(|value| value == "interactive" || value == "complete")
-            })
-            .unwrap_or(false);
-        if ready {
-            return;
+        if page_is_storage_host_ready(websocket, storage) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    false
+}
+
+fn page_is_storage_host_ready(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+) -> bool {
+    let Some(location) = current_page_location(websocket) else {
+        return false;
+    };
+    location.host == storage.host
+        && (location.ready_state == "interactive" || location.ready_state == "complete")
+}
+
+fn current_page_location(websocket: &mut CdpWebSocket) -> Option<PageLocation> {
+    let response = websocket
+        .call(
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "({ host: location.hostname.toLowerCase(), readyState: document.readyState })",
+                "returnByValue": true
+            }),
+        )
+        .ok()?;
+    let value = response
+        .get("result")?
+        .get("result")?
+        .get("value")?;
+    Some(PageLocation {
+        host: value.get("host")?.as_str()?.to_string(),
+        ready_state: value.get("readyState")?.as_str()?.to_string(),
+    })
+}
+
+struct PageLocation {
+    host: String,
+    ready_state: String,
+}
+
+fn runtime_set_local_storage_items(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+    items: &[CdpLocalStorageEntry],
+) -> Vec<CdpLocalStorageEntry> {
+    let entries = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "name": &item.name,
+                "value": &item.value
+            })
+        })
+        .collect::<Vec<_>>();
+    let entries_json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+    let target_host_json =
+        serde_json::to_string(&storage.host).unwrap_or_else(|_| "\"\"".to_string());
+    let expression = format!(
+        r#"(() => {{
+            const targetHost = {target_host};
+            const entries = {entries};
+            const written = [];
+            if (location.hostname.toLowerCase() !== targetHost) {{
+                return {{ host: location.hostname.toLowerCase(), written }};
+            }}
+            for (const item of entries) {{
+                try {{
+                    localStorage.setItem(item.name, item.value);
+                    if (localStorage.getItem(item.name) === item.value) {{
+                        written.push(item.name);
+                    }}
+                }} catch (_) {{}}
+            }}
+            return {{ host: location.hostname.toLowerCase(), written }};
+        }})()"#,
+        target_host = target_host_json,
+        entries = entries_json
+    );
+    let params = serde_json::json!({
+        "expression": expression,
+        "returnByValue": true,
+        "awaitPromise": true,
+        "userGesture": true,
+        "allowUnsafeEvalBlockedByCSP": true
+    });
+    let written_names = websocket
+        .call("Runtime.evaluate", params)
+        .ok()
+        .and_then(runtime_written_names)
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter(|item| written_names.iter().any(|name| name == &item.name))
+        .cloned()
+        .collect()
 }
 
 fn local_storage_item_matches(
@@ -615,34 +709,60 @@ fn dom_storage_id(storage: &CdpLocalStorageParam) -> serde_json::Value {
     })
 }
 
+fn dom_storage_ids(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+) -> Vec<serde_json::Value> {
+    let mut ids = Vec::new();
+    if let Some(storage_key) = current_storage_key(websocket) {
+        ids.push(serde_json::json!({
+            "storageKey": storage_key,
+            "isLocalStorage": true
+        }));
+    }
+    ids.push(dom_storage_id(storage));
+    ids.push(serde_json::json!({
+        "storageKey": format!("{}/", storage.origin.trim_end_matches('/')),
+        "isLocalStorage": true
+    }));
+
+    let mut unique = Vec::new();
+    for id in ids {
+        if !unique.iter().any(|existing| existing == &id) {
+            unique.push(id);
+        }
+    }
+    unique
+}
+
+fn current_storage_key(websocket: &mut CdpWebSocket) -> Option<String> {
+    websocket
+        .call("Storage.getStorageKey", serde_json::json!({}))
+        .ok()
+        .and_then(|response| {
+            response
+                .get("result")
+                .and_then(|value| value.get("storageKey"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+}
+
 fn dom_storage_item_matches(
     websocket: &mut CdpWebSocket,
     storage: &CdpLocalStorageParam,
     item: &CdpLocalStorageEntry,
 ) -> bool {
-    let params = serde_json::json!({
-        "storageId": dom_storage_id(storage)
-    });
-    websocket
-        .call("DOMStorage.getDOMStorageItems", params)
-        .ok()
-        .and_then(|response| {
-            response
-                .get("result")
-                .and_then(|value| value.get("entries"))
-                .and_then(|value| value.as_array())
-                .map(|entries| {
-                    entries.iter().any(|entry| {
-                        let Some(pair) = entry.as_array() else {
-                            return false;
-                        };
-                        let key = pair.first().and_then(|value| value.as_str());
-                        let value = pair.get(1).and_then(|value| value.as_str());
-                        key == Some(item.name.as_str()) && value == Some(item.value.as_str())
-                    })
-                })
-        })
-        .unwrap_or(false)
+    dom_storage_ids(websocket, storage).into_iter().any(|storage_id| {
+        let params = serde_json::json!({
+            "storageId": storage_id
+        });
+        websocket
+            .call("DOMStorage.getDOMStorageItems", params)
+            .ok()
+            .and_then(dom_storage_response_has_item(item))
+            .unwrap_or(false)
+    })
 }
 
 fn runtime_local_storage_item_matches(
@@ -668,6 +788,49 @@ fn runtime_local_storage_item_matches(
                 .map(|value| value == item.value)
         })
         .unwrap_or(false)
+}
+
+fn runtime_written_names(response: serde_json::Value) -> Option<Vec<String>> {
+    if response
+        .get("result")
+        .and_then(|value| value.get("exceptionDetails"))
+        .is_some()
+    {
+        return None;
+    }
+    response
+        .get("result")?
+        .get("result")?
+        .get("value")?
+        .get("written")?
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
+fn dom_storage_response_has_item(
+    item: &CdpLocalStorageEntry,
+) -> impl FnOnce(serde_json::Value) -> Option<bool> + '_ {
+    |response| {
+        response
+            .get("result")
+            .and_then(|value| value.get("entries"))
+            .and_then(|value| value.as_array())
+            .map(|entries| {
+                entries.iter().any(|entry| {
+                    let Some(pair) = entry.as_array() else {
+                        return false;
+                    };
+                    let key = pair.first().and_then(|value| value.as_str());
+                    let value = pair.get(1).and_then(|value| value.as_str());
+                    key == Some(item.name.as_str()) && value == Some(item.value.as_str())
+                })
+            })
+    }
 }
 
 pub fn chrome_installed() -> bool {
