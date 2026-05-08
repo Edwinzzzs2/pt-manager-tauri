@@ -58,6 +58,19 @@ pub struct CdpCookieParam {
     pub expires: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CdpLocalStorageEntry {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CdpLocalStorageParam {
+    pub host: String,
+    pub origin: String,
+    pub items: Vec<CdpLocalStorageEntry>,
+}
+
 pub const CDP_CANCELLED: &str = "CDP 操作已终止";
 
 #[derive(Clone)]
@@ -282,6 +295,44 @@ impl CdpClient {
         Ok(imported)
     }
 
+    pub async fn set_local_storage(
+        &self,
+        storages: &[CdpLocalStorageParam],
+    ) -> Result<Vec<CdpLocalStorageParam>, String> {
+        if storages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut imported = Vec::new();
+        for storage in storages {
+            let tab_id = match self.find_tab_for_url(&storage.origin).await {
+                Some(tab_id) => tab_id,
+                None => self.open_tab(&storage.origin).await?,
+            };
+            self.wait_for_tab_host(&tab_id, &storage.host).await;
+            let Some(websocket_url) = self.websocket_url_for_tab(&tab_id)? else {
+                continue;
+            };
+            let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+            let _ = websocket.call("DOMStorage.enable", serde_json::json!({}));
+            let mut imported_items = Vec::new();
+            for item in &storage.items {
+                if set_local_storage_item(&mut websocket, storage, item) {
+                    imported_items.push(item.clone());
+                }
+            }
+            if !imported_items.is_empty() {
+                imported.push(CdpLocalStorageParam {
+                    host: storage.host.clone(),
+                    origin: storage.origin.clone(),
+                    items: imported_items,
+                });
+            }
+        }
+
+        Ok(imported)
+    }
+
     /// Cookie 写入后，对 Chrome 中已打开的目标站点页面执行刷新，
     /// 使新 Cookie 立即生效——否则用户看到的仍是旧的未登录状态。
     pub async fn reload_tabs_for_sites(&self, site_urls: &[String]) {
@@ -348,6 +399,47 @@ impl CdpClient {
             .into_iter()
             .filter(|tab| tab.tab_type.as_deref() == Some("page"))
             .find_map(|tab| tab.web_socket_debugger_url))
+    }
+
+    fn websocket_url_for_tab(&self, tab_id: &str) -> Result<Option<String>, String> {
+        let response = self.request("GET", "/json/list", Duration::from_secs(5))?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("CDP 返回 HTTP {}", response.status));
+        }
+
+        let tabs =
+            serde_json::from_str::<Vec<CdpTab>>(&response.body).map_err(|err| err.to_string())?;
+        Ok(tabs
+            .into_iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.web_socket_debugger_url))
+    }
+
+    async fn wait_for_tab_host(&self, tab_id: &str, expected_host: &str) {
+        for _ in 0..20 {
+            if self
+                .tab_host(tab_id)
+                .map(|host| host == expected_host)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    fn tab_host(&self, tab_id: &str) -> Option<String> {
+        let response = self.request("GET", "/json/list", Duration::from_secs(5)).ok()?;
+        if !(200..300).contains(&response.status) {
+            return None;
+        }
+
+        serde_json::from_str::<Vec<CdpTab>>(&response.body)
+            .ok()?
+            .into_iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.url)
+            .and_then(|url| host_from_url(&url))
     }
 
     async fn ensure_initial_urls(
@@ -420,6 +512,44 @@ impl CdpClient {
         let raw = read_http_response(&mut stream)?;
         parse_http_response(&raw)
     }
+}
+
+fn set_local_storage_item(
+    websocket: &mut CdpWebSocket,
+    storage: &CdpLocalStorageParam,
+    item: &CdpLocalStorageEntry,
+) -> bool {
+    let dom_storage_params = serde_json::json!({
+        "storageId": {
+            "securityOrigin": storage.origin,
+            "isLocalStorage": true
+        },
+        "key": item.name,
+        "value": item.value
+    });
+    if websocket
+        .call("DOMStorage.setDOMStorageItem", dom_storage_params)
+        .is_ok()
+    {
+        return true;
+    }
+
+    let runtime_params = serde_json::json!({
+        "expression": format!(
+            "localStorage.setItem({}, {})",
+            serde_json::to_string(&item.name).unwrap_or_else(|_| "\"\"".to_string()),
+            serde_json::to_string(&item.value).unwrap_or_else(|_| "\"\"".to_string())
+        )
+    });
+    websocket
+        .call("Runtime.evaluate", runtime_params)
+        .map(|response| {
+            response
+                .get("result")
+                .and_then(|value| value.get("exceptionDetails"))
+                .is_none()
+        })
+        .unwrap_or(false)
 }
 
 pub fn chrome_installed() -> bool {

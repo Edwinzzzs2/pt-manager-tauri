@@ -1,4 +1,4 @@
-use crate::cdp::{self, CdpClient, CdpProgress};
+use crate::cdp::{self, CdpClient, CdpLocalStorageParam, CdpProgress};
 use crate::cookiecloud;
 use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
@@ -36,6 +36,8 @@ pub struct AppStatus {
 pub struct CookieCloudSyncResult {
     pub matched_cookies: usize,
     pub imported_cookies: usize,
+    pub matched_local_storages: usize,
+    pub imported_local_storages: usize,
 }
 
 #[tauri::command]
@@ -157,23 +159,23 @@ pub async fn sync_cookiecloud_from_config(
     config: AppConfig,
 ) -> Result<CookieCloudSyncResult, String> {
     let cookiecloud_config = config.cookiecloud.clone();
-    let cookies = tauri::async_runtime::spawn_blocking(move || {
-        cookiecloud::fetch_cookie_data(&cookiecloud_config)
+    let payload = tauri::async_runtime::spawn_blocking(move || {
+        cookiecloud::fetch_sync_payload(&cookiecloud_config)
     })
     .await
     .map_err(|err| err.to_string())??;
 
-    import_cookiecloud_cookies(&state, &config, cookies).await
+    import_cookiecloud_cookies(&state, &config, payload).await
 }
 
 async fn import_cookiecloud_cookies(
     state: &State<'_, AppState>,
     config: &AppConfig,
-    cookies: serde_json::Value,
+    payload: serde_json::Value,
 ) -> Result<CookieCloudSyncResult, String> {
-    let cookie_params = cookiecloud::cookies_from_cookiecloud(cookies, &config.sites)?;
-    if cookie_params.is_empty() {
-        let message = "CookieCloud 未解析到可同步的 Cookie".to_string();
+    let sync_data = cookiecloud::sync_data_from_cookiecloud(payload, &config.sites)?;
+    if sync_data.cookies.is_empty() && sync_data.local_storages.is_empty() {
+        let message = "CookieCloud 未解析到可同步的 Cookie 或 Local Storage".to_string();
         push_log(&state.logs, LogEntry::error(message.clone())).await;
         return Err(message);
     }
@@ -192,7 +194,8 @@ async fn import_cookiecloud_cookies(
         }
     };
 
-    let imported_cookie_params = match CdpClient::new(active_port).set_cookies(&cookie_params).await {
+    let mut write_port = active_port;
+    let imported_cookie_params = match CdpClient::new(write_port).set_cookies(&sync_data.cookies).await {
         Ok(cookies) => cookies,
         Err(err) if is_connection_refused(&err) => {
             push_log(
@@ -205,8 +208,9 @@ async fn import_cookiecloud_cookies(
                 Arc::clone(&state.task_cancel_requested),
             );
             let result = cdp.ensure_available_with_progress(&[], &progress).await?;
-            CdpClient::new(result.port)
-                .set_cookies(&cookie_params)
+            write_port = result.port;
+            CdpClient::new(write_port)
+                .set_cookies(&sync_data.cookies)
                 .await
                 .map_err(|retry_err| format!("Cookie 已拉取，但写入 Chrome 失败：{}", retry_err))?
         }
@@ -214,29 +218,39 @@ async fn import_cookiecloud_cookies(
             return Err(format!("Cookie 已拉取，但写入 Chrome 失败：{}", err));
         }
     };
+    let imported_local_storages = CdpClient::new(write_port)
+        .set_local_storage(&sync_data.local_storages)
+        .await
+        .map_err(|err| format!("Local Storage 已拉取，但写入 Chrome 失败：{}", err))?;
 
-    // Cookie 写入成功后，刷新 Chrome 中已打开的站点页面，使新 Cookie 立即生效。
+    // Cookie/Local Storage 写入成功后，刷新 Chrome 中已打开的站点页面，使新登录态立即生效。
     let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
-    CdpClient::new(active_port)
+    CdpClient::new(write_port)
         .reload_tabs_for_sites(&site_urls)
         .await;
 
     let result = CookieCloudSyncResult {
-        matched_cookies: cookie_params.len(),
+        matched_cookies: sync_data.cookies.len(),
         imported_cookies: imported_cookie_params.len(),
+        matched_local_storages: local_storage_item_count(&sync_data.local_storages),
+        imported_local_storages: local_storage_item_count(&imported_local_storages),
     };
-    // 日志里的站点数按成功写入的 Cookie 计算，避免把 CDP 拒绝写入的 Cookie 也报成可用。
-    let site_match = cookie_site_match_summary(&config.sites, &imported_cookie_params);
+    // 日志里的站点数按成功写入的数据计算，Cookie 或 Local Storage 任一命中都算站点匹配。
+    let site_match = site_match_summary(&config.sites, &imported_cookie_params, &imported_local_storages);
     let (_, detail) = cookie_summary(&imported_cookie_params);
+    let storage_detail = local_storage_summary(&imported_local_storages);
     push_log(
         &state.logs,
         LogEntry::success(format!(
-            "CookieCloud 同步完成：匹配 {} 个站点，共解析 {} 条 Cookie，成功写入 {} 条；{}；{}",
+            "CookieCloud 同步完成：匹配 {} 个站点，共解析 {} 条 Cookie / {} 条 Local Storage，成功写入 {} 条 Cookie / {} 条 Local Storage；{}；{}；{}",
             site_match.matched_count,
             result.matched_cookies,
+            result.matched_local_storages,
             result.imported_cookies,
+            result.imported_local_storages,
             site_match.detail,
-            detail
+            detail,
+            storage_detail
         )),
     )
     .await;
@@ -248,18 +262,19 @@ struct CookieSiteMatchSummary {
     detail: String,
 }
 
-fn cookie_site_match_summary(
+fn site_match_summary(
     sites: &[crate::store::Site],
     cookies: &[crate::cdp::CdpCookieParam],
+    local_storages: &[CdpLocalStorageParam],
 ) -> CookieSiteMatchSummary {
     let matched = sites
         .iter()
-        .filter(|site| site_has_cookie_match(site, cookies))
+        .filter(|site| site_has_sync_match(site, cookies, local_storages))
         .map(|site| site.name.clone())
         .collect::<Vec<_>>();
     let unmatched = sites
         .iter()
-        .filter(|site| !site_has_cookie_match(site, cookies))
+        .filter(|site| !site_has_sync_match(site, cookies, local_storages))
         .map(|site| site.name.clone())
         .collect::<Vec<_>>();
 
@@ -277,19 +292,26 @@ fn cookie_site_match_summary(
     }
 }
 
-fn site_has_cookie_match(site: &crate::store::Site, cookies: &[crate::cdp::CdpCookieParam]) -> bool {
+fn site_has_sync_match(
+    site: &crate::store::Site,
+    cookies: &[crate::cdp::CdpCookieParam],
+    local_storages: &[CdpLocalStorageParam],
+) -> bool {
     let Some(site_host) = host_from_url(&site.url) else {
         return false;
     };
 
-    cookies.iter().any(|cookie| {
+    let cookie_matched = cookies.iter().any(|cookie| {
         let Some(cookie_host) = cookie_host(cookie) else {
             return false;
         };
-        site_host == cookie_host
-            || site_host.ends_with(&format!(".{}", cookie_host))
-            || cookie_host.ends_with(&format!(".{}", site_host))
-    })
+        hosts_match(&site_host, &cookie_host)
+    });
+    let storage_matched = local_storages
+        .iter()
+        .any(|storage| hosts_match(&site_host, &storage.host));
+
+    cookie_matched || storage_matched
 }
 
 fn cookie_host(cookie: &crate::cdp::CdpCookieParam) -> Option<String> {
@@ -323,6 +345,12 @@ fn normalize_host(value: &str) -> Option<String> {
     } else {
         Some(host)
     }
+}
+
+fn hosts_match(site_host: &str, data_host: &str) -> bool {
+    site_host == data_host
+        || site_host.ends_with(&format!(".{}", data_host))
+        || data_host.ends_with(&format!(".{}", site_host))
 }
 
 /// 返回 (站点域名数, 详情文本)。按纯 host 分组（去掉 scheme），避免同域的 http/https Cookie 分成两条。
@@ -369,6 +397,35 @@ fn cookie_summary(cookies: &[crate::cdp::CdpCookieParam]) -> (usize, String) {
         format!("导入 Cookie：{}", details)
     };
     (site_count, detail)
+}
+
+fn local_storage_item_count(local_storages: &[CdpLocalStorageParam]) -> usize {
+    local_storages
+        .iter()
+        .map(|storage| storage.items.len())
+        .sum()
+}
+
+fn local_storage_summary(local_storages: &[CdpLocalStorageParam]) -> String {
+    if local_storages.is_empty() {
+        return "导入 Local Storage：无".to_string();
+    }
+
+    let details = local_storages
+        .iter()
+        .map(|storage| {
+            let mut names = storage
+                .items
+                .iter()
+                .map(|item| item.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names.dedup();
+            format!("{}：{}", storage.host, names.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    format!("导入 Local Storage：{}", details)
 }
 
 fn is_connection_refused(message: &str) -> bool {

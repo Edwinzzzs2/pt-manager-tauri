@@ -74,6 +74,8 @@ type AppStatus = {
 type CookieCloudSyncResult = {
   matched_cookies: number;
   imported_cookies: number;
+  matched_local_storages: number;
+  imported_local_storages: number;
 };
 
 type TabKey = "dashboard" | "sites" | "settings" | "logs";
@@ -577,13 +579,13 @@ async function fetchCookieCloudData(config: CookieCloudConfig) {
   for (const endpoint of endpoints) {
     try {
       const payload = await requestCookieCloudPayload(endpoint, password);
-      if (payload?.cookie_data) {
-        return payload.cookie_data;
+      if (payload?.cookie_data || payload?.local_storage_data) {
+        return payload;
       }
       if (payload?.encrypted) {
         throw new Error("CookieCloud 服务端返回了密文，请确认服务端支持 password 解密接口");
       }
-      throw new Error("CookieCloud 返回数据缺少 cookie_data");
+      throw new Error("CookieCloud 返回数据缺少 cookie_data/local_storage_data");
     } catch (err) {
       errors.push(`${endpoint}: ${readableError(err)}`);
     }

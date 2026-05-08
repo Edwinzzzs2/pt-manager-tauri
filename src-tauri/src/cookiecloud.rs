@@ -1,4 +1,4 @@
-use crate::cdp::CdpCookieParam;
+use crate::cdp::{CdpCookieParam, CdpLocalStorageEntry, CdpLocalStorageParam};
 use crate::store::{CookieCloudConfig, Site};
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,13 +26,18 @@ struct CookieCloudCookie {
     same_site: Option<String>,
 }
 
+pub struct CookieCloudSyncData {
+    pub cookies: Vec<CdpCookieParam>,
+    pub local_storages: Vec<CdpLocalStorageParam>,
+}
+
 struct HttpUrl {
     host: String,
     port: u16,
     path: String,
 }
 
-pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
+pub fn fetch_sync_payload(config: &CookieCloudConfig) -> Result<Value, String> {
     let server_url = config.server_url.trim();
     let uuid = config.uuid.trim();
     let password = config.password.as_str();
@@ -45,8 +50,10 @@ pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
     for endpoint in endpoints {
         match request_cookiecloud_payload(&endpoint, password) {
             Ok(payload) => {
-                if let Some(cookie_data) = payload.get("cookie_data").cloned() {
-                    return Ok(cookie_data);
+                if payload.get("cookie_data").is_some()
+                    || payload.get("local_storage_data").is_some()
+                {
+                    return Ok(payload);
                 }
                 if payload.get("encrypted").is_some() {
                     return Err(
@@ -54,7 +61,10 @@ pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
                             .to_string(),
                     );
                 }
-                errors.push(format!("{}：返回数据缺少 cookie_data", mask_uuid(&endpoint, uuid)));
+                errors.push(format!(
+                    "{}：返回数据缺少 cookie_data/local_storage_data",
+                    mask_uuid(&endpoint, uuid)
+                ));
             }
             Err(err) => errors.push(format!("{}：{}", mask_uuid(&endpoint, uuid), err)),
         }
@@ -66,11 +76,38 @@ pub fn fetch_cookie_data(config: &CookieCloudConfig) -> Result<Value, String> {
     ))
 }
 
-/// 把 CookieCloud 返回的 Cookie 全部转换成 CDP 入参；站点匹配只用于同步日志统计。
-pub fn cookies_from_cookiecloud(
-    cookie_data: Value,
+/// 把 CookieCloud 返回的 Cookie 和 localStorage 全部转换成 CDP 入参；站点匹配只用于同步日志统计。
+pub fn sync_data_from_cookiecloud(
+    payload: Value,
     _sites: &[Site],
-) -> Result<Vec<CdpCookieParam>, String> {
+) -> Result<CookieCloudSyncData, String> {
+    let has_payload_shape =
+        payload.get("cookie_data").is_some() || payload.get("local_storage_data").is_some();
+    let cookie_data = if let Some(value) = payload.get("cookie_data") {
+        value.clone()
+    } else if has_payload_shape {
+        serde_json::json!({})
+    } else {
+        payload.clone()
+    };
+    let local_storage_data = payload.get("local_storage_data").cloned();
+    let cookies = cookies_from_cookie_data(cookie_data)?;
+    let local_storages = match local_storage_data {
+        Some(value) => local_storages_from_cookiecloud(value)?,
+        None => Vec::new(),
+    };
+
+    if cookies.is_empty() && local_storages.is_empty() {
+        return Err("CookieCloud 未解析到可同步的 Cookie 或 Local Storage，请确认 CookieCloud 中已有数据".to_string());
+    }
+
+    Ok(CookieCloudSyncData {
+        cookies,
+        local_storages,
+    })
+}
+
+fn cookies_from_cookie_data(cookie_data: Value) -> Result<Vec<CdpCookieParam>, String> {
     let data = serde_json::from_value::<HashMap<String, Vec<CookieCloudCookie>>>(cookie_data)
         .map_err(|err| format!("CookieCloud cookie_data 格式解析失败：{}", err))?;
 
@@ -118,11 +155,72 @@ pub fn cookies_from_cookiecloud(
         }
     }
 
-    if result.is_empty() {
-        return Err("CookieCloud 未解析到可同步的 Cookie，请确认 CookieCloud 中已有 Cookie 数据".to_string());
+    Ok(result)
+}
+
+fn local_storages_from_cookiecloud(
+    local_storage_data: Value,
+) -> Result<Vec<CdpLocalStorageParam>, String> {
+    let data = serde_json::from_value::<HashMap<String, Value>>(local_storage_data)
+        .map_err(|err| format!("CookieCloud local_storage_data 格式解析失败：{}", err))?;
+
+    let mut result = Vec::new();
+    for (domain_key, value) in data {
+        let host = normalize_cookie_host(&domain_key);
+        if host.is_empty() {
+            continue;
+        }
+        let items = local_storage_items(value);
+        if items.is_empty() {
+            continue;
+        }
+        result.push(CdpLocalStorageParam {
+            origin: format!("https://{}", host),
+            host,
+            items,
+        });
     }
 
     Ok(result)
+}
+
+fn local_storage_items(value: Value) -> Vec<CdpLocalStorageEntry> {
+    match value {
+        Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(name, value)| {
+                Some(CdpLocalStorageEntry {
+                    name,
+                    value: storage_value_to_string(value)?,
+                })
+            })
+            .collect(),
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let name = object
+                    .get("name")
+                    .or_else(|| object.get("key"))?
+                    .as_str()?
+                    .to_string();
+                let value = object
+                    .get("value")
+                    .cloned()
+                    .and_then(storage_value_to_string)?;
+                Some(CdpLocalStorageEntry { name, value })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn storage_value_to_string(value: Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value),
+        Value::Null => None,
+        value => Some(value.to_string()),
+    }
 }
 
 fn cookie_domain(cookie: &CookieCloudCookie, domain_key: &str) -> String {
@@ -134,6 +232,19 @@ fn cookie_domain(cookie: &CookieCloudCookie, domain_key: &str) -> String {
         .unwrap_or(domain_key)
         .trim()
         .to_string()
+}
+
+fn normalize_cookie_host(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches('.')
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn request_cookiecloud_payload(endpoint: &str, password: &str) -> Result<Value, String> {

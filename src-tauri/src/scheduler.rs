@@ -132,7 +132,7 @@ async fn run_keepalive_inner(
                 push_log(
                     logs,
                     LogEntry::success(format!(
-                        "保活前 CookieCloud 自动同步完成：{} 条 Cookie 已写入（共解析 {} 条）",
+                        "保活前 CookieCloud 自动同步完成：{} 条登录数据已写入（共解析 {} 条）",
                         imported, parsed
                     )),
                 )
@@ -333,14 +333,14 @@ async fn sync_cookiecloud_before_keepalive(
     push_log(logs, LogEntry::info("保活前自动同步 CookieCloud")).await;
 
     let cookiecloud_config = config.cookiecloud.clone();
-    let cookie_data = tauri::async_runtime::spawn_blocking(move || {
-        cookiecloud::fetch_cookie_data(&cookiecloud_config)
+    let payload = tauri::async_runtime::spawn_blocking(move || {
+        cookiecloud::fetch_sync_payload(&cookiecloud_config)
     })
     .await
     .map_err(|err| err.to_string())??;
-    let cookie_params = cookiecloud::cookies_from_cookiecloud(cookie_data, &config.sites)?;
-    if cookie_params.is_empty() {
-        return Err("CookieCloud 未解析到可同步的 Cookie".to_string());
+    let sync_data = cookiecloud::sync_data_from_cookiecloud(payload, &config.sites)?;
+    if sync_data.cookies.is_empty() && sync_data.local_storages.is_empty() {
+        return Err("CookieCloud 未解析到可同步的 Cookie 或 Local Storage".to_string());
     }
 
     let cdp = CdpClient::new(config.cdp_port);
@@ -351,18 +351,32 @@ async fn sync_cookiecloud_before_keepalive(
             cdp.ensure_available_with_progress(&[], &progress).await?.port
         }
     };
-    let imported = CdpClient::new(active_port)
-        .set_cookies(&cookie_params)
+    let active_cdp = CdpClient::new(active_port);
+    let imported_cookies = active_cdp.set_cookies(&sync_data.cookies).await?.len();
+    let imported_storages = CdpClient::new(active_port)
+        .set_local_storage(&sync_data.local_storages)
         .await?
-        .len();
+        .iter()
+        .map(|storage| storage.items.len())
+        .sum::<usize>();
 
-    // Cookie 写入后刷新已打开的站点页面，使新 Cookie 在保活执行前立即生效。
+    // Cookie/Local Storage 写入后刷新已打开的站点页面，使新登录态在保活执行前立即生效。
     let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
     CdpClient::new(active_port)
         .reload_tabs_for_sites(&site_urls)
         .await;
 
-    Ok((cookie_params.len(), imported))
+    Ok((
+        sync_data.cookies.len() + local_storage_item_count(&sync_data.local_storages),
+        imported_cookies + imported_storages,
+    ))
+}
+
+fn local_storage_item_count(local_storages: &[crate::cdp::CdpLocalStorageParam]) -> usize {
+    local_storages
+        .iter()
+        .map(|storage| storage.items.len())
+        .sum()
 }
 
 async fn run_keepalive_batch(
