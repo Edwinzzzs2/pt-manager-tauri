@@ -295,7 +295,16 @@ button.ghost {
   color: var(--danger-soft-fg);
 }
 
+.row-actions .danger-action {
+  background: var(--danger-soft-bg);
+  color: var(--danger-soft-fg);
+}
+
 .danger-action:hover {
+  background: var(--danger-soft-bg-hover);
+}
+
+.row-actions .danger-action:hover {
   background: var(--danger-soft-bg-hover);
 }
 
@@ -422,7 +431,13 @@ button.ghost {
 }
 
 .panel-heading > div:first-child {
+  display: grid;
+  gap: 3px;
   min-width: 0;
+}
+
+.panel-heading .icon-button {
+  flex: 0 0 38px;
 }
 
 .setup-panel .row-actions {
@@ -456,18 +471,56 @@ button.ghost {
 }
 
 .result-text {
+  min-height: 0;
+  max-height: min(250px, 28vh);
+  overflow: auto;
+  padding-right: 4px;
   color: var(--color-fg-muted);
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
 
-.live-log-panel {
+.result-panel {
+  display: flex;
+  max-height: min(380px, 42vh);
   min-height: 0;
+  flex-direction: column;
+}
+
+.result-panel .panel-heading {
+  flex: 0 0 auto;
+}
+
+.live-log-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: min(320px, 40vh);
+  overflow: hidden;
+  padding: 18px;
+  background: var(--panel-surface);
+}
+
+.live-log-heading {
+  min-height: 38px;
+  margin-bottom: 0;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.live-log-heading .icon-button {
+  flex: 0 0 38px;
 }
 
 .compact-log-list {
   display: grid;
-  gap: 4px;
+  flex: 1 1 auto;
+  min-height: 180px;
+  min-width: 0;
+  max-height: min(360px, 42vh);
+  gap: 8px;
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .compact-log-row {
@@ -475,17 +528,23 @@ button.ghost {
   grid-template-columns: 76px 158px minmax(0, 1fr);
   gap: 10px;
   align-items: center;
-  min-height: 34px;
-  padding: 6px 10px;
+  min-width: 0;
+  min-height: 46px;
+  padding: 8px 12px;
   border: 1px solid var(--color-border);
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--subtle-surface);
   cursor: help;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
+.compact-log-row > * {
+  min-width: 0;
+}
+
 .compact-log-row time,
 .log-row time {
+  align-self: center;
   line-height: 1.2;
   white-space: nowrap;
 }
@@ -910,6 +969,7 @@ label {
 
 .badge {
   display: inline-flex;
+  align-self: center;
   align-items: center;
   justify-content: center;
   width: 76px;

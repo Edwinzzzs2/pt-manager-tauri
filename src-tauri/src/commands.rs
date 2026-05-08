@@ -514,6 +514,37 @@ pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn clear_browser_data(state: State<'_, AppState>) -> Result<(), String> {
+    if *state.task_running.lock().await {
+        return Err("保活任务执行中，请等待结束后再清除浏览器数据".to_string());
+    }
+
+    let config = state.config.lock().await.clone();
+    let site_urls = config
+        .sites
+        .iter()
+        .map(|site| site.url.clone())
+        .collect::<Vec<_>>();
+    let cdp = CdpClient::new(config.cdp_port);
+    let message = if let Some(active_port) = cdp.available_port().await {
+        CdpClient::new(active_port)
+            .clear_browser_data(&site_urls)
+            .await?;
+        format!("已通过 CDP 清除专用 Chrome 浏览器数据：localhost:{}", active_port)
+    } else {
+        let cleared = cdp::clear_dedicated_profile_data()?;
+        if cleared == 0 {
+            "专用 Chrome 浏览器数据为空，无需清除".to_string()
+        } else {
+            "已清除专用 Chrome Profile，Cookie、Local Storage 和缓存将在下次启动时重新生成".to_string()
+        }
+    };
+
+    push_log(&state.logs, LogEntry::success(message)).await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn open_chrome_download() -> Result<(), String> {
     open_url("https://www.google.com/chrome/").map_err(|err| err.to_string())
 }

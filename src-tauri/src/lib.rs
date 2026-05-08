@@ -73,6 +73,7 @@ pub fn run() {
             commands::stop_task,
             commands::get_logs,
             commands::clear_logs,
+            commands::clear_browser_data,
             commands::open_chrome_download,
         ])
         .run(tauri::generate_context!())

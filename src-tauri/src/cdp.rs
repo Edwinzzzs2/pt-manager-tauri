@@ -385,6 +385,24 @@ impl CdpClient {
         }
     }
 
+    /// 通过 CDP 清除专用浏览器数据，给 CookieCloud 重新同步前准备干净环境。
+    pub async fn clear_browser_data(&self, site_urls: &[String]) -> Result<(), String> {
+        let websocket_url = self.page_websocket_url().await?;
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        websocket.call("Network.clearBrowserCookies", serde_json::json!({}))?;
+        websocket.call("Network.clearBrowserCache", serde_json::json!({}))?;
+        for origin in unique_origins(site_urls) {
+            websocket.call(
+                "Storage.clearDataForOrigin",
+                serde_json::json!({
+                    "origin": origin,
+                    "storageTypes": "all"
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
     async fn page_websocket_url(&self) -> Result<String, String> {
         if let Some(url) = self.find_page_websocket_url()? {
             return Ok(url);
@@ -835,6 +853,20 @@ fn dom_storage_response_has_item(
 
 pub fn chrome_installed() -> bool {
     find_chrome_executable().is_some()
+}
+
+pub fn clear_dedicated_profile_data() -> Result<usize, String> {
+    let profile_dir = dedicated_profile_dir();
+    if profile_dir_in_use(&profile_dir) {
+        return Err("专用 Chrome 正在运行，请关闭专用 Chrome 后再清除离线浏览器数据".to_string());
+    }
+    if !profile_dir.exists() {
+        return Ok(0);
+    }
+
+    fs::remove_dir_all(&profile_dir)
+        .map_err(|err| format!("清除专用 Chrome Profile 失败：{}", err))?;
+    Ok(1)
 }
 
 fn read_http_response(stream: &mut TcpStream) -> Result<String, String> {
@@ -1379,6 +1411,33 @@ fn host_from_url(url: &str) -> Option<String> {
     } else {
         Some(host)
     }
+}
+
+fn origin_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let (scheme, rest) = if let Some(rest) = trimmed.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+    let host_port = rest.split(['/', '?', '#']).next()?.trim();
+    if host_port.is_empty() {
+        None
+    } else {
+        Some(format!("{}://{}", scheme, host_port.to_ascii_lowercase()))
+    }
+}
+
+fn unique_origins(urls: &[String]) -> Vec<String> {
+    let mut origins = Vec::new();
+    for origin in urls.iter().filter_map(|url| origin_from_url(url)) {
+        if !origins.iter().any(|existing| existing == &origin) {
+            origins.push(origin);
+        }
+    }
+    origins
 }
 
 fn find_chrome_executable() -> Option<PathBuf> {

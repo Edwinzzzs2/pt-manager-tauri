@@ -135,6 +135,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [cdpBusy, setCdpBusy] = useState(false);
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
+  const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [appVersion, setAppVersion] = useState("");
@@ -266,6 +267,37 @@ function App() {
       }
     } finally {
       setCookieSyncBusy(false);
+    }
+  }
+
+  async function clearBrowserData() {
+    const confirmed = await ask(
+      "将清除专用 Chrome 的 Cookie、Local Storage 和缓存。清除后可重新同步 CookieCloud，确定继续？",
+      {
+        kind: "warning",
+        okLabel: "清除",
+        cancelLabel: "取消",
+        title: "清除浏览器数据",
+      },
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setBrowserDataClearBusy(true);
+    setError(null);
+    try {
+      await invoke("clear_browser_data");
+      await refreshStatus();
+      await refreshLogs();
+      await message("浏览器数据已清除，可以重新同步 CookieCloud", {
+        kind: "info",
+        title: "清除完成",
+      });
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBrowserDataClearBusy(false);
     }
   }
 
@@ -522,7 +554,7 @@ function App() {
               lastLog={lastVisibleLog}
               onEnsureCdp={ensureCdp}
               onOpenChromeDownload={openChromeDownload}
-              recentLogs={logs.slice(-5).reverse()}
+              recentLogs={logs.slice(-30).reverse()}
               status={status}
               onRefresh={() => {
                 refreshStatus().catch(showError);
@@ -551,9 +583,11 @@ function App() {
           {activeTab === "settings" ? (
             <SettingsPanel
               busy={busy}
+              browserDataClearBusy={browserDataClearBusy}
               cookieSyncBusy={cookieSyncBusy}
               draft={settingsDraft}
               onChange={setSettingsDraft}
+              onClearBrowserData={clearBrowserData}
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               taskRunning={!!status?.is_running}
@@ -777,7 +811,7 @@ function Dashboard({
           </div>
         </div>
 
-        <div className="panel">
+        <div className="panel result-panel">
           <div className="panel-heading">
             <div>
               <p className="eyebrow">最近结果</p>
@@ -794,9 +828,8 @@ function Dashboard({
       </section>
 
       <section className="panel live-log-panel">
-        <div className="panel-heading">
+        <div className="panel-heading live-log-heading">
           <div>
-            <p className="eyebrow">Live</p>
             <h2>实时日志</h2>
           </div>
           <button className="icon-button" onClick={onRefresh} title="刷新日志" type="button">
@@ -952,18 +985,22 @@ function SitesPanel({
 }
 
 function SettingsPanel({
+  browserDataClearBusy,
   busy,
   cookieSyncBusy,
   draft,
   onChange,
+  onClearBrowserData,
   onSave,
   onSyncCookieCloud,
   taskRunning,
 }: {
+  browserDataClearBusy: boolean;
   busy: boolean;
   cookieSyncBusy: boolean;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
+  onClearBrowserData: () => void;
   onSave: () => void;
   onSyncCookieCloud: () => void;
   taskRunning: boolean;
@@ -1146,6 +1183,28 @@ function SettingsPanel({
             />
           </label>
         </div>
+        </section>
+
+        <section className="panel settings-card browser-data-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Chrome</p>
+              <h2>浏览器数据</h2>
+            </div>
+            <div className="row-actions">
+              <button
+                className="danger-action"
+                disabled={browserDataClearBusy || taskRunning}
+                onClick={onClearBrowserData}
+                type="button"
+              >
+                {browserDataClearBusy ? <RefreshCw size={16} /> : <Trash2 size={16} />}
+                <span>
+                  {taskRunning ? "任务执行中" : browserDataClearBusy ? "清除中" : "清除浏览器数据"}
+                </span>
+              </button>
+            </div>
+          </div>
         </section>
       </div>
 
