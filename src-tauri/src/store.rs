@@ -18,6 +18,14 @@ pub struct Site {
     pub id: String,
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub totp_secret: String,
+    #[serde(default)]
+    pub auto_login: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +43,8 @@ pub struct AppConfig {
     pub log_retention: usize,
     #[serde(default)]
     pub auto_sync_cookie: bool,
+    #[serde(default)]
+    pub auto_close_sync_tabs: bool,
     #[serde(default)]
     pub cookiecloud: CookieCloudConfig,
 }
@@ -58,6 +68,7 @@ impl Default for AppConfig {
             auto_launch: false,
             log_retention: DEFAULT_LOG_RETENTION,
             auto_sync_cookie: false,
+            auto_close_sync_tabs: false,
             cookiecloud: CookieCloudConfig::default(),
         }
     }

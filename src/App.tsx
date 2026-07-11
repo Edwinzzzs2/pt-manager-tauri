@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getVersion, setTheme as setTauriTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import {
@@ -12,6 +12,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  FileUp,
   HelpCircle,
   ListChecks,
   Moon,
@@ -35,7 +36,16 @@ type Site = {
   id: string;
   name: string;
   url: string;
+  username: string;
+  password: string;
+  totp_secret: string;
+  auto_login: boolean;
 };
+
+type SiteDraft = Pick<
+  Site,
+  "name" | "url" | "username" | "password" | "totp_secret" | "auto_login"
+>;
 
 type AppConfig = {
   sites: Site[];
@@ -47,6 +57,7 @@ type AppConfig = {
   auto_launch: boolean;
   log_retention: number;
   auto_sync_cookie: boolean;
+  auto_close_sync_tabs: boolean;
   cookiecloud: CookieCloudConfig;
 };
 
@@ -79,6 +90,12 @@ type CookieCloudSyncResult = {
   imported_local_storages: number;
 };
 
+type SiteImportResult = {
+  config: AppConfig;
+  imported: number;
+  skipped: number;
+};
+
 type TabKey = "dashboard" | "sites" | "settings" | "logs";
 type ColorMode = "dark" | "light";
 
@@ -95,6 +112,7 @@ const defaultConfig: AppConfig = {
   auto_launch: false,
   log_retention: 500,
   auto_sync_cookie: false,
+  auto_close_sync_tabs: false,
   cookiecloud: {
     server_url: "",
     uuid: "",
@@ -129,9 +147,23 @@ function App() {
   const [settingsDraft, setSettingsDraft] = useState<AppConfig>(defaultConfig);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [newSite, setNewSite] = useState({ name: "", url: "" });
+  const [newSite, setNewSite] = useState<SiteDraft>({
+    name: "",
+    url: "",
+    username: "",
+    password: "",
+    totp_secret: "",
+    auto_login: false,
+  });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
-  const [editingSite, setEditingSite] = useState({ name: "", url: "" });
+  const [editingSite, setEditingSite] = useState<SiteDraft>({
+    name: "",
+    url: "",
+    username: "",
+    password: "",
+    totp_secret: "",
+    auto_login: false,
+  });
   const [busy, setBusy] = useState(false);
   const [cdpBusy, setCdpBusy] = useState(false);
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
@@ -312,11 +344,53 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const next = await invoke<AppConfig>("add_site", { name, url });
+      const next = await invoke<AppConfig>("add_site", {
+        name,
+        url,
+        username: newSite.username.trim(),
+        password: newSite.password,
+        totpSecret: newSite.totp_secret.trim(),
+        autoLogin: newSite.auto_login,
+      });
       setConfig(next);
       setSettingsDraft(next);
-      setNewSite({ name: "", url: "" });
+      setNewSite({
+        name: "",
+        url: "",
+        username: "",
+        password: "",
+        totp_secret: "",
+        auto_login: false,
+      });
       await refreshStatus();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importSites() {
+    const path = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) {
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await invoke<SiteImportResult>("import_sites_from_json", { path });
+      setConfig(result.config);
+      setSettingsDraft(result.config);
+      await refreshStatus();
+      await message(`成功导入 ${result.imported} 个站点，跳过 ${result.skipped} 个`, {
+        kind: "info",
+        title: "导入完成",
+      });
     } catch (err) {
       showError(err);
     } finally {
@@ -326,7 +400,14 @@ function App() {
 
   function startEdit(site: Site) {
     setEditingSiteId(site.id);
-    setEditingSite({ name: site.name, url: site.url });
+    setEditingSite({
+      name: site.name,
+      url: site.url,
+      username: site.username,
+      password: site.password,
+      totp_secret: site.totp_secret,
+      auto_login: site.auto_login,
+    });
   }
 
   async function saveSite(id: string) {
@@ -340,7 +421,15 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const next = await invoke<AppConfig>("update_site", { id, name, url });
+      const next = await invoke<AppConfig>("update_site", {
+        id,
+        name,
+        url,
+        username: editingSite.username.trim(),
+        password: editingSite.password,
+        totpSecret: editingSite.totp_secret.trim(),
+        autoLogin: editingSite.auto_login,
+      });
       setConfig(next);
       setSettingsDraft(next);
       setEditingSiteId(null);
@@ -362,6 +451,24 @@ function App() {
       await refreshStatus();
     } catch (err) {
       showError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeSites(ids: string[]) {
+    if (ids.length === 0) return false;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invoke<AppConfig>("remove_sites", { ids });
+      setConfig(next);
+      setSettingsDraft(next);
+      await refreshStatus();
+      return true;
+    } catch (err) {
+      showError(err);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -571,10 +678,12 @@ function App() {
               editingSiteId={editingSiteId}
               newSite={newSite}
               onAdd={addSite}
+              onImport={importSites}
               onCancelEdit={() => setEditingSiteId(null)}
               onEditChange={setEditingSite}
               onNewSiteChange={setNewSite}
               onRemove={removeSite}
+              onRemoveSelected={removeSites}
               onSave={saveSite}
               onStartEdit={startEdit}
             />
@@ -740,6 +849,7 @@ function Dashboard({
 }) {
   const chromeInstalled = status?.chrome_installed !== false;
   const chromeConnected = !!status?.cdp_connected;
+  const latestResult = status?.last_result ?? lastLog;
 
   return (
     <div className="dashboard">
@@ -815,14 +925,16 @@ function Dashboard({
           <div className="panel-heading">
             <div>
               <p className="eyebrow">最近结果</p>
-              <h2>{status?.last_result?.level ?? "暂无任务"}</h2>
+              <h2>{latestResult ? levelLabel(latestResult.level) : "暂无任务"}</h2>
             </div>
-            <span className={status?.last_result ? levelClass(status.last_result.level) : "badge"}>
-              {status?.last_result ? formatTime(status.last_result.timestamp) : "待执行"}
+            <span className={latestResult ? levelClass(latestResult.level) : "badge"}>
+              {latestResult ? formatTime(latestResult.timestamp) : "待执行"}
             </span>
           </div>
-          <p className="result-text">
-            {status?.last_result?.message ?? lastLog?.message ?? "添加站点后即可开始，Chrome 会在运行时自动准备。"}
+          <p className="result-text" title={latestResult?.message}>
+            {latestResult
+              ? summarizeResult(latestResult.message)
+              : "添加站点后即可开始，Chrome 会在运行时自动准备。"}
           </p>
         </div>
       </section>
@@ -885,26 +997,84 @@ function SitesPanel({
   editingSiteId,
   newSite,
   onAdd,
+  onImport,
   onCancelEdit,
   onEditChange,
   onNewSiteChange,
   onRemove,
+  onRemoveSelected,
   onSave,
   onStartEdit,
 }: {
   busy: boolean;
   config: AppConfig;
-  editingSite: { name: string; url: string };
+  editingSite: SiteDraft;
   editingSiteId: string | null;
-  newSite: { name: string; url: string };
+  newSite: SiteDraft;
   onAdd: () => void;
+  onImport: () => void;
   onCancelEdit: () => void;
-  onEditChange: (site: { name: string; url: string }) => void;
-  onNewSiteChange: (site: { name: string; url: string }) => void;
-  onRemove: (id: string) => void;
+  onEditChange: (site: SiteDraft) => void;
+  onNewSiteChange: (site: SiteDraft) => void;
+  onRemove: (id: string) => Promise<void>;
+  onRemoveSelected: (ids: string[]) => Promise<boolean>;
   onSave: (id: string) => void;
   onStartEdit: (site: Site) => void;
 }) {
+  const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
+  const [showSitePassword, setShowSitePassword] = useState(false);
+  const [showTotpSecret, setShowTotpSecret] = useState(false);
+  const allSelected = config.sites.length > 0 && selectedSiteIds.size === config.sites.length;
+
+  useEffect(() => {
+    const availableIds = new Set(config.sites.map((site) => site.id));
+    setSelectedSiteIds((current) =>
+      new Set([...current].filter((id) => availableIds.has(id))),
+    );
+  }, [config.sites]);
+
+  function toggleSite(id: string) {
+    setSelectedSiteIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function startEditingSite(site: Site) {
+    setShowSitePassword(false);
+    setShowTotpSecret(false);
+    onStartEdit(site);
+  }
+
+  function cancelEditingSite() {
+    setShowSitePassword(false);
+    setShowTotpSecret(false);
+    onCancelEdit();
+  }
+
+  async function removeSelectedSites() {
+    const count = selectedSiteIds.size;
+    if (count === 0) return;
+    const confirmed = await ask(`确定删除选中的 ${count} 个站点吗？此操作无法撤销。`, {
+      kind: "warning",
+      title: "批量删除站点",
+    });
+    if (!confirmed) return;
+    if (await onRemoveSelected([...selectedSiteIds])) {
+      setSelectedSiteIds(new Set());
+    }
+  }
+
+  async function removeSingleSite(site: Site) {
+    const confirmed = await ask(`确定删除站点“${site.name}”吗？此操作无法撤销。`, {
+      kind: "warning",
+      title: "删除站点",
+    });
+    if (confirmed) await onRemove(site.id);
+  }
+
   return (
     <div className="content-stack sites-stack">
       <section className="panel site-form">
@@ -918,11 +1088,50 @@ function SitesPanel({
           placeholder="https://example.com"
           value={newSite.url}
         />
-        <button disabled={busy} onClick={onAdd} type="button">
-          <Plus size={17} />
-          <span>新增</span>
-        </button>
+        <div className="site-form-actions">
+          <button
+            className="ghost"
+            disabled={busy}
+            onClick={onImport}
+            title={'支持 [{"name":"站点名","url":"https://example.com"}] 或 {"sites":[...] }'}
+            type="button"
+          >
+            <FileUp size={17} />
+            <span>导入 JSON</span>
+          </button>
+          <button disabled={busy} onClick={onAdd} type="button">
+            <Plus size={17} />
+            <span>新增</span>
+          </button>
+        </div>
       </section>
+
+      {config.sites.length > 0 ? (
+        <div className="site-selection-bar">
+          <label>
+            <input
+              checked={allSelected}
+              onChange={() =>
+                setSelectedSiteIds(
+                  allSelected ? new Set() : new Set(config.sites.map((site) => site.id)),
+                )
+              }
+              type="checkbox"
+            />
+            <span>{allSelected ? "取消全选" : "全选"}</span>
+          </label>
+          <span>已选 {selectedSiteIds.size} 项</span>
+          <button
+            className="danger-action"
+            disabled={busy || selectedSiteIds.size === 0}
+            onClick={removeSelectedSites}
+            type="button"
+          >
+            <Trash2 size={16} />
+            <span>批量删除</span>
+          </button>
+        </div>
+      ) : null}
 
       <section className="site-list site-list-scroll">
         {config.sites.length === 0 ? (
@@ -931,26 +1140,102 @@ function SitesPanel({
           config.sites.map((site) => {
             const editing = editingSiteId === site.id;
             return (
-              <article className="site-row" key={site.id}>
+              <article className={editing ? "site-row editing" : "site-row"} key={site.id}>
+                <input
+                  aria-label={`选择 ${site.name}`}
+                  checked={selectedSiteIds.has(site.id)}
+                  className="site-select-checkbox"
+                  onChange={() => toggleSite(site.id)}
+                  type="checkbox"
+                />
                 {editing ? (
-                  <>
+                  <div className="site-edit-fields">
                     <input
                       onChange={(event) =>
                         onEditChange({ ...editingSite, name: event.target.value })
                       }
+                      placeholder="站点名称"
                       value={editingSite.name}
                     />
                     <input
                       onChange={(event) =>
                         onEditChange({ ...editingSite, url: event.target.value })
                       }
+                      placeholder="站点 URL"
                       value={editingSite.url}
                     />
-                  </>
+                    <input
+                      autoComplete="username"
+                      onChange={(event) =>
+                        onEditChange({ ...editingSite, username: event.target.value })
+                      }
+                      placeholder="登录用户名"
+                      value={editingSite.username}
+                    />
+                    <div className="password-field">
+                      <input
+                        autoComplete="new-password"
+                        onChange={(event) =>
+                          onEditChange({ ...editingSite, password: event.target.value })
+                        }
+                        placeholder="登录密码"
+                        type={showSitePassword ? "text" : "password"}
+                        value={editingSite.password}
+                      />
+                      <button
+                        aria-label={showSitePassword ? "隐藏登录密码" : "显示登录密码"}
+                        onClick={() => setShowSitePassword((value) => !value)}
+                        type="button"
+                      >
+                        {showSitePassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                    <div className="password-field site-secret-field">
+                      <input
+                        autoComplete="off"
+                        onChange={(event) =>
+                          onEditChange({ ...editingSite, totp_secret: event.target.value })
+                        }
+                        placeholder="2FA Base32 密钥"
+                        type={showTotpSecret ? "text" : "password"}
+                        value={editingSite.totp_secret}
+                      />
+                      <button
+                        aria-label={showTotpSecret ? "隐藏 2FA 密钥" : "显示 2FA 密钥"}
+                        onClick={() => setShowTotpSecret((value) => !value)}
+                        type="button"
+                      >
+                        {showTotpSecret ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
+                    <label className="switch-row site-auto-login">
+                      <span>需要自动登录</span>
+                      <input
+                        checked={editingSite.auto_login}
+                        onChange={(event) =>
+                          onEditChange({ ...editingSite, auto_login: event.target.checked })
+                        }
+                        type="checkbox"
+                      />
+                    </label>
+                  </div>
                 ) : (
                   <div className="site-main">
-                    <strong>{site.name}</strong>
-                    <span>{site.url}</span>
+                    <div className="site-title-line">
+                      <strong>{site.name}</strong>
+                      <span className={site.auto_login ? "site-login-badge active" : "site-login-badge"}>
+                        {site.auto_login ? "自动登录" : "仅保活"}
+                      </span>
+                    </div>
+                    <div className="site-details">
+                      <span className="site-url">{site.url}</span>
+                      {site.username || site.totp_secret ? (
+                        <div className="site-auth-details">
+                          {site.username ? <span>账号：{site.username}</span> : null}
+                          {site.totp_secret ? <TotpCode secret={site.totp_secret} /> : null}
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
                 )}
                 <div className="row-actions">
@@ -960,16 +1245,23 @@ function SitesPanel({
                         <Save size={16} />
                         <span>保存</span>
                       </button>
-                      <button className="ghost" onClick={onCancelEdit} type="button">
+                      <button className="ghost" onClick={cancelEditingSite} type="button">
                         取消
                       </button>
                     </>
                   ) : (
                     <>
-                      <button onClick={() => onStartEdit(site)} type="button">
+                      <button onClick={() => startEditingSite(site)} type="button">
                         编辑
                       </button>
-                      <button className="danger-button" onClick={() => onRemove(site.id)} type="button">
+                      <button
+                        aria-label={`删除 ${site.name}`}
+                        className="danger-action site-delete-button"
+                        disabled={busy}
+                        onClick={() => removeSingleSite(site)}
+                        title="删除站点"
+                        type="button"
+                      >
                         <Trash2 size={16} />
                       </button>
                     </>
@@ -1051,7 +1343,7 @@ function SettingsPanel({
             />
           </label>
           <label>
-            <span>页面停留秒数</span>
+            <span>保活页面停留时间（秒）</span>
             <input
               min={5}
               onChange={(event) =>
@@ -1182,6 +1474,16 @@ function SettingsPanel({
               type="checkbox"
             />
           </label>
+          <label className="switch-row">
+            <span>同步完成 15 秒后自动关闭</span>
+            <input
+              checked={draft.auto_close_sync_tabs}
+              onChange={(event) =>
+                onChange({ ...draft, auto_close_sync_tabs: event.target.checked })
+              }
+              type="checkbox"
+            />
+          </label>
         </div>
         </section>
 
@@ -1292,6 +1594,78 @@ function LogsPanel({
   );
 }
 
+function TotpCode({ secret }: { secret: string }) {
+  const [code, setCode] = useState("------");
+  const [remaining, setRemaining] = useState(30);
+
+  useEffect(() => {
+    let active = true;
+    const update = async () => {
+      const now = Math.floor(Date.now() / 1000);
+      setRemaining(30 - (now % 30));
+      try {
+        const next = await generateTotp(secret, now);
+        if (active) setCode(next);
+      } catch {
+        if (active) setCode("密钥无效");
+      }
+    };
+    update();
+    const timer = window.setInterval(update, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [secret]);
+
+  return (
+    <span className="totp-code" title="当前 2FA 动态验证码">
+      2FA <strong>{code}</strong>
+      {code !== "密钥无效" ? <small>{remaining}s</small> : null}
+    </span>
+  );
+}
+
+async function generateTotp(secret: string, unixSeconds: number) {
+  const keyBytes = decodeBase32(secret);
+  const counter = BigInt(Math.floor(unixSeconds / 30));
+  const message = new ArrayBuffer(8);
+  new DataView(message).setBigUint64(0, counter);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"],
+  );
+  const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, message));
+  const offset = digest[digest.length - 1] & 0x0f;
+  const value =
+    (((digest[offset] & 0x7f) << 24) |
+      ((digest[offset + 1] & 0xff) << 16) |
+      ((digest[offset + 2] & 0xff) << 8) |
+      (digest[offset + 3] & 0xff)) %
+    1_000_000;
+  return value.toString().padStart(6, "0");
+}
+
+function decodeBase32(value: string) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const normalized = value.toUpperCase().replace(/[\s=-]/g, "");
+  if (!normalized || [...normalized].some((char) => !alphabet.includes(char))) {
+    throw new Error("Invalid Base32 secret");
+  }
+  let bits = "";
+  for (const char of normalized) {
+    bits += alphabet.indexOf(char).toString(2).padStart(5, "0");
+  }
+  const bytes = new Uint8Array(Math.floor(bits.length / 8));
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(bits.slice(index * 8, index * 8 + 8), 2);
+  }
+  return bytes;
+}
+
 function pageTitle(tab: TabKey) {
   return {
     dashboard: "状态总览",
@@ -1317,6 +1691,21 @@ function formatTime(value: string) {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(value));
+}
+
+function summarizeResult(message: string) {
+  if (message.startsWith("CookieCloud 同步完成：")) {
+    return message.split("；", 1)[0];
+  }
+  return message;
+}
+
+function levelLabel(level: LogEntry["level"]) {
+  return {
+    SUCCESS: "执行成功",
+    ERROR: "执行失败",
+    INFO: "执行信息",
+  }[level];
 }
 
 function formatLogTime(value: string) {

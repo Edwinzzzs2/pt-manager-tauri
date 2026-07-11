@@ -353,9 +353,10 @@ async fn sync_cookiecloud_before_keepalive(
     };
     let active_cdp = CdpClient::new(active_port);
     let imported_cookies = active_cdp.set_cookies(&sync_data.cookies).await?.len();
-    let imported_storages = CdpClient::new(active_port)
-        .set_local_storage(&sync_data.local_storages)
-        .await?
+    let (imported_storages, opened_sync_tabs) = CdpClient::new(active_port)
+        .set_local_storage_with_opened_tabs(&sync_data.local_storages)
+        .await?;
+    let imported_storages = imported_storages
         .iter()
         .map(|storage| storage.items.len())
         .sum::<usize>();
@@ -365,6 +366,27 @@ async fn sync_cookiecloud_before_keepalive(
     CdpClient::new(active_port)
         .reload_tabs_for_sites(&site_urls)
         .await;
+
+    if config.auto_close_sync_tabs && !opened_sync_tabs.is_empty() {
+        let logs = Arc::clone(logs);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let cdp = CdpClient::new(active_port);
+            let mut closed = 0usize;
+            for tab_id in opened_sync_tabs {
+                if cdp.close_tab(&tab_id).await.is_ok() {
+                    closed += 1;
+                }
+            }
+            if closed > 0 {
+                push_log(
+                    &logs,
+                    LogEntry::info(format!("Cookie 同步自动打开的 {} 个标签页已关闭", closed)),
+                )
+                .await;
+            }
+        });
+    }
 
     Ok((
         sync_data.cookies.len() + local_storage_item_count(&sync_data.local_storages),

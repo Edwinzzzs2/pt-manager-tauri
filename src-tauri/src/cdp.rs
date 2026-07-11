@@ -295,19 +295,26 @@ impl CdpClient {
         Ok(imported)
     }
 
-    pub async fn set_local_storage(
+    /// 写入 Local Storage，并返回本次为写入数据而新打开的标签页 ID。
+    /// 调用方可据此延迟关闭标签页，不影响用户原本已经打开的页面。
+    pub async fn set_local_storage_with_opened_tabs(
         &self,
         storages: &[CdpLocalStorageParam],
-    ) -> Result<Vec<CdpLocalStorageParam>, String> {
+    ) -> Result<(Vec<CdpLocalStorageParam>, Vec<String>), String> {
         if storages.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut imported = Vec::new();
+        let mut opened_tab_ids = Vec::new();
         for storage in storages {
             let tab_id = match self.find_tab_for_url(&storage.origin).await {
                 Some(tab_id) => tab_id,
-                None => self.open_tab(&storage.origin).await?,
+                None => {
+                    let tab_id = self.open_tab(&storage.origin).await?;
+                    opened_tab_ids.push(tab_id.clone());
+                    tab_id
+                }
             };
             self.wait_for_tab_host(&tab_id, &storage.host).await;
             let Some(websocket_url) = self.websocket_url_for_tab(&tab_id)? else {
@@ -338,7 +345,7 @@ impl CdpClient {
             }
         }
 
-        Ok(imported)
+        Ok((imported, opened_tab_ids))
     }
 
     /// Cookie 写入后，对 Chrome 中已打开的目标站点页面执行刷新，

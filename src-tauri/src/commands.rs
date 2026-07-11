@@ -3,10 +3,13 @@ use crate::cookiecloud;
 use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
 use chrono::{DateTime, Local};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::process::Command;
+use std::time::Duration;
 use tauri::State;
 use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::Mutex;
@@ -40,6 +43,27 @@ pub struct CookieCloudSyncResult {
     pub imported_local_storages: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImportedSite {
+    name: String,
+    url: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    totp_secret: String,
+    #[serde(default)]
+    auto_login: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SiteImportResult {
+    pub config: AppConfig,
+    pub imported: usize,
+    pub skipped: usize,
+}
+
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     let config = state.config.lock().await;
@@ -69,12 +93,20 @@ pub async fn add_site(
     state: State<'_, AppState>,
     name: String,
     url: String,
+    username: String,
+    password: String,
+    totp_secret: String,
+    auto_login: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     let site = store::Site {
         id: uuid::Uuid::new_v4().to_string(),
         name,
         url,
+        username,
+        password,
+        totp_secret,
+        auto_login,
     };
     config.sites.push(site);
     store::save_config(&state.app_handle, &config);
@@ -82,6 +114,58 @@ pub async fn add_site(
     drop(config);
     restart_scheduler(&state, next.clone()).await;
     Ok(next)
+}
+
+#[tauri::command]
+pub async fn import_sites_from_json(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<SiteImportResult, String> {
+    let content = fs::read_to_string(PathBuf::from(path))
+        .map_err(|err| format!("读取 JSON 文件失败：{}", err))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|err| format!("JSON 格式错误：{}", err))?;
+    let sites_value = value.get("sites").cloned().unwrap_or(value);
+    let imported_sites: Vec<ImportedSite> = serde_json::from_value(sites_value)
+        .map_err(|_| "JSON 应为站点数组，或包含 sites 数组；每项需有 name 和 url".to_string())?;
+
+    let mut config = state.config.lock().await;
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for site in imported_sites {
+        let name = site.name.trim();
+        let url = site.url.trim();
+        let valid_url = (url.starts_with("http://") || url.starts_with("https://"))
+            && url.split_once("://").is_some_and(|(_, rest)| !rest.is_empty());
+        let duplicate = config
+            .sites
+            .iter()
+            .any(|existing| existing.url.trim_end_matches('/').eq_ignore_ascii_case(url.trim_end_matches('/')));
+        if name.is_empty() || !valid_url || duplicate {
+            skipped += 1;
+            continue;
+        }
+        config.sites.push(store::Site {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            url: url.to_string(),
+            username: site.username.trim().to_string(),
+            password: site.password,
+            totp_secret: site.totp_secret.trim().replace(' ', ""),
+            auto_login: site.auto_login,
+        });
+        imported += 1;
+    }
+
+    store::save_config(&state.app_handle, &config);
+    let next = config.clone();
+    drop(config);
+    restart_scheduler(&state, next.clone()).await;
+    Ok(SiteImportResult {
+        config: next,
+        imported,
+        skipped,
+    })
 }
 
 #[tauri::command]
@@ -96,16 +180,39 @@ pub async fn remove_site(state: State<'_, AppState>, id: String) -> Result<AppCo
 }
 
 #[tauri::command]
+pub async fn remove_sites(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<AppConfig, String> {
+    let ids = ids.into_iter().collect::<std::collections::HashSet<_>>();
+    let mut config = state.config.lock().await;
+    config.sites.retain(|site| !ids.contains(&site.id));
+    store::save_config(&state.app_handle, &config);
+    let next = config.clone();
+    drop(config);
+    restart_scheduler(&state, next.clone()).await;
+    Ok(next)
+}
+
+#[tauri::command]
 pub async fn update_site(
     state: State<'_, AppState>,
     id: String,
     name: String,
     url: String,
+    username: String,
+    password: String,
+    totp_secret: String,
+    auto_login: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
         site.name = name;
         site.url = url;
+        site.username = username;
+        site.password = password;
+        site.totp_secret = totp_secret.trim().replace(' ', "");
+        site.auto_login = auto_login;
     }
     store::save_config(&state.app_handle, &config);
     let next = config.clone();
@@ -218,8 +325,8 @@ async fn import_cookiecloud_cookies(
             return Err(format!("Cookie 已拉取，但写入 Chrome 失败：{}", err));
         }
     };
-    let imported_local_storages = CdpClient::new(write_port)
-        .set_local_storage(&sync_data.local_storages)
+    let (imported_local_storages, opened_sync_tabs) = CdpClient::new(write_port)
+        .set_local_storage_with_opened_tabs(&sync_data.local_storages)
         .await
         .map_err(|err| format!("Local Storage 已拉取，但写入 Chrome 失败：{}", err))?;
 
@@ -228,6 +335,27 @@ async fn import_cookiecloud_cookies(
     CdpClient::new(write_port)
         .reload_tabs_for_sites(&site_urls)
         .await;
+
+    if config.auto_close_sync_tabs && !opened_sync_tabs.is_empty() {
+        let logs = Arc::clone(&state.logs);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let cdp = CdpClient::new(write_port);
+            let mut closed = 0usize;
+            for tab_id in opened_sync_tabs {
+                if cdp.close_tab(&tab_id).await.is_ok() {
+                    closed += 1;
+                }
+            }
+            if closed > 0 {
+                push_log(
+                    &logs,
+                    LogEntry::info(format!("Cookie 同步自动打开的 {} 个标签页已关闭", closed)),
+                )
+                .await;
+            }
+        });
+    }
 
     let result = CookieCloudSyncResult {
         matched_cookies: sync_data.cookies.len(),
