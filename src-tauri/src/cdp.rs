@@ -726,6 +726,109 @@ impl CdpClient {
         Err("HDKylin 登录后仍停留在登录页，请检查凭据或人工验证要求".to_string())
     }
 
+    /// 等待 Audiences 的 Cloudflare 自动验证，并填写可自动处理的登录字段。
+    pub async fn login_audiences(
+        &self,
+        tab_id: &str,
+        username: &str,
+        password: &str,
+        totp_secret: Option<&str>,
+    ) -> Result<bool, String> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
+            return Err("无法连接 Audiences 标签页".to_string());
+        };
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        let mut login_ready = false;
+        let mut stable_logged_in = 0usize;
+
+        for _ in 0..240 {
+            if let Some(current) = audiences_login_page_state(&mut websocket) {
+                if current.has_login_form {
+                    login_ready = true;
+                    break;
+                }
+                if current.ready && !current.challenge && current.path != "/login.php" {
+                    stable_logged_in += 1;
+                    if stable_logged_in >= 6 {
+                        return Ok(false);
+                    }
+                } else {
+                    stable_logged_in = 0;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if !login_ready {
+            return Err("等待 Audiences Cloudflare 验证放行超时（120 秒）".to_string());
+        }
+
+        human_delay(650, 1350).await;
+        if !type_runtime_input(
+            &mut websocket,
+            "input[name=\"username\"]",
+            username,
+            45,
+            120,
+        )
+        .await
+        {
+            return Err("未找到 Audiences 用户名输入框".to_string());
+        }
+        human_delay(500, 1150).await;
+        if !type_runtime_input(
+            &mut websocket,
+            "input[name=\"password\"]",
+            password,
+            55,
+            140,
+        )
+        .await
+        {
+            return Err("未找到 Audiences 密码输入框".to_string());
+        }
+        if let Some(secret) = totp_secret {
+            let code = auth::current_totp(secret)?;
+            human_delay(450, 950).await;
+            if !type_runtime_input(
+                &mut websocket,
+                "input[name=\"scode\"]",
+                &code,
+                70,
+                145,
+            )
+            .await
+            {
+                return Err("未找到 Audiences 两步验证码输入框".to_string());
+            }
+        }
+
+        let current = audiences_login_page_state(&mut websocket)
+            .ok_or_else(|| "无法读取 Audiences 登录表单状态".to_string())?;
+        if current.has_captcha {
+            return Err("Audiences 登录信息已填写，请人工输入图片验证码并点击登录".to_string());
+        }
+        human_delay(750, 1550).await;
+        if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"]") {
+            return Err("未找到 Audiences 登录按钮".to_string());
+        }
+        stable_logged_in = 0;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let Some(current) = audiences_login_page_state(&mut websocket) else {
+                continue;
+            };
+            if current.ready && !current.challenge && !current.has_login_form {
+                stable_logged_in += 1;
+                if stable_logged_in >= 4 {
+                    return Ok(true);
+                }
+            } else {
+                stable_logged_in = 0;
+            }
+        }
+        Err("Audiences 登录后仍停留在登录页，请检查凭据".to_string())
+    }
+
     fn request(&self, method: &str, path: &str, timeout: Duration) -> Result<HttpResponse, String> {
         let addr = ("127.0.0.1", self.port)
             .to_socket_addrs()
@@ -770,6 +873,48 @@ struct HdkLoginPageState {
     has_captcha: bool,
     challenge: bool,
     blocked_debug: bool,
+}
+
+struct AudiencesLoginPageState {
+    path: String,
+    ready: bool,
+    has_login_form: bool,
+    has_captcha: bool,
+    challenge: bool,
+}
+
+fn audiences_login_page_state(websocket: &mut CdpWebSocket) -> Option<AudiencesLoginPageState> {
+    let expression = r#"(() => {
+        const username = document.querySelector('input[name="username"]');
+        const password = document.querySelector('input[name="password"]');
+        const submit = document.querySelector('input[type="submit"][value="登录"]');
+        const captcha = document.querySelector('input[name="imagestring"]');
+        const body = (document.body?.innerText || '').slice(0, 5000).toLowerCase();
+        return {
+            path: location.pathname,
+            ready: document.readyState === 'interactive' || document.readyState === 'complete',
+            hasLoginForm: Boolean(username && password && submit),
+            hasCaptcha: Boolean(captcha && captcha.type !== 'hidden'),
+            challenge: /(just a moment|checking your browser|cloudflare|正在进行安全验证|安全验证)/.test(body)
+        };
+    })()"#;
+    let response = websocket
+        .call(
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": expression,
+                "returnByValue": true
+            }),
+        )
+        .ok()?;
+    let value = response.get("result")?.get("result")?.get("value")?;
+    Some(AudiencesLoginPageState {
+        path: value.get("path")?.as_str()?.to_string(),
+        ready: value.get("ready")?.as_bool()?,
+        has_login_form: value.get("hasLoginForm")?.as_bool()?,
+        has_captcha: value.get("hasCaptcha")?.as_bool()?,
+        challenge: value.get("challenge")?.as_bool()?,
+    })
 }
 
 fn hdk_login_page_state(websocket: &mut CdpWebSocket) -> Option<HdkLoginPageState> {

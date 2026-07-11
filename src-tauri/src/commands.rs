@@ -240,8 +240,9 @@ pub async fn test_site_login(
     let site_url = site.url.to_ascii_lowercase();
     let is_mteam = site_url.contains("kp.m-team.cc");
     let is_hdkylin = site_url.contains("hdkyl.in");
-    if !is_mteam && !is_hdkylin {
-        return Err("当前单站测试仅支持 M-Team 和 HDKylin".to_string());
+    let is_audiences = site_url.contains("audiences.me");
+    if !is_mteam && !is_hdkylin && !is_audiences {
+        return Err("当前单站测试仅支持 M-Team、HDKylin 和 Audiences".to_string());
     }
     if site.username.trim().is_empty() || site.password.is_empty() {
         return Err("请先配置登录用户名和密码".to_string());
@@ -280,9 +281,13 @@ pub async fn test_site_login(
         };
         cdp.login_mteam(&tab_id, &site.username, &site.password, totp.as_deref())
             .await
-    } else {
+    } else if is_hdkylin {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
         cdp.login_hdkylin(&tab_id, &site.username, &site.password, secret)
+            .await
+    } else {
+        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+        cdp.login_audiences(&tab_id, &site.username, &site.password, secret)
             .await
     };
     let message = match login_result {

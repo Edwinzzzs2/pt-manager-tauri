@@ -423,7 +423,8 @@ async fn try_auto_login_site(
     let site_url = site.url.to_ascii_lowercase();
     let is_mteam = site_url.contains("kp.m-team.cc");
     let is_hdkylin = site_url.contains("hdkyl.in");
-    if !is_mteam && !is_hdkylin {
+    let is_audiences = site_url.contains("audiences.me");
+    if !is_mteam && !is_hdkylin && !is_audiences {
         push_log(
             logs,
             LogEntry::info(format!("{} 已开启自动登录，但该站点暂未适配", site.name)),
@@ -450,9 +451,13 @@ async fn try_auto_login_site(
         };
         cdp.login_mteam(tab_id, &site.username, &site.password, totp.as_deref())
             .await
-    } else {
+    } else if is_hdkylin {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
         cdp.login_hdkylin(tab_id, &site.username, &site.password, secret)
+            .await
+    } else {
+        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+        cdp.login_audiences(tab_id, &site.username, &site.password, secret)
             .await
     };
     match login_result {
