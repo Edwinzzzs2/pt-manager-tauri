@@ -833,7 +833,7 @@ impl CdpClient {
                     human_delay(450, 950).await;
                     if !type_runtime_input(
                         &mut websocket,
-                        "input[name=\"two_factor\"], input[name=\"twofactor\"], input[name=\"otp\"], input[name=\"two_factor_code\"], input[name=\"2fa_secret\"], input[name=\"2fa\"], input[autocomplete=\"one-time-code\"]",
+                        "input[name=\"two_factor\"], input[name=\"twofactor\"], input[name=\"two_step_code\"], input[name=\"otp\"], input[name=\"two_factor_code\"], input[name=\"2fa_secret\"], input[name=\"2fa\"], input[autocomplete=\"one-time-code\"]",
                         &code,
                         70,
                         145,
@@ -964,6 +964,7 @@ impl CdpClient {
 
             let mut captcha_solved = false;
             let mut logged_challenge_msg = false;
+            let mut stable_solved_samples = 0usize;
             
             for _ in 0..120 { // 最多等待 60 秒
                 if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
@@ -971,16 +972,26 @@ impl CdpClient {
                 }
                 
                 let eval_expr = r#"(() => {
-                    const fields = document.querySelectorAll('textarea[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
-                    if (fields.length === 0) return { hasChallenge: false, solved: true };
-                    let solved = false;
-                    for (const f of fields) {
-                        if (f.value && f.value.trim().length > 10) {
-                            solved = true;
-                            break;
-                        }
-                    }
-                    return { hasChallenge: true, solved: solved };
+                    const fields = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
+                    const challengeElement = document.querySelector([
+                        '.cf-turnstile',
+                        '.g-recaptcha',
+                        '.h-captcha',
+                        'iframe[src*="challenges.cloudflare.com"]',
+                        'iframe[src*="recaptcha"]',
+                        'iframe[src*="hcaptcha.com"]'
+                    ].join(','));
+                    const challengeScript = Array.from(document.scripts).some((script) => {
+                        const src = (script.src || '').toLowerCase();
+                        return src.includes('challenges.cloudflare.com/turnstile')
+                            || src.includes('recaptcha/api.js')
+                            || src.includes('hcaptcha.com/1/api.js');
+                    });
+                    const hasChallenge = fields.length > 0 || Boolean(challengeElement) || challengeScript;
+                    const solved = Array.from(fields).some((field) =>
+                        typeof field.value === 'string' && field.value.trim().length > 10
+                    );
+                    return { hasChallenge, solved };
                 })()"#;
                 
                 let val_res = websocket.call("Runtime.evaluate", serde_json::json!({
@@ -993,9 +1004,19 @@ impl CdpClient {
                         let has_challenge = val.get("hasChallenge").and_then(|v| v.as_bool()).unwrap_or(false);
                         let solved = val.get("solved").and_then(|v| v.as_bool()).unwrap_or(true);
                         
-                        if !has_challenge || solved {
+                        if !has_challenge {
                             captcha_solved = true;
                             break;
+                        }
+
+                        if solved {
+                            stable_solved_samples += 1;
+                            if stable_solved_samples >= 2 {
+                                captcha_solved = true;
+                                break;
+                            }
+                        } else {
+                            stable_solved_samples = 0;
                         }
                         
                         if !logged_challenge_msg {
@@ -1017,9 +1038,54 @@ impl CdpClient {
             let delay_min = if has_ocr { 1200 } else { 750 };
             let delay_max = if has_ocr { 2500 } else { 1550 };
             human_delay(delay_min, delay_max).await;
-            if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"], button[type=\"submit\"]") {
-                if !click_runtime_element(&mut websocket, "input[type=\"submit\"], button") {
-                    return Err((format!("未找到 {} 登录按钮", site_name), last_remaining_attempts));
+            let submit_expr = r#"(() => {
+                const passwordInput = document.querySelector('input[type="password"]');
+                if (!passwordInput) return false;
+                const form = passwordInput.form || passwordInput.closest('form');
+                if (!form) return false;
+
+                // Some NexusPHP sites use challenge-response authentication. Their
+                // visible login button runs an async script that fills `response`
+                // before submitting, so requestSubmit()/form.submit() must not bypass it.
+                if (form.querySelector('input[name="response"]')) {
+                    const challengeSubmit = form.querySelector(
+                        '#submit-btn, input[type="button"][value="登录"], input[type="button"][value="Login"]'
+                    );
+                    if (!challengeSubmit) return false;
+                    challengeSubmit.click();
+                    return true;
+                }
+
+                const submitBtn = form.querySelector('input[type="submit"], button[type="submit"]');
+                if (submitBtn) {
+                    submitBtn.click();
+                    return true;
+                }
+
+                if (typeof form.requestSubmit === 'function') {
+                    form.requestSubmit();
+                    return true;
+                }
+
+                form.submit();
+                return true;
+            })()"#;
+
+            let mut submitted = false;
+            if let Ok(response) = websocket.call("Runtime.evaluate", serde_json::json!({
+                "expression": submit_expr,
+                "returnByValue": true
+            })) {
+                if let Some(val) = response.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")) {
+                    submitted = val.as_bool().unwrap_or(false);
+                }
+            }
+
+            if !submitted {
+                if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"], button[type=\"submit\"]") {
+                    if !click_runtime_element(&mut websocket, "input[type=\"submit\"]") {
+                        return Err((format!("未找到 {} 登录按钮", site_name), last_remaining_attempts));
+                    }
                 }
             }
 
@@ -1363,7 +1429,7 @@ fn nexus_login_page_state(websocket: &mut CdpWebSocket) -> Option<NexusLoginPage
         const username = document.querySelector('input[name="username"], input[name="email"], input[name="login"], input[autocomplete="username"]');
         const password = document.querySelector('input[name="password"], input[type="password"]');
         const captcha = document.querySelector('input[name="imagestring"]');
-        const two_factor = document.querySelector('input[name="two_factor"], input[name="twofactor"], input[name="otp"], input[name="two_factor_code"], input[name="2fa_secret"], input[name="2fa"], input[autocomplete="one-time-code"]');
+        const two_factor = document.querySelector('input[name="two_factor"], input[name="twofactor"], input[name="two_step_code"], input[name="otp"], input[name="two_factor_code"], input[name="2fa_secret"], input[name="2fa"], input[autocomplete="one-time-code"]');
         const logout = document.querySelector('a[href*="logout"], a[href*="signout"]');
         const rawBody = (document.body?.innerText || '').slice(0, 5000);
         const body = rawBody.toLowerCase();

@@ -64,12 +64,19 @@ type AppConfig = {
   ocr_retry_count: number;
   min_login_attempts_remaining: number;
   cookiecloud: CookieCloudConfig;
+  gotify: GotifyConfig;
 };
 
 type CookieCloudConfig = {
   server_url: string;
   uuid: string;
   password: string;
+};
+
+type GotifyConfig = {
+  enabled: boolean;
+  server_url: string;
+  token: string;
 };
 
 type LogEntry = {
@@ -126,13 +133,18 @@ const defaultConfig: AppConfig = {
     uuid: "",
     password: "",
   },
+  gotify: {
+    enabled: false,
+    server_url: "",
+    token: "",
+  },
 };
 
 const navItems: Array<{ key: TabKey; label: string; icon: LucideIcon }> = [
   { key: "dashboard", label: "总览", icon: Activity },
   { key: "sites", label: "站点", icon: ListChecks },
-  { key: "settings", label: "设置", icon: Settings },
   { key: "logs", label: "日志", icon: Clock3 },
+  { key: "settings", label: "设置", icon: Settings },
 ];
 
 function readStoredTheme(): ColorMode {
@@ -656,6 +668,11 @@ function App() {
         1,
         20,
       ),
+      gotify: {
+        ...settingsDraft.gotify,
+        server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
+        token: settingsDraft.gotify.token.trim(),
+      },
     };
 
     setBusy(true);
@@ -1631,6 +1648,7 @@ function SettingsPanel({
   onExportConfig: () => void;
 }) {
   const [showCookiePassword, setShowCookiePassword] = useState(false);
+  const [showGotifyToken, setShowGotifyToken] = useState(false);
 
   return (
     <div className="settings-stack">
@@ -1882,6 +1900,71 @@ function SettingsPanel({
                 value={draft.min_login_attempts_remaining}
               />
             </label>
+          </div>
+        </section>
+
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Gotify</p>
+              <h2>任务通知</h2>
+            </div>
+          </div>
+          <div className="settings-form">
+            <label className="switch-row">
+              <span>启用 Gotify 通知</span>
+              <input
+                checked={draft.gotify.enabled}
+                onChange={(event) =>
+                  onChange({
+                    ...draft,
+                    gotify: { ...draft.gotify, enabled: event.target.checked },
+                  })
+                }
+                type="checkbox"
+              />
+            </label>
+            <label>
+              <span>Gotify 服务地址</span>
+              <input
+                onChange={(event) =>
+                  onChange({
+                    ...draft,
+                    gotify: { ...draft.gotify, server_url: event.target.value },
+                  })
+                }
+                placeholder="https://gotify.example.com"
+                type="url"
+                value={draft.gotify.server_url}
+              />
+            </label>
+            <label>
+              <span>应用 Token</span>
+              <div className="password-field">
+                <input
+                  onChange={(event) =>
+                    onChange({
+                      ...draft,
+                      gotify: { ...draft.gotify, token: event.target.value },
+                    })
+                  }
+                  placeholder="Gotify 应用 Token"
+                  type={showGotifyToken ? "text" : "password"}
+                  value={draft.gotify.token}
+                />
+                <button
+                  aria-label={showGotifyToken ? "隐藏 Token" : "显示 Token"}
+                  onClick={() => setShowGotifyToken((value) => !value)}
+                  title={showGotifyToken ? "隐藏 Token" : "显示 Token"}
+                  type="button"
+                >
+                  {showGotifyToken ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
+            <p className="field-hint">
+              每次保活任务结束后发送一条汇总通知，包含登录成功和登录失败的站点。
+            </p>
           </div>
         </section>
 

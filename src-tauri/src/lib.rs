@@ -2,6 +2,7 @@ mod auth;
 mod cdp;
 mod commands;
 mod cookiecloud;
+mod gotify;
 mod ocr;
 mod scheduler;
 mod store;

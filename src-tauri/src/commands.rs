@@ -78,6 +78,18 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     config.ocr_server_url = config.ocr_server_url.trim().trim_end_matches('/').to_string();
     config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
+    config.gotify.server_url = config
+        .gotify
+        .server_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    config.gotify.token = config.gotify.token.trim().to_string();
+    if config.gotify.enabled
+        && (config.gotify.server_url.is_empty() || config.gotify.token.is_empty())
+    {
+        return Err("启用 Gotify 通知前，请填写服务地址和应用 Token".to_string());
+    }
     if !config.ocr_server_url.is_empty() {
         let ocr_server_url = config.ocr_server_url.clone();
         tauri::async_runtime::spawn_blocking(move || ocr::ensure_initialized(&ocr_server_url))

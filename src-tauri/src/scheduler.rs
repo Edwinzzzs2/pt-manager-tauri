@@ -1,6 +1,7 @@
 use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress, CDP_CANCELLED};
 use crate::cookiecloud;
+use crate::gotify;
 use crate::store::{self, AppConfig, LogEntry, Site};
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone};
 use rand::Rng;
@@ -281,6 +282,9 @@ async fn run_keepalive_inner(
         .await;
     }
 
+    let mut successful_logins = Vec::new();
+    let mut failed_logins = Vec::new();
+
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
             return true;
@@ -311,7 +315,7 @@ async fn run_keepalive_inner(
 
         match opened_tab {
             Ok(tab_id) => {
-                try_auto_login_site(
+                let login_outcome = try_auto_login_site(
                     site,
                     &cdp,
                     &tab_id,
@@ -323,6 +327,13 @@ async fn run_keepalive_inner(
                     config_state,
                 )
                 .await;
+                match login_outcome {
+                    Some(LoginOutcome::Success) => successful_logins.push(site.name.clone()),
+                    Some(LoginOutcome::Failed(reason)) => {
+                        failed_logins.push((site.name.clone(), reason));
+                    }
+                    None => {}
+                }
                 // 等待页面加载 + 随机抖动
                 let jitter: u64 = rand::thread_rng().gen_range(0..10);
                 let wait = config.visit_duration + jitter;
@@ -359,6 +370,9 @@ async fn run_keepalive_inner(
                 push_log(logs, entry).await;
             }
             Err(e) => {
+                if site.auto_login {
+                    failed_logins.push((site.name.clone(), format!("站点打开失败：{}", e)));
+                }
                 let entry = LogEntry::error(format!("{} 访问失败: {}", site.name, e));
                 push_log(logs, entry).await;
             }
@@ -387,6 +401,7 @@ async fn run_keepalive_inner(
         let entry = LogEntry::success("保活任务全部完成".to_string());
         push_log(logs, entry).await;
     }
+    send_gotify_login_summary(config, logs, &successful_logins, &failed_logins).await;
     false
 }
 
@@ -471,6 +486,11 @@ fn local_storage_item_count(local_storages: &[crate::cdp::CdpLocalStorageParam])
         .sum()
 }
 
+enum LoginOutcome {
+    Success,
+    Failed(String),
+}
+
 async fn try_auto_login_site(
     site: &Site,
     cdp: &CdpClient,
@@ -481,17 +501,18 @@ async fn try_auto_login_site(
     cancel_requested: Option<Arc<AtomicBool>>,
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
-) {
+) -> Option<LoginOutcome> {
     if !site.auto_login {
-        return;
+        return None;
     }
     if site.username.trim().is_empty() || site.password.is_empty() {
+        let reason = "用户名或密码未配置".to_string();
         push_log(
             logs,
-            LogEntry::error(format!("{} 已开启自动登录，但用户名或密码未配置", site.name)),
+            LogEntry::error(format!("{} 已开启自动登录，但{}", site.name, reason)),
         )
         .await;
-        return;
+        return Some(LoginOutcome::Failed(reason));
     }
     let site_url = site.url.to_ascii_lowercase();
     let is_mteam = site_url.contains("kp.m-team.cc");
@@ -507,12 +528,13 @@ async fn try_auto_login_site(
             match auth::current_totp(&site.totp_secret) {
                 Ok(code) => Some(code),
                 Err(err) => {
+                    let reason = err.clone();
                     push_log(
                         logs,
                         LogEntry::error(format!("{} 自动登录失败：{}", site.name, err)),
                     )
                     .await;
-                    return;
+                    return Some(LoginOutcome::Failed(reason));
                 }
             }
         };
@@ -558,17 +580,41 @@ async fn try_auto_login_site(
 
     match success {
         Ok(true) => {
-            push_log(logs, LogEntry::success(format!("{} 自动登录成功", site.name))).await
+            push_log(logs, LogEntry::success(format!("{} 自动登录成功", site.name))).await;
+            Some(LoginOutcome::Success)
         }
         Ok(false) => {
-            push_log(logs, LogEntry::info(format!("{} 已处于登录状态", site.name))).await
+            push_log(logs, LogEntry::info(format!("{} 已处于登录状态", site.name))).await;
+            Some(LoginOutcome::Success)
         }
         Err(err) => {
+            let reason = err.clone();
             push_log(
                 logs,
                 LogEntry::error(format!("{} 自动登录失败：{}", site.name, err)),
             )
-            .await
+            .await;
+            Some(LoginOutcome::Failed(reason))
+        }
+    }
+}
+
+async fn send_gotify_login_summary(
+    config: &AppConfig,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    successful_sites: &[String],
+    failed_sites: &[(String, String)],
+) {
+    if !config.gotify.enabled || (successful_sites.is_empty() && failed_sites.is_empty()) {
+        return;
+    }
+
+    match gotify::send_login_summary(&config.gotify, successful_sites, failed_sites).await {
+        Ok(()) => {
+            push_log(logs, LogEntry::success("Gotify 登录结果通知已发送")).await;
+        }
+        Err(err) => {
+            push_log(logs, LogEntry::error(err)).await;
         }
     }
 }
@@ -584,6 +630,8 @@ async fn run_keepalive_batch(
 ) -> bool {
     let mut opened_tabs: Vec<(String, String)> = Vec::new();
     let mut login_jobs = Vec::new();
+    let mut successful_logins = Vec::new();
+    let mut failed_logins = Vec::new();
 
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
@@ -631,7 +679,7 @@ async fn run_keepalive_batch(
                     let config_state_clone = config_state.map(|s| Arc::clone(s));
                     login_jobs.push(tauri::async_runtime::spawn(async move {
                         let login_cdp = CdpClient::new(cdp_port);
-                        try_auto_login_site(
+                        let outcome = try_auto_login_site(
                             &login_site,
                             &login_cdp,
                             &login_tab_id,
@@ -643,12 +691,16 @@ async fn run_keepalive_batch(
                             config_state_clone.as_ref(),
                         )
                         .await;
+                        (login_site.name.clone(), outcome)
                     }));
                 }
                 push_log(logs, LogEntry::info(format!("{} 已打开", site.name))).await;
                 opened_tabs.push((site.name.clone(), tab_id));
             }
             Err(e) => {
+                if site.auto_login {
+                    failed_logins.push((site.name.clone(), format!("站点打开失败：{}", e)));
+                }
                 push_log(
                     logs,
                     LogEntry::error(format!("{} 打开失败: {}", site.name, e)),
@@ -659,11 +711,21 @@ async fn run_keepalive_batch(
     }
 
     for job in login_jobs {
-        let _ = job.await;
+        match job.await {
+            Ok((site_name, Some(LoginOutcome::Success))) => successful_logins.push(site_name),
+            Ok((site_name, Some(LoginOutcome::Failed(reason)))) => {
+                failed_logins.push((site_name, reason));
+            }
+            Ok((_, None)) => {}
+            Err(err) => {
+                push_log(logs, LogEntry::error(format!("自动登录任务异常结束：{}", err))).await;
+            }
+        }
     }
 
     if opened_tabs.is_empty() {
         push_log(logs, LogEntry::error("没有成功打开任何站点，保活任务结束")).await;
+        send_gotify_login_summary(config, logs, &successful_logins, &failed_logins).await;
         return false;
     }
 
@@ -701,6 +763,7 @@ async fn run_keepalive_batch(
     }
 
     push_log(logs, LogEntry::success("保活任务全部完成".to_string())).await;
+    send_gotify_login_summary(config, logs, &successful_logins, &failed_logins).await;
     false
 }
 

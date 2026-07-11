@@ -57,6 +57,8 @@ pub struct AppConfig {
     pub min_login_attempts_remaining: u8,
     #[serde(default)]
     pub cookiecloud: CookieCloudConfig,
+    #[serde(default)]
+    pub gotify: GotifyConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,6 +66,13 @@ pub struct CookieCloudConfig {
     pub server_url: String,
     pub uuid: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GotifyConfig {
+    pub enabled: bool,
+    pub server_url: String,
+    pub token: String,
 }
 
 impl Default for AppConfig {
@@ -83,6 +92,7 @@ impl Default for AppConfig {
             ocr_retry_count: default_ocr_retry_count(),
             min_login_attempts_remaining: default_min_login_attempts_remaining(),
             cookiecloud: CookieCloudConfig::default(),
+            gotify: GotifyConfig::default(),
         }
     }
 }

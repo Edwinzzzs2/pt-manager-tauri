@@ -977,6 +977,14 @@ input:focus {
   grid-template-rows: auto 38px;
 }
 
+.field-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--color-fg-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .label-with-help {
   display: inline-flex;
   align-items: center;
