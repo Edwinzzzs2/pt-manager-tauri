@@ -243,6 +243,7 @@ pub async fn test_site_login(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<String, String> {
+    state.task_cancel_requested.store(false, Ordering::SeqCst);
     let config = state.config.lock().await.clone();
     let site = config
         .sites
@@ -932,22 +933,32 @@ pub async fn run_task(state: State<'_, AppState>) -> Result<(), String> {
     let logs = Arc::clone(&state.logs);
     let task_running = Arc::clone(&state.task_running);
     let task_cancel_requested = Arc::clone(&state.task_cancel_requested);
+    let app_handle = state.app_handle.clone();
+    let config_state = Arc::clone(&state.config);
     tauri::async_runtime::spawn(async move {
-        scheduler::run_with_flag(&config, &logs, &task_running, &task_cancel_requested, false)
-            .await;
+        scheduler::run_with_flag(
+            &config,
+            &logs,
+            &task_running,
+            &task_cancel_requested,
+            false,
+            Some(&app_handle),
+            Some(&config_state),
+        )
+        .await;
     });
     Ok(())
 }
 
 #[tauri::command]
 pub async fn stop_task(state: State<'_, AppState>) -> Result<(), String> {
+    state.task_cancel_requested.store(true, Ordering::SeqCst);
     let is_running = *state.task_running.lock().await;
     if !is_running {
-        push_log(&state.logs, LogEntry::info("当前没有正在执行的保活任务")).await;
+        push_log(&state.logs, LogEntry::info("已请求终止测试/保活任务")).await;
         return Ok(());
     }
 
-    state.task_cancel_requested.store(true, Ordering::SeqCst);
     push_log(
         &state.logs,
         LogEntry::info("已请求终止保活任务，正在等待当前步骤收尾"),
@@ -1012,6 +1023,8 @@ async fn restart_scheduler(state: &State<'_, AppState>, config: AppConfig) {
         Arc::clone(&state.logs),
         Arc::clone(&state.task_running),
         Arc::clone(&state.task_cancel_requested),
+        Some(state.app_handle.clone()),
+        Some(Arc::clone(&state.config)),
     );
 }
 
@@ -1073,4 +1086,34 @@ fn open_url(url: &str) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "当前系统不支持自动打开 Chrome 下载页",
     ))
+}
+
+#[tauri::command]
+pub async fn export_config(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let config = state.config.lock().await;
+    let json_content = serde_json::to_string_pretty(&*config)
+        .map_err(|err| format!("序列化配置失败: {}", err))?;
+    std::fs::write(&path, json_content)
+        .map_err(|err| format!("写入配置文件失败: {}", err))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<AppConfig, String> {
+    let json_content = std::fs::read_to_string(&path)
+        .map_err(|err| format!("读取配置文件失败: {}", err))?;
+    let new_config: AppConfig = serde_json::from_str(&json_content)
+        .map_err(|err| format!("解析配置文件失败（文件格式可能不正确）: {}", err))?;
+    
+    let mut config = state.config.lock().await;
+    *config = new_config.clone();
+    
+    store::save_config(&state.app_handle, &config);
+    
+    store::set_log_retention(config.log_retention);
+    let _ = apply_auto_launch(&state.app_handle, config.auto_launch);
+    
+    restart_scheduler(&state, config.clone()).await;
+    
+    Ok(new_config)
 }

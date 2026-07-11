@@ -36,16 +36,19 @@ pub fn run() {
             let task_cancel_requested = Arc::new(AtomicBool::new(false));
             let next_run: Arc<Mutex<Option<DateTime<Local>>>> = Arc::new(Mutex::new(None));
             let mut scheduler = scheduler::Scheduler::new(Arc::clone(&next_run));
+            let config_state = Arc::new(Mutex::new(config.clone()));
             scheduler.start(
                 config.clone(),
                 Arc::clone(&logs),
                 Arc::clone(&task_running),
                 Arc::clone(&task_cancel_requested),
+                Some(app.handle().clone()),
+                Some(Arc::clone(&config_state)),
             );
 
             // 初始化全局状态
             let state = AppState {
-                config: Arc::new(Mutex::new(config)),
+                config: config_state,
                 logs,
                 scheduler: Arc::new(Mutex::new(scheduler)),
                 task_running,
@@ -81,6 +84,8 @@ pub fn run() {
             commands::clear_logs,
             commands::clear_browser_data,
             commands::open_chrome_download,
+            commands::export_config,
+            commands::import_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -114,6 +119,8 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                         &state.task_running,
                         &state.task_cancel_requested,
                         false,
+                        Some(&state.app_handle),
+                        Some(&state.config),
                     )
                     .await;
                 });

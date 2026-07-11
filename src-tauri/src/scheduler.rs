@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime::JoinHandle;
+use tauri::AppHandle;
 use tokio::sync::Mutex;
 
 pub struct Scheduler {
@@ -37,10 +38,14 @@ impl Scheduler {
         logs: Arc<Mutex<Vec<LogEntry>>>,
         task_running: Arc<Mutex<bool>>,
         task_cancel_requested: Arc<AtomicBool>,
+        app_handle: Option<AppHandle>,
+        config_state: Option<Arc<Mutex<AppConfig>>>,
     ) {
         self.stop();
 
         let next_run = Arc::clone(&self.next_run);
+        let app_handle_clone = app_handle.clone();
+        let config_state_clone = config_state.clone();
         let handle = tauri::async_runtime::spawn(async move {
             loop {
                 let Some(next) = next_run_from_cron(&config.cron) else {
@@ -68,7 +73,16 @@ impl Scheduler {
                     .unwrap_or_else(|_| Duration::from_secs(0));
                 tokio::time::sleep(wait).await;
 
-                run_with_flag(&config, &logs, &task_running, &task_cancel_requested, true).await;
+                run_with_flag(
+                    &config,
+                    &logs,
+                    &task_running,
+                    &task_cancel_requested,
+                    true,
+                    app_handle_clone.as_ref(),
+                    config_state_clone.as_ref(),
+                )
+                .await;
             }
         });
 
@@ -86,6 +100,8 @@ pub async fn run_with_flag(
     task_running: &Arc<Mutex<bool>>,
     task_cancel_requested: &Arc<AtomicBool>,
     allow_random_delay: bool,
+    app_handle: Option<&AppHandle>,
+    config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) {
     {
         let mut running = task_running.lock().await;
@@ -99,7 +115,7 @@ pub async fn run_with_flag(
     }
 
     let canceled =
-        run_keepalive_inner(config, logs, task_cancel_requested, allow_random_delay).await;
+        run_keepalive_inner(config, logs, task_cancel_requested, allow_random_delay, app_handle, config_state).await;
     if canceled {
         push_log(logs, LogEntry::info("保活任务已终止")).await;
     }
@@ -119,6 +135,8 @@ async fn run_keepalive_inner(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     task_cancel_requested: &Arc<AtomicBool>,
     allow_random_delay: bool,
+    app_handle: Option<&AppHandle>,
+    config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
     let mut cdp = CdpClient::new(config.cdp_port);
 
@@ -257,8 +275,8 @@ async fn run_keepalive_inner(
             &cdp,
             task_cancel_requested,
             launched_with_initial_sites,
-            Some(&app_handle),
-            Some(&state),
+            app_handle,
+            config_state,
         )
         .await;
     }
@@ -301,8 +319,8 @@ async fn run_keepalive_inner(
                     config.min_login_attempts_remaining as u32,
                     Some((config.ocr_server_url.clone(), config.ocr_retry_count)),
                     Some(Arc::clone(task_cancel_requested)),
-                    Some(&app_handle),
-                    Some(&state),
+                    app_handle,
+                    config_state,
                 )
                 .await;
                 // 等待页面加载 + 随机抖动
@@ -462,7 +480,7 @@ async fn try_auto_login_site(
     ocr_config: Option<(String, u8)>,
     cancel_requested: Option<Arc<AtomicBool>>,
     app_handle: Option<&AppHandle>,
-    state: Option<&Arc<AppState>>,
+    config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) {
     if !site.auto_login {
         return;
@@ -529,8 +547,8 @@ async fn try_auto_login_site(
     };
 
     if let Some(val) = remaining {
-        if let (Some(app), Some(st)) = (app_handle, state) {
-            let mut current = st.config.lock().await;
+        if let (Some(app), Some(cfg)) = (app_handle, config_state) {
+            let mut current = cfg.lock().await;
             if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
                 saved_site.login_attempts_remaining = Some(val);
             }
@@ -562,7 +580,7 @@ async fn run_keepalive_batch(
     task_cancel_requested: &Arc<AtomicBool>,
     launched_with_initial_sites: bool,
     app_handle: Option<&AppHandle>,
-    state: Option<&Arc<AppState>>,
+    config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
     let mut opened_tabs: Vec<(String, String)> = Vec::new();
     let mut login_jobs = Vec::new();
@@ -610,7 +628,7 @@ async fn run_keepalive_batch(
                     let ocr_retry_count = config.ocr_retry_count;
                     let cancel_requested = Arc::clone(task_cancel_requested);
                     let app_handle_clone = app_handle.map(|h| h.clone());
-                    let state_clone = state.map(|s| Arc::clone(s));
+                    let config_state_clone = config_state.map(|s| Arc::clone(s));
                     login_jobs.push(tauri::async_runtime::spawn(async move {
                         let login_cdp = CdpClient::new(cdp_port);
                         try_auto_login_site(
@@ -622,7 +640,7 @@ async fn run_keepalive_batch(
                             Some((ocr_server_url, ocr_retry_count)),
                             Some(cancel_requested),
                             app_handle_clone.as_ref(),
-                            state_clone.as_ref(),
+                            config_state_clone.as_ref(),
                         )
                         .await;
                     }));

@@ -748,6 +748,9 @@ impl CdpClient {
         let mut last_remaining_attempts = None;
         
         for attempt in 0..max_attempts {
+            if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
+                return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
+            }
             if attempt > 0 {
                 if let Some(p) = progress {
                     p.info(format!("前一次登录尝试失败，准备点击获取新的图片代码进行第 {}/{} 次重试...", attempt + 1, max_attempts)).await;
@@ -763,6 +766,9 @@ impl CdpClient {
             let mut stable_logged_in = 0usize;
 
             for _ in 0..240 {
+                if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
+                    return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
+                }
                 if let Some(current) = nexus_login_page_state(&mut websocket) {
                     if let Some(rem) = current.remaining_attempts {
                         last_remaining_attempts = Some(rem);
@@ -800,7 +806,7 @@ impl CdpClient {
             human_delay(650, 1350).await;
             if !type_runtime_input(
                 &mut websocket,
-                "input[name=\"username\"]",
+                "input[name=\"username\"], input[name=\"email\"], input[name=\"login\"], input[autocomplete=\"username\"]",
                 username,
                 45,
                 120,
@@ -812,7 +818,7 @@ impl CdpClient {
             human_delay(500, 1150).await;
             if !type_runtime_input(
                 &mut websocket,
-                "input[name=\"password\"]",
+                "input[name=\"password\"], input[type=\"password\"]",
                 password,
                 55,
                 140,
@@ -827,7 +833,7 @@ impl CdpClient {
                     human_delay(450, 950).await;
                     if !type_runtime_input(
                         &mut websocket,
-                        "input[name=\"two_factor\"]",
+                        "input[name=\"two_factor\"], input[name=\"twofactor\"], input[name=\"otp\"], input[name=\"two_factor_code\"], input[name=\"2fa_secret\"], input[name=\"2fa\"], input[autocomplete=\"one-time-code\"]",
                         &code,
                         70,
                         145,
@@ -956,11 +962,63 @@ impl CdpClient {
                 }
             }
 
+            let mut captcha_solved = false;
+            let mut logged_challenge_msg = false;
+            
+            for _ in 0..120 { // 最多等待 60 秒
+                if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
+                    return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
+                }
+                
+                let eval_expr = r#"(() => {
+                    const fields = document.querySelectorAll('textarea[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
+                    if (fields.length === 0) return { hasChallenge: false, solved: true };
+                    let solved = false;
+                    for (const f of fields) {
+                        if (f.value && f.value.trim().length > 10) {
+                            solved = true;
+                            break;
+                        }
+                    }
+                    return { hasChallenge: true, solved: solved };
+                })()"#;
+                
+                let val_res = websocket.call("Runtime.evaluate", serde_json::json!({
+                    "expression": eval_expr,
+                    "returnByValue": true
+                }));
+                
+                if let Ok(response) = val_res {
+                    if let Some(val) = response.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")) {
+                        let has_challenge = val.get("hasChallenge").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let solved = val.get("solved").and_then(|v| v.as_bool()).unwrap_or(true);
+                        
+                        if !has_challenge || solved {
+                            captcha_solved = true;
+                            break;
+                        }
+                        
+                        if !logged_challenge_msg {
+                            if let Some(p) = progress {
+                                p.info("检测到页面存在人机验证（如 Cloudflare Turnstile），请在浏览器中完成验证...").await;
+                            }
+                            logged_challenge_msg = true;
+                        }
+                    }
+                }
+                
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            if !captcha_solved {
+                return Err((format!("等待 {} 人机验证通过超时", site_name), last_remaining_attempts));
+            }
+
             let delay_min = if has_ocr { 1200 } else { 750 };
             let delay_max = if has_ocr { 2500 } else { 1550 };
             human_delay(delay_min, delay_max).await;
-            if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"]") {
-                if !click_runtime_element(&mut websocket, "input[type=\"submit\"]") {
+            if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"], button[type=\"submit\"]") {
+                if !click_runtime_element(&mut websocket, "input[type=\"submit\"], button") {
                     return Err((format!("未找到 {} 登录按钮", site_name), last_remaining_attempts));
                 }
             }
@@ -968,6 +1026,9 @@ impl CdpClient {
             let mut login_success = false;
             let mut captcha_failed = false;
             for _ in 0..40 {
+                if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
+                    return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
+                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 let Some(current) = nexus_login_page_state(&mut websocket) else {
                     continue;
@@ -1233,6 +1294,7 @@ struct HdkLoginPageState {
     blocked_debug: bool,
 }
 
+#[allow(dead_code)]
 struct AudiencesLoginPageState {
     path: String,
     ready: bool,
@@ -1256,7 +1318,7 @@ fn audiences_login_page_state(websocket: &mut CdpWebSocket) -> Option<AudiencesL
             ready: document.readyState === 'interactive' || document.readyState === 'complete',
             hasLoginForm: Boolean(username && password && submit),
             hasCaptcha: Boolean(captcha && captcha.type !== 'hidden'),
-            challenge: /(just a moment|checking your browser|cloudflare|正在进行安全验证|安全验证)/.test(body),
+            challenge: /just a moment|checking your browser|cloudflare|请稍候/i.test(document.title || '') || Boolean(document.querySelector('#challenge-stage, #challenge-running')),
             remainingAttempts: attempts ? Number(attempts[1]) : null
         };
     })()"#;
@@ -1298,11 +1360,11 @@ struct NexusLoginPageState {
 
 fn nexus_login_page_state(websocket: &mut CdpWebSocket) -> Option<NexusLoginPageState> {
     let expression = r#"(() => {
-        const username = document.querySelector('input[name="username"]');
-        const password = document.querySelector('input[name="password"]');
+        const username = document.querySelector('input[name="username"], input[name="email"], input[name="login"], input[autocomplete="username"]');
+        const password = document.querySelector('input[name="password"], input[type="password"]');
         const captcha = document.querySelector('input[name="imagestring"]');
-        const two_factor = document.querySelector('input[name="two_factor"]');
-        const logout = document.querySelector('a[href*="logout.php"]');
+        const two_factor = document.querySelector('input[name="two_factor"], input[name="twofactor"], input[name="otp"], input[name="two_factor_code"], input[name="2fa_secret"], input[name="2fa"], input[autocomplete="one-time-code"]');
+        const logout = document.querySelector('a[href*="logout"], a[href*="signout"]');
         const rawBody = (document.body?.innerText || '').slice(0, 5000);
         const body = rawBody.toLowerCase();
         const attempts = rawBody.match(/你还有\s*\[(\d+)\]\s*次尝试机会/);
@@ -1313,8 +1375,8 @@ fn nexus_login_page_state(websocket: &mut CdpWebSocket) -> Option<NexusLoginPage
             hasLoginForm: Boolean(username && password),
             hasCaptcha: Boolean(captcha && captcha.type !== 'hidden'),
             hasTwoFactor: Boolean(two_factor),
-            challenge: /(just a moment|checking your browser|cloudflare|正在进行安全验证|安全验证)/.test(body),
-            loggedIn: Boolean(logout),
+            challenge: /just a moment|checking your browser|cloudflare|请稍候/i.test(document.title || '') || Boolean(document.querySelector('#challenge-stage, #challenge-running')),
+            loggedIn: Boolean(logout) || body.includes('分享率') || body.includes('上传') || body.includes('上傳') || body.includes('下载') || body.includes('下載') || body.includes('魔力') || body.includes('ratio') || body.includes('uploaded') || body.includes('downloaded'),
             isFailurePage: Boolean(isFailurePage),
             remainingAttempts: attempts ? Number(attempts[1]) : null
         };

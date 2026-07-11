@@ -1410,3 +1410,45 @@ label {
   color: var(--color-accent);
   font-weight: 600;
 }
+
+/* 旋转动画与测试状态终止按钮样式 */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spin {
+  animation: spin 1.5s linear infinite;
+}
+
+.site-test-button.testing {
+  color: var(--warning-color, #f59e0b) !important;
+  border-color: var(--warning-color, #f59e0b) !important;
+  background-color: transparent !important;
+  cursor: pointer;
+}
+
+.site-test-button.testing:hover {
+  color: var(--danger-color, #ef4444) !important;
+  border-color: var(--danger-color, #ef4444) !important;
+  background-color: rgba(239, 68, 68, 0.1) !important;
+}
+
+.site-test-button.testing .icon-stop,
+.site-test-button.testing .text-stop {
+  display: none;
+}
+
+.site-test-button.testing:hover .icon-testing,
+.site-test-button.testing:hover .text-testing {
+  display: none !important;
+}
+
+.site-test-button.testing:hover .icon-stop,
+.site-test-button.testing:hover .text-stop {
+  display: inline-block !important;
+}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getVersion, setTheme as setTauriTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ask, message, open } from "@tauri-apps/plugin-dialog";
+import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import {
@@ -424,6 +424,68 @@ function App() {
     }
   }
 
+  async function exportConfig() {
+    const path = await save({
+      filters: [{ name: "JSON", extensions: ["json"] }],
+      defaultPath: "pt-manager-config.json",
+    });
+    if (!path) {
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("export_config", { path });
+      await message("配置已成功导出为 JSON 文件", {
+        kind: "info",
+        title: "导出成功",
+      });
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importConfig() {
+    const path = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) {
+      return;
+    }
+
+    const confirmed = await ask("导入的配置会完全覆盖当前所有站点及选项设置，是否继续？", {
+      title: "确认导入配置",
+      kind: "warning",
+      okLabel: "继续导入",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) {
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await invoke<AppConfig>("import_config", { path });
+      setConfig(result);
+      setSettingsDraft(result);
+      await refreshStatus();
+      await message("整个配置（包含站点和系统选项）已成功导入！", {
+        kind: "info",
+        title: "导入完成",
+      });
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function startEdit(site: Site) {
     setEditingSiteId(site.id);
     setEditingSite({
@@ -809,6 +871,7 @@ function App() {
               onSave={saveSite}
               onStartEdit={startEdit}
               onTestLogin={testSiteLogin}
+              onStopTest={stopTask}
               testingSiteId={testingSiteId}
               recognizingSiteId={recognizingSiteId}
               onToggleKeepalive={toggleSiteKeepalive}
@@ -827,6 +890,8 @@ function App() {
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               taskRunning={!!status?.is_running}
+              onImportConfig={importConfig}
+              onExportConfig={exportConfig}
             />
           ) : null}
 
@@ -1154,6 +1219,7 @@ function SitesPanel({
   onSave,
   onStartEdit,
   onTestLogin,
+  onStopTest,
   recognizingSiteId,
   testingSiteId,
   onToggleKeepalive,
@@ -1175,6 +1241,7 @@ function SitesPanel({
   onSave: (id: string) => void;
   onStartEdit: (site: Site) => void;
   onTestLogin: (site: Site) => void;
+  onStopTest?: () => void;
   recognizingSiteId: string | null;
   testingSiteId: string | null;
   onToggleKeepalive: (site: Site) => void;
@@ -1470,18 +1537,31 @@ function SitesPanel({
                     <>
                       {site.auto_login ? (
                         <button
-                          className="ghost site-test-button"
-                          disabled={busy || testingSiteId !== null}
-                          onClick={() => onTestLogin(site)}
-                          title="单独测试自动登录"
+                          className={`ghost site-test-button ${testingSiteId === site.id ? "testing" : ""}`}
+                          disabled={busy || (testingSiteId !== null && testingSiteId !== site.id)}
+                          onClick={() => {
+                            if (testingSiteId === site.id) {
+                              onStopTest?.();
+                            } else {
+                              onTestLogin(site);
+                            }
+                          }}
+                          title={testingSiteId === site.id ? "终止当前测试" : "单独测试自动登录"}
                           type="button"
                         >
                           {testingSiteId === site.id ? (
-                            <RefreshCw size={16} />
+                            <>
+                              <RefreshCw size={16} className="icon-testing spin" />
+                              <XCircle size={16} className="icon-stop" />
+                              <span className="text-testing">测试中</span>
+                              <span className="text-stop">终止</span>
+                            </>
                           ) : (
-                            <ShieldCheck size={16} />
+                            <>
+                              <ShieldCheck size={16} />
+                              <span>测试</span>
+                            </>
                           )}
-                          <span>{testingSiteId === site.id ? "测试中" : "测试"}</span>
                         </button>
                       ) : null}
                       {site.auto_login && !site.url.toLowerCase().includes("kp.m-team.cc") && !site.url.toLowerCase().includes("hdkyl.in") ? (
@@ -1535,6 +1615,8 @@ function SettingsPanel({
   onSave,
   onSyncCookieCloud,
   taskRunning,
+  onImportConfig,
+  onExportConfig,
 }: {
   browserDataClearBusy: boolean;
   busy: boolean;
@@ -1545,6 +1627,8 @@ function SettingsPanel({
   onSave: () => void;
   onSyncCookieCloud: () => void;
   taskRunning: boolean;
+  onImportConfig: () => void;
+  onExportConfig: () => void;
 }) {
   const [showCookiePassword, setShowCookiePassword] = useState(false);
 
@@ -1798,6 +1882,37 @@ function SettingsPanel({
                 value={draft.min_login_attempts_remaining}
               />
             </label>
+          </div>
+        </section>
+
+        <section className="panel settings-card config-backup-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Backup</p>
+              <h2>备份与还原</h2>
+            </div>
+            <div className="row-actions" style={{ gap: "10px" }}>
+              <button
+                className="ghost"
+                disabled={busy}
+                onClick={onImportConfig}
+                type="button"
+                style={{ minHeight: "34px", padding: "0 12px" }}
+              >
+                <FileUp size={16} />
+                <span>导入全部配置</span>
+              </button>
+              <button
+                className="ghost"
+                disabled={busy}
+                onClick={onExportConfig}
+                type="button"
+                style={{ minHeight: "34px", padding: "0 12px" }}
+              >
+                <Download size={16} />
+                <span>导出全部配置</span>
+              </button>
+            </div>
           </div>
         </section>
 
