@@ -257,6 +257,8 @@ async fn run_keepalive_inner(
             &cdp,
             task_cancel_requested,
             launched_with_initial_sites,
+            Some(&app_handle),
+            Some(&state),
         )
         .await;
     }
@@ -299,6 +301,8 @@ async fn run_keepalive_inner(
                     config.min_login_attempts_remaining as u32,
                     Some((config.ocr_server_url.clone(), config.ocr_retry_count)),
                     Some(Arc::clone(task_cancel_requested)),
+                    Some(&app_handle),
+                    Some(&state),
                 )
                 .await;
                 // 等待页面加载 + 随机抖动
@@ -457,6 +461,8 @@ async fn try_auto_login_site(
     min_login_attempts_remaining: u32,
     ocr_config: Option<(String, u8)>,
     cancel_requested: Option<Arc<AtomicBool>>,
+    app_handle: Option<&AppHandle>,
+    state: Option<&Arc<AppState>>,
 ) {
     if !site.auto_login {
         return;
@@ -472,15 +478,6 @@ async fn try_auto_login_site(
     let site_url = site.url.to_ascii_lowercase();
     let is_mteam = site_url.contains("kp.m-team.cc");
     let is_hdkylin = site_url.contains("hdkyl.in");
-    let is_audiences = site_url.contains("audiences.me");
-    if !is_mteam && !is_hdkylin && !is_audiences {
-        push_log(
-            logs,
-            LogEntry::info(format!("{} 已开启自动登录，但该站点暂未适配", site.name)),
-        )
-        .await;
-        return;
-    }
 
     let cancel = cancel_requested.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let progress = CdpProgress::new(Arc::clone(logs), cancel);
@@ -503,13 +500,17 @@ async fn try_auto_login_site(
         };
         cdp.login_mteam(tab_id, &site.username, &site.password, totp.as_deref())
             .await
+            .map(|logged_in| (logged_in, None))
+            .map_err(|err| (err, None))
     } else if is_hdkylin {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
         cdp.login_hdkylin(tab_id, &site.username, &site.password, secret)
             .await
+            .map(|logged_in| (logged_in, None))
+            .map_err(|err| (err, None))
     } else {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        cdp.login_audiences(
+        cdp.login_nexusphp(
             tab_id,
             &site.username,
             &site.password,
@@ -517,10 +518,27 @@ async fn try_auto_login_site(
             min_login_attempts_remaining,
             ocr_config,
             Some(&progress),
+            &site.name,
         )
-            .await
+        .await
     };
-    match login_result {
+
+    let (success, remaining) = match login_result {
+        Ok((logged_in, remaining)) => (Ok(logged_in), remaining),
+        Err((err, remaining)) => (Err(err), remaining),
+    };
+
+    if let Some(val) = remaining {
+        if let (Some(app), Some(st)) = (app_handle, state) {
+            let mut current = st.config.lock().await;
+            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+                saved_site.login_attempts_remaining = Some(val);
+            }
+            store::save_config(app, &current);
+        }
+    }
+
+    match success {
         Ok(true) => {
             push_log(logs, LogEntry::success(format!("{} 自动登录成功", site.name))).await
         }
@@ -543,6 +561,8 @@ async fn run_keepalive_batch(
     cdp: &CdpClient,
     task_cancel_requested: &Arc<AtomicBool>,
     launched_with_initial_sites: bool,
+    app_handle: Option<&AppHandle>,
+    state: Option<&Arc<AppState>>,
 ) -> bool {
     let mut opened_tabs: Vec<(String, String)> = Vec::new();
     let mut login_jobs = Vec::new();
@@ -589,6 +609,8 @@ async fn run_keepalive_batch(
                     let ocr_server_url = config.ocr_server_url.clone();
                     let ocr_retry_count = config.ocr_retry_count;
                     let cancel_requested = Arc::clone(task_cancel_requested);
+                    let app_handle_clone = app_handle.map(|h| h.clone());
+                    let state_clone = state.map(|s| Arc::clone(s));
                     login_jobs.push(tauri::async_runtime::spawn(async move {
                         let login_cdp = CdpClient::new(cdp_port);
                         try_auto_login_site(
@@ -599,6 +621,8 @@ async fn run_keepalive_batch(
                             min_login_attempts_remaining,
                             Some((ocr_server_url, ocr_retry_count)),
                             Some(cancel_requested),
+                            app_handle_clone.as_ref(),
+                            state_clone.as_ref(),
                         )
                         .await;
                     }));

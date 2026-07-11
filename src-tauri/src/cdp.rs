@@ -727,6 +727,293 @@ impl CdpClient {
     }
 
     /// 等待 Audiences 的 Cloudflare 自动验证，并填写可自动处理的登录字段。
+    /// 通用 NexusPHP 站点的登录逻辑（包含可选的 TOTP、Cloudflare 绕过、以及自动 OCR 验证码识别）
+    pub async fn login_nexusphp(
+        &self,
+        tab_id: &str,
+        username: &str,
+        password: &str,
+        totp_secret: Option<&str>,
+        min_remaining_attempts: u32,
+        ocr_config: Option<(String, u8)>,
+        progress: Option<&CdpProgress>,
+        site_name: &str,
+    ) -> Result<(bool, Option<u32>), (String, Option<u32>)> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id).map_err(|err| (err, None))? else {
+            return Err((format!("无法连接 {} 标签页", site_name), None));
+        };
+        
+        let ocr_cfg = ocr_config.clone();
+        let max_attempts = ocr_config.as_ref().map(|(_, count)| *count as usize).unwrap_or(1);
+        let mut last_remaining_attempts = None;
+        
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                if let Some(p) = progress {
+                    p.info(format!("前一次登录尝试失败，准备点击获取新的图片代码进行第 {}/{} 次重试...", attempt + 1, max_attempts)).await;
+                }
+                self.prepare_audiences_captcha_retry(tab_id)
+                    .await
+                    .map_err(|err| (err, last_remaining_attempts))?;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+
+            let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10)).map_err(|err| (err.to_string(), last_remaining_attempts))?;
+            let mut login_state = None;
+            let mut stable_logged_in = 0usize;
+
+            for _ in 0..240 {
+                if let Some(current) = nexus_login_page_state(&mut websocket) {
+                    if let Some(rem) = current.remaining_attempts {
+                        last_remaining_attempts = Some(rem);
+                    }
+                    if current.has_login_form {
+                        login_state = Some(current);
+                        break;
+                    }
+                    if current.ready && !current.challenge && current.logged_in {
+                        stable_logged_in += 1;
+                        if stable_logged_in >= 3 {
+                            return Ok((false, last_remaining_attempts)); // 已经登录，直接返回
+                        }
+                    } else {
+                        stable_logged_in = 0;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            
+            let Some(login_state) = login_state else {
+                return Err((format!("等待 {} Cloudflare 验证放行超时（120 秒）", site_name), last_remaining_attempts));
+            };
+            
+            if let Some(remaining) = login_state.remaining_attempts {
+                last_remaining_attempts = Some(remaining);
+                if remaining <= min_remaining_attempts {
+                    return Err((format!(
+                        "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止自动登录与重试",
+                        site_name, remaining, min_remaining_attempts
+                    ), last_remaining_attempts));
+                }
+            }
+
+            human_delay(650, 1350).await;
+            if !type_runtime_input(
+                &mut websocket,
+                "input[name=\"username\"]",
+                username,
+                45,
+                120,
+            )
+            .await
+            {
+                return Err((format!("未找到 {} 用户名输入框", site_name), last_remaining_attempts));
+            }
+            human_delay(500, 1150).await;
+            if !type_runtime_input(
+                &mut websocket,
+                "input[name=\"password\"]",
+                password,
+                55,
+                140,
+            )
+            .await
+            {
+                return Err((format!("未找到 {} 密码输入框", site_name), last_remaining_attempts));
+            }
+            if let Some(secret) = totp_secret {
+                if login_state.has_two_factor {
+                    let code = auth::current_totp(secret).map_err(|err| (err, last_remaining_attempts))?;
+                    human_delay(450, 950).await;
+                    if !type_runtime_input(
+                        &mut websocket,
+                        "input[name=\"two_factor\"]",
+                        &code,
+                        70,
+                        145,
+                    )
+                    .await
+                    {
+                        return Err((format!("未找到 {} 两步验证码输入框", site_name), last_remaining_attempts));
+                    }
+                }
+            }
+
+            let has_ocr = ocr_config.is_some();
+            let current = nexus_login_page_state(&mut websocket)
+                .ok_or_else(|| (format!("无法读取 {} 登录表单状态", site_name), last_remaining_attempts))?;
+            
+            if let Some(rem) = current.remaining_attempts {
+                last_remaining_attempts = Some(rem);
+            }
+            
+            if current.has_captcha {
+                if let Some((ocr_server_url, ocr_retry_count)) = ocr_cfg.clone() {
+                    if let Some(p) = progress {
+                        p.info("检测到图片验证码，正在获取图片数据并进行自动 OCR 识别...").await;
+                    }
+                    
+                    let expression = r#"(() => {
+                        const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i], img[src*="image.php" i]');
+                        if (!image || !image.complete || !image.naturalWidth) return { ok: false };
+                        try {
+                            const scale = 3;
+                            const padding = 8;
+                            const canvas = document.createElement('canvas');
+                            canvas.width = image.naturalWidth * scale + padding * 2;
+                            canvas.height = image.naturalHeight * scale + padding * 2;
+                            const context = canvas.getContext('2d', { alpha: false });
+                            context.fillStyle = '#ffffff';
+                            context.fillRect(0, 0, canvas.width, canvas.height);
+                            context.imageSmoothingEnabled = false;
+                            context.filter = 'contrast(140%) saturate(120%)';
+                            context.drawImage(
+                                image,
+                                padding,
+                                padding,
+                                image.naturalWidth * scale,
+                                image.naturalHeight * scale
+                            );
+                            context.filter = 'none';
+                            return {
+                                ok: true,
+                                image: canvas.toDataURL('image/png').split(',')[1],
+                                width: canvas.width,
+                                height: canvas.height
+                            };
+                        } catch (_) {
+                            return { ok: false };
+                        }
+                    })()"#;
+                    
+                    let response = websocket
+                        .call(
+                            "Runtime.evaluate",
+                            serde_json::json!({
+                                "expression": expression,
+                                "returnByValue": true
+                            }),
+                        )
+                        .map_err(|err| (format!("截取验证码失败：{}", err), last_remaining_attempts))?;
+                    
+                    let value = response
+                        .get("result")
+                        .and_then(|value| value.get("result"))
+                        .and_then(|value| value.get("value"))
+                        .ok_or_else(|| ("未读取到验证码图片数据".to_string(), last_remaining_attempts))?;
+                    
+                    if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+                        return Err(("验证码图片尚未加载或无法截取".to_string(), last_remaining_attempts));
+                    }
+                    
+                    let image_base64 = value
+                        .get("image")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| ("验证码截图数据为空".to_string(), last_remaining_attempts))?;
+
+                    if let Some(p) = progress {
+                        p.info(format!("获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}", image_base64)).await;
+                    }
+
+                    let ocr_server_url_clone = ocr_server_url.clone();
+                    let image_base64_clone = image_base64.to_string();
+                    let recognition = tauri::async_runtime::spawn_blocking(move || {
+                        crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone, ocr_retry_count)
+                    })
+                    .await
+                    .map_err(|err| (err.to_string(), last_remaining_attempts))?;
+
+                    let recognition = match recognition {
+                        Ok(res) => res,
+                        Err(err) => return Err((format!("验证码自动识别失败：{}", err), last_remaining_attempts)),
+                    };
+
+                    if let Some(p) = progress {
+                        p.info(format!("验证码识别成功：{}，尝试次数：{}/{}。正在自动填入...", recognition.text, recognition.attempts, ocr_retry_count)).await;
+                    }
+
+                    human_delay(500, 1000).await;
+                    if !type_runtime_input(
+                        &mut websocket,
+                        "input[name=\"imagestring\"]",
+                        &recognition.text,
+                        70,
+                        145,
+                    )
+                    .await
+                    {
+                        return Err((format!("未找到 {} 图片验证码输入框", site_name), last_remaining_attempts));
+                    }
+                } else {
+                    let attempts = current
+                        .remaining_attempts
+                        .map(|value| format!("，当前剩余 {} 次尝试", value))
+                        .unwrap_or_default();
+                    return Err((format!(
+                        "{} 登录信息已填写{}，请人工输入图片验证码并点击登录",
+                        site_name, attempts
+                    ), last_remaining_attempts));
+                }
+            }
+
+            let delay_min = if has_ocr { 1200 } else { 750 };
+            let delay_max = if has_ocr { 2500 } else { 1550 };
+            human_delay(delay_min, delay_max).await;
+            if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"]") {
+                if !click_runtime_element(&mut websocket, "input[type=\"submit\"]") {
+                    return Err((format!("未找到 {} 登录按钮", site_name), last_remaining_attempts));
+                }
+            }
+
+            let mut login_success = false;
+            let mut captcha_failed = false;
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let Some(current) = nexus_login_page_state(&mut websocket) else {
+                    continue;
+                };
+                if let Some(rem) = current.remaining_attempts {
+                    last_remaining_attempts = Some(rem);
+                }
+                if current.ready && !current.challenge {
+                    if current.logged_in {
+                        login_success = true;
+                        break;
+                    }
+                    if current.is_failure_page {
+                        captcha_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            if login_success {
+                return Ok((true, last_remaining_attempts));
+            }
+            if captcha_failed {
+                if attempt + 1 >= max_attempts {
+                    return Err((format!("{} 自动登录失败：图片验证码错误，已达到最大重试次数 {} 次", site_name, max_attempts), last_remaining_attempts));
+                }
+                continue;
+            }
+            
+            let final_state = nexus_login_page_state(&mut websocket);
+            if let Some(state) = final_state {
+                if let Some(rem) = state.remaining_attempts {
+                    last_remaining_attempts = Some(rem);
+                }
+                if !state.has_login_form && !state.logged_in {
+                    return Err((format!("{} 自动登录失败：跳转到了非预期页面（可能是用户名或密码错误）", site_name), last_remaining_attempts));
+                }
+            }
+            
+            return Err((format!("{} 登录后仍停留在登录页，请检查凭据", site_name), last_remaining_attempts));
+        }
+
+        Err((format!("{} 自动登录失败：已尝试 {} 次均未成功", site_name, max_attempts), last_remaining_attempts))
+    }
+
+    /// 等待 Audiences 的 Cloudflare 自动验证，并填写可自动处理的登录字段。
     pub async fn login_audiences(
         &self,
         tab_id: &str,
@@ -736,216 +1023,18 @@ impl CdpClient {
         min_remaining_attempts: u32,
         ocr_config: Option<(String, u8)>,
         progress: Option<&CdpProgress>,
-    ) -> Result<bool, String> {
-        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
-            return Err("无法连接 Audiences 标签页".to_string());
-        };
-        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
-        let mut login_state = None;
-        let mut stable_logged_in = 0usize;
-
-        for _ in 0..240 {
-            if let Some(current) = audiences_login_page_state(&mut websocket) {
-                if current.has_login_form {
-                    login_state = Some(current);
-                    break;
-                }
-                if current.ready && !current.challenge && current.path != "/login.php" {
-                    stable_logged_in += 1;
-                    if stable_logged_in >= 6 {
-                        return Ok(false);
-                    }
-                } else {
-                    stable_logged_in = 0;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        let Some(login_state) = login_state else {
-            return Err("等待 Audiences Cloudflare 验证放行超时（120 秒）".to_string());
-        };
-        if let Some(remaining) = login_state.remaining_attempts {
-            if remaining <= min_remaining_attempts {
-                return Err(format!(
-                    "Audiences 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止自动登录与重试",
-                    remaining, min_remaining_attempts
-                ));
-            }
-        }
-
-        human_delay(650, 1350).await;
-        if !type_runtime_input(
-            &mut websocket,
-            "input[name=\"username\"]",
+    ) -> Result<(bool, Option<u32>), (String, Option<u32>)> {
+        self.login_nexusphp(
+            tab_id,
             username,
-            45,
-            120,
-        )
-        .await
-        {
-            return Err("未找到 Audiences 用户名输入框".to_string());
-        }
-        human_delay(500, 1150).await;
-        if !type_runtime_input(
-            &mut websocket,
-            "input[name=\"password\"]",
             password,
-            55,
-            140,
+            totp_secret,
+            min_remaining_attempts,
+            ocr_config,
+            progress,
+            "Audiences",
         )
         .await
-        {
-            return Err("未找到 Audiences 密码输入框".to_string());
-        }
-        if let Some(secret) = totp_secret {
-            let code = auth::current_totp(secret)?;
-            human_delay(450, 950).await;
-            if !type_runtime_input(
-                &mut websocket,
-                "input[name=\"scode\"]",
-                &code,
-                70,
-                145,
-            )
-            .await
-            {
-                return Err("未找到 Audiences 两步验证码输入框".to_string());
-            }
-        }
-
-        let has_ocr = ocr_config.is_some();
-        let current = audiences_login_page_state(&mut websocket)
-            .ok_or_else(|| "无法读取 Audiences 登录表单状态".to_string())?;
-        if current.has_captcha {
-            if let Some((ocr_server_url, ocr_retry_count)) = ocr_config {
-                if let Some(p) = progress {
-                    p.info("检测到图片验证码，正在获取图片数据并进行自动 OCR 识别...").await;
-                }
-                
-                let expression = r#"(() => {
-                    const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i]');
-                    if (!image || !image.complete || !image.naturalWidth) return { ok: false };
-                    try {
-                        const scale = 3;
-                        const padding = 8;
-                        const canvas = document.createElement('canvas');
-                        canvas.width = image.naturalWidth * scale + padding * 2;
-                        canvas.height = image.naturalHeight * scale + padding * 2;
-                        const context = canvas.getContext('2d', { alpha: false });
-                        context.fillStyle = '#ffffff';
-                        context.fillRect(0, 0, canvas.width, canvas.height);
-                        context.imageSmoothingEnabled = false;
-                        context.filter = 'contrast(140%) saturate(120%)';
-                        context.drawImage(
-                            image,
-                            padding,
-                            padding,
-                            image.naturalWidth * scale,
-                            image.naturalHeight * scale
-                        );
-                        context.filter = 'none';
-                        return {
-                            ok: true,
-                            image: canvas.toDataURL('image/png').split(',')[1],
-                            width: canvas.width,
-                            height: canvas.height
-                        };
-                    } catch (_) {
-                        return { ok: false };
-                    }
-                })()"#;
-                
-                let response = websocket
-                    .call(
-                        "Runtime.evaluate",
-                        serde_json::json!({
-                            "expression": expression,
-                            "returnByValue": true
-                        }),
-                    )
-                    .map_err(|err| format!("截取验证码失败：{}", err))?;
-                
-                let value = response
-                    .get("result")
-                    .and_then(|value| value.get("result"))
-                    .and_then(|value| value.get("value"))
-                    .ok_or_else(|| "未读取到验证码图片数据".to_string())?;
-                
-                if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
-                    return Err("验证码图片尚未加载或无法截取".to_string());
-                }
-                
-                let image_base64 = value
-                    .get("image")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| "验证码截图数据为空".to_string())?;
-
-                if let Some(p) = progress {
-                    p.info(format!("获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}", image_base64)).await;
-                }
-
-                let ocr_server_url_clone = ocr_server_url.clone();
-                let image_base64_clone = image_base64.to_string();
-                let recognition = tauri::async_runtime::spawn_blocking(move || {
-                    crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone, ocr_retry_count)
-                })
-                .await
-                .map_err(|err| err.to_string())?;
-
-                let recognition = match recognition {
-                    Ok(res) => res,
-                    Err(err) => return Err(format!("验证码自动识别失败：{}", err)),
-                };
-
-                if let Some(p) = progress {
-                    p.info(format!("验证码识别成功：{}，尝试次数：{}/{}。正在自动填入...", recognition.text, recognition.attempts, ocr_retry_count)).await;
-                }
-
-                human_delay(500, 1000).await;
-                if !type_runtime_input(
-                    &mut websocket,
-                    "input[name=\"imagestring\"]",
-                    &recognition.text,
-                    70,
-                    145,
-                )
-                .await
-                {
-                    return Err("未找到 Audiences 图片验证码输入框".to_string());
-                }
-            } else {
-                let attempts = current
-                    .remaining_attempts
-                    .map(|value| format!("，当前剩余 {} 次尝试", value))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "Audiences 登录信息已填写{}，请人工输入图片验证码并点击登录",
-                    attempts
-                ));
-            }
-        }
-        let delay_min = if has_ocr { 1200 } else { 750 };
-        let delay_max = if has_ocr { 2500 } else { 1550 };
-        human_delay(delay_min, delay_max).await;
-        if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"]") {
-            return Err("未找到 Audiences 登录按钮".to_string());
-        }
-        stable_logged_in = 0;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let Some(current) = audiences_login_page_state(&mut websocket) else {
-                continue;
-            };
-            if current.ready && !current.challenge && !current.has_login_form {
-                stable_logged_in += 1;
-                if stable_logged_in >= 4 {
-                    return Ok(true);
-                }
-            } else {
-                stable_logged_in = 0;
-            }
-        }
-        Err("Audiences 登录后仍停留在登录页，请检查凭据".to_string())
     }
 
     pub async fn audiences_remaining_attempts(
@@ -967,7 +1056,7 @@ impl CdpClient {
         };
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
         let expression = r#"(() => {
-            const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i]');
+            const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i], img[src*="image.php" i]');
             if (!image || !image.complete || !image.naturalWidth) return { ok: false };
             try {
                 const scale = 3;
@@ -1187,6 +1276,68 @@ fn audiences_login_page_state(websocket: &mut CdpWebSocket) -> Option<AudiencesL
         has_login_form: value.get("hasLoginForm")?.as_bool()?,
         has_captcha: value.get("hasCaptcha")?.as_bool()?,
         challenge: value.get("challenge")?.as_bool()?,
+        remaining_attempts: value
+            .get("remainingAttempts")
+            .and_then(|attempts| attempts.as_u64())
+            .map(|attempts| attempts as u32),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NexusLoginPageState {
+    path: String,
+    ready: bool,
+    has_login_form: bool,
+    has_captcha: bool,
+    has_two_factor: bool,
+    challenge: bool,
+    logged_in: bool,
+    is_failure_page: bool,
+    remaining_attempts: Option<u32>,
+}
+
+fn nexus_login_page_state(websocket: &mut CdpWebSocket) -> Option<NexusLoginPageState> {
+    let expression = r#"(() => {
+        const username = document.querySelector('input[name="username"]');
+        const password = document.querySelector('input[name="password"]');
+        const captcha = document.querySelector('input[name="imagestring"]');
+        const two_factor = document.querySelector('input[name="two_factor"]');
+        const logout = document.querySelector('a[href*="logout.php"]');
+        const rawBody = (document.body?.innerText || '').slice(0, 5000);
+        const body = rawBody.toLowerCase();
+        const attempts = rawBody.match(/你还有\s*\[(\d+)\]\s*次尝试机会/);
+        const isFailurePage = rawBody.includes('图片代码无效') || rawBody.includes('验证码错误') || rawBody.includes('验证码无效') || rawBody.includes('验证码不正确') || location.pathname.includes('takelogin.php');
+        return {
+            path: location.pathname,
+            ready: document.readyState === 'interactive' || document.readyState === 'complete',
+            hasLoginForm: Boolean(username && password),
+            hasCaptcha: Boolean(captcha && captcha.type !== 'hidden'),
+            hasTwoFactor: Boolean(two_factor),
+            challenge: /(just a moment|checking your browser|cloudflare|正在进行安全验证|安全验证)/.test(body),
+            loggedIn: Boolean(logout),
+            isFailurePage: Boolean(isFailurePage),
+            remainingAttempts: attempts ? Number(attempts[1]) : null
+        };
+    })()"#;
+    let response = websocket
+        .call(
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": expression,
+                "returnByValue": true
+            }),
+        )
+        .ok()?;
+    let value = response.get("result")?.get("result")?.get("value")?;
+    Some(NexusLoginPageState {
+        path: value.get("path")?.as_str()?.to_string(),
+        ready: value.get("ready")?.as_bool()?,
+        has_login_form: value.get("hasLoginForm")?.as_bool()?,
+        has_captcha: value.get("hasCaptcha")?.as_bool()?,
+        has_two_factor: value.get("hasTwoFactor")?.as_bool()?,
+        challenge: value.get("challenge")?.as_bool()?,
+        logged_in: value.get("loggedIn")?.as_bool()?,
+        is_failure_page: value.get("isFailurePage")?.as_bool()?,
         remaining_attempts: value
             .get("remainingAttempts")
             .and_then(|attempts| attempts.as_u64())

@@ -1102,7 +1102,7 @@ function Dashboard({
                   }}
                   role="button"
                   tabIndex={0}
-                  title={copied ? "已复制！" : "点击复制完整日志"}
+                  title={copied ? "已复制！" : `${entry.message}\n\n(点击复制完整日志)`}
                 >
                   <span className={levelClass(entry.level)}>{entry.level}</span>
                   <time>{formatLogTime(entry.timestamp)}</time>
@@ -1484,7 +1484,7 @@ function SitesPanel({
                           <span>{testingSiteId === site.id ? "测试中" : "测试"}</span>
                         </button>
                       ) : null}
-                      {site.auto_login && site.url.toLowerCase().includes("audiences.me") ? (
+                      {site.auto_login && !site.url.toLowerCase().includes("kp.m-team.cc") && !site.url.toLowerCase().includes("hdkyl.in") ? (
                         <button
                           className="ghost site-captcha-button"
                           disabled={busy || testingSiteId !== null || recognizingSiteId !== null}
@@ -1914,7 +1914,7 @@ function LogsPanel({
                   }}
                   role="button"
                   tabIndex={0}
-                  title={copied ? "已复制！" : "点击复制完整日志"}
+                  title={copied ? "已复制！" : `${entry.message}\n\n(点击复制完整日志)`}
                 >
                   <span className={levelClass(entry.level)}>{entry.level}</span>
                   <time>{formatLogTime(entry.timestamp)}</time>

@@ -798,14 +798,15 @@ input:focus {
   min-width: 0;
 }
 
-.site-secret-field,
-.site-auto-login {
+.site-secret-field {
   grid-column: 1 / -1;
 }
 
-.site-auto-login {
-  min-height: 38px;
-  padding: 7px 10px;
+.site-auto-login,
+.site-auto-keepalive {
+  min-height: 44px;
+  padding: 6px 12px;
+  border-radius: 6px;
 }
 
 .site-main {
@@ -1308,7 +1309,8 @@ label {
   }
 
   .site-secret-field,
-  .site-auto-login {
+  .site-auto-login,
+  .site-auto-keepalive {
     grid-column: auto;
   }
 

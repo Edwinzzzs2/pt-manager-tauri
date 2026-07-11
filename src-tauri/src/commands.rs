@@ -250,16 +250,10 @@ pub async fn test_site_login(
         .find(|site| site.id == id)
         .cloned()
         .ok_or_else(|| "未找到要测试的站点".to_string())?;
-    if !site.auto_login {
-        return Err("请先开启该站点的自动登录开关".to_string());
-    }
     let site_url = site.url.to_ascii_lowercase();
     let is_mteam = site_url.contains("kp.m-team.cc");
     let is_hdkylin = site_url.contains("hdkyl.in");
-    let is_audiences = site_url.contains("audiences.me");
-    if !is_mteam && !is_hdkylin && !is_audiences {
-        return Err("当前单站测试仅支持 M-Team、HDKylin 和 Audiences".to_string());
-    }
+    let is_nexusphp = !is_mteam && !is_hdkylin;
     if site.username.trim().is_empty() || site.password.is_empty() {
         return Err("请先配置登录用户名和密码".to_string());
     }
@@ -282,7 +276,7 @@ pub async fn test_site_login(
         Some(tab_id) => tab_id,
         None => cdp.open_tab(&site.url).await?,
     };
-    if is_audiences && !config.ocr_server_url.is_empty() {
+    if is_nexusphp && !config.ocr_server_url.is_empty() {
         push_log(&state.logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
         let ocr_server_url = config.ocr_server_url.clone();
         let init_result = tauri::async_runtime::spawn_blocking(move || {
@@ -317,44 +311,60 @@ pub async fn test_site_login(
         };
         cdp.login_mteam(&tab_id, &site.username, &site.password, totp.as_deref())
             .await
+            .map(|logged_in| (logged_in, None))
+            .map_err(|err| (err, None))
     } else if is_hdkylin {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
         cdp.login_hdkylin(&tab_id, &site.username, &site.password, secret)
             .await
+            .map(|logged_in| (logged_in, None))
+            .map_err(|err| (err, None))
     } else {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        cdp.login_audiences(
+        let progress = CdpProgress::new(
+            Arc::clone(&state.logs),
+            Arc::clone(&state.task_cancel_requested),
+        );
+        let ocr_cfg = (!config.ocr_server_url.is_empty()).then(|| (config.ocr_server_url.clone(), config.ocr_retry_count));
+        cdp.login_nexusphp(
             &tab_id,
             &site.username,
             &site.password,
             secret,
             config.min_login_attempts_remaining as u32,
-            None,
-            None,
+            ocr_cfg,
+            Some(&progress),
+            &site.name,
         )
-            .await
+        .await
     };
-    if is_audiences {
-        if let Ok(remaining) = cdp.audiences_remaining_attempts(&tab_id).await {
+
+    let (success, remaining) = match login_result {
+        Ok((logged_in, remaining)) => (Ok(logged_in), remaining),
+        Err((err, remaining)) => (Err(err), remaining),
+    };
+
+    if is_nexusphp {
+        if let Some(val) = remaining {
             let mut current = state.config.lock().await;
             if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-                saved_site.login_attempts_remaining = remaining;
+                saved_site.login_attempts_remaining = Some(val);
             }
             store::save_config(&state.app_handle, &current);
             drop(current);
-            if let Some(remaining) = remaining {
-                push_log(
-                    &state.logs,
-                    LogEntry::info(format!(
-                        "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
-                        site.name, remaining, config.min_login_attempts_remaining
-                    )),
-                )
-                .await;
-            }
+
+            push_log(
+                &state.logs,
+                LogEntry::info(format!(
+                    "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
+                    site.name, val, config.min_login_attempts_remaining
+                )),
+            )
+            .await;
         }
     }
-    let message = match login_result {
+
+    let message = match success {
         Ok(true) => format!("{} 自动登录测试成功", site.name),
         Ok(false) => format!("{} 当前已处于登录状态", site.name),
         Err(err) => {
@@ -379,8 +389,12 @@ pub async fn recognize_site_captcha(
         .find(|site| site.id == id)
         .cloned()
         .ok_or_else(|| "未找到要识别验证码的站点".to_string())?;
-    if !site.url.to_ascii_lowercase().contains("audiences.me") {
-        return Err("当前验证码识别仅支持 Audiences".to_string());
+    let site_url = site.url.to_ascii_lowercase();
+    let is_mteam = site_url.contains("kp.m-team.cc");
+    let is_hdkylin = site_url.contains("hdkyl.in");
+    let is_nexusphp = !is_mteam && !is_hdkylin;
+    if !is_nexusphp {
+        return Err("当前验证码识别仅支持 NexusPHP 架构的站点".to_string());
     }
     if config.ocr_server_url.trim().is_empty() {
         return Err("请先在设置中配置 OCR 服务地址".to_string());
@@ -411,13 +425,15 @@ pub async fn recognize_site_captcha(
     let tab_id = cdp
         .find_tab_for_url(&site.url)
         .await
-        .ok_or_else(|| "未找到 Audiences 登录页，请先点击测试按钮".to_string())?;
+        .ok_or_else(|| format!("未找到 {} 登录页，请先点击测试按钮", site.name))?;
     let renewed = cdp.prepare_audiences_captcha_retry(&tab_id).await?;
     let remaining = cdp.audiences_remaining_attempts(&tab_id).await?;
     {
         let mut current = state.config.lock().await;
         if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-            saved_site.login_attempts_remaining = remaining;
+            if remaining.is_some() {
+                saved_site.login_attempts_remaining = remaining;
+            }
         }
         store::save_config(&state.app_handle, &current);
     }
@@ -452,7 +468,7 @@ pub async fn recognize_site_captcha(
             return Err("已获取新的图片验证码，但站点用户名或密码未配置".to_string());
         }
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        match cdp
+        let res = cdp
             .login_audiences(
                 &tab_id,
                 &site.username,
@@ -462,10 +478,24 @@ pub async fn recognize_site_captcha(
                 None,
                 None,
             )
-            .await
-        {
-            Err(err) if err.contains("登录信息已填写") => {}
-            Err(err) => return Err(format!("重新填写 Audiences 登录信息失败：{}", err)),
+            .await;
+
+        let remaining_after = match &res {
+            Ok((_, rem)) => *rem,
+            Err((_, rem)) => *rem,
+        };
+
+        if let Some(val) = remaining_after {
+            let mut current = state.config.lock().await;
+            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+                saved_site.login_attempts_remaining = Some(val);
+            }
+            store::save_config(&state.app_handle, &current);
+        }
+
+        match res {
+            Err((err, _)) if err.contains("登录信息已填写") => {}
+            Err((err, _)) => return Err(format!("重新填写 Audiences 登录信息失败：{}", err)),
             Ok(_) => return Err("Audiences 当前不再需要图片验证码".to_string()),
         }
     } else {
