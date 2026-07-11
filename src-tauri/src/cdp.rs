@@ -551,24 +551,14 @@ impl CdpClient {
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
 
         let mut state = None;
-        let mut stable_non_login = 0usize;
-        for _ in 0..24 {
+        for _ in 0..120 {
             state = login_page_state(&mut websocket);
             if let Some(current) = state.as_ref() {
-                if current.host == "kp.m-team.cc" && current.ready && current.has_login_form {
-                    break;
-                }
                 if current.host == "kp.m-team.cc"
                     && current.ready
-                    && current.path != "/login"
-                    && !current.has_login_form
+                    && (current.has_login_form || current.logged_in)
                 {
-                    stable_non_login += 1;
-                    if stable_non_login >= 12 {
-                        break;
-                    }
-                } else {
-                    stable_non_login = 0;
+                    break;
                 }
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -577,13 +567,16 @@ impl CdpClient {
             return Err("无法读取 M-Team 登录页状态".to_string());
         };
         if current.host != "kp.m-team.cc" {
+            return Err("M-Team 页面加载超时，未能进入站点页面".to_string());
+        }
+        if current.logged_in {
             return Ok(false);
         }
         if !current.has_login_form {
             if current.path == "/login" {
                 return Err("M-Team 已进入登录页，但登录表单未加载完成".to_string());
             }
-            return Ok(false);
+            return Err("M-Team 登录状态检测超时：未发现账户信息或登录表单".to_string());
         }
 
         human_delay(550, 1250).await;
@@ -600,8 +593,7 @@ impl CdpClient {
         }
 
         let mut otp_submitted = false;
-        let mut stable_logged_in = 0usize;
-        for _ in 0..40 {
+        for _ in 0..120 {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let Some(current) = login_page_state(&mut websocket) else {
                 continue;
@@ -612,19 +604,13 @@ impl CdpClient {
                     return Err("检测到 M-Team 2FA 验证，但未能填写或提交验证码".to_string());
                 }
                 otp_submitted = true;
-                stable_logged_in = 0;
                 continue;
             }
-            if current.path != "/login" && !current.has_login_form {
-                stable_logged_in += 1;
-                if stable_logged_in >= 4 {
-                    return Ok(true);
-                }
-            } else {
-                stable_logged_in = 0;
+            if current.logged_in {
+                return Ok(true);
             }
         }
-        Err("M-Team 登录后仍停留在登录页，请检查账号、密码、2FA 或验证码要求".to_string())
+        Err("M-Team 登录后未检测到账户信息，请检查账号、密码、2FA 或验证码要求".to_string())
     }
 
     /// 等待 HDKylin 的正常安全检测放行后，以带间隔的方式填写并提交登录表单。
@@ -1360,6 +1346,7 @@ struct LoginPageState {
     ready: bool,
     has_login_form: bool,
     has_otp: bool,
+    logged_in: bool,
 }
 
 struct HdkLoginPageState {
@@ -1592,6 +1579,12 @@ fn click_runtime_element(websocket: &mut CdpWebSocket, selector: &str) -> bool {
 fn login_page_state(websocket: &mut CdpWebSocket) -> Option<LoginPageState> {
     let expression = r#"(() => {
         const inputs = Array.from(document.querySelectorAll('input'));
+        const rawBody = (document.body?.innerText || '').slice(0, 10000);
+        const body = rawBody.toLowerCase();
+        const logout = document.querySelector('a[href*="logout"], a[href*="signout"]');
+        const hasUpload = rawBody.includes('上传') || rawBody.includes('上傳') || body.includes('uploaded');
+        const hasDownload = rawBody.includes('下载') || rawBody.includes('下載') || body.includes('downloaded');
+        const hasRatio = rawBody.includes('分享率') || body.includes('ratio');
         const hasOtp = inputs.some((input) => {
             const hint = [input.id, input.name, input.placeholder, input.autocomplete]
                 .filter(Boolean).join(' ').toLowerCase();
@@ -1604,7 +1597,10 @@ fn login_page_state(websocket: &mut CdpWebSocket) -> Option<LoginPageState> {
             hasLoginForm: Boolean(document.querySelector('#username')
                 && document.querySelector('#password')
                 && document.querySelector('button[type="submit"]')),
-            hasOtp
+            hasOtp,
+            loggedIn: Boolean(logout)
+                || (hasUpload && hasDownload)
+                || (hasRatio && (hasUpload || hasDownload))
         };
     })()"#;
     let response = websocket
@@ -1623,6 +1619,7 @@ fn login_page_state(websocket: &mut CdpWebSocket) -> Option<LoginPageState> {
         ready: value.get("ready")?.as_bool()?,
         has_login_form: value.get("hasLoginForm")?.as_bool()?,
         has_otp: value.get("hasOtp")?.as_bool()?,
+        logged_in: value.get("loggedIn")?.as_bool()?,
     })
 }
 
