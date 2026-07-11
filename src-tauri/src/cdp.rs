@@ -733,18 +733,19 @@ impl CdpClient {
         username: &str,
         password: &str,
         totp_secret: Option<&str>,
+        min_remaining_attempts: u32,
     ) -> Result<bool, String> {
         let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
             return Err("无法连接 Audiences 标签页".to_string());
         };
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
-        let mut login_ready = false;
+        let mut login_state = None;
         let mut stable_logged_in = 0usize;
 
         for _ in 0..240 {
             if let Some(current) = audiences_login_page_state(&mut websocket) {
                 if current.has_login_form {
-                    login_ready = true;
+                    login_state = Some(current);
                     break;
                 }
                 if current.ready && !current.challenge && current.path != "/login.php" {
@@ -758,8 +759,16 @@ impl CdpClient {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        if !login_ready {
+        let Some(login_state) = login_state else {
             return Err("等待 Audiences Cloudflare 验证放行超时（120 秒）".to_string());
+        };
+        if let Some(remaining) = login_state.remaining_attempts {
+            if remaining <= min_remaining_attempts {
+                return Err(format!(
+                    "Audiences 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止自动登录与重试",
+                    remaining, min_remaining_attempts
+                ));
+            }
         }
 
         human_delay(650, 1350).await;
@@ -805,7 +814,14 @@ impl CdpClient {
         let current = audiences_login_page_state(&mut websocket)
             .ok_or_else(|| "无法读取 Audiences 登录表单状态".to_string())?;
         if current.has_captcha {
-            return Err("Audiences 登录信息已填写，请人工输入图片验证码并点击登录".to_string());
+            let attempts = current
+                .remaining_attempts
+                .map(|value| format!("，当前剩余 {} 次尝试", value))
+                .unwrap_or_default();
+            return Err(format!(
+                "Audiences 登录信息已填写{}，请人工输入图片验证码并点击登录",
+                attempts
+            ));
         }
         human_delay(750, 1550).await;
         if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"]") {
@@ -827,6 +843,156 @@ impl CdpClient {
             }
         }
         Err("Audiences 登录后仍停留在登录页，请检查凭据".to_string())
+    }
+
+    pub async fn audiences_remaining_attempts(
+        &self,
+        tab_id: &str,
+    ) -> Result<Option<u32>, String> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
+            return Err("无法连接 Audiences 标签页".to_string());
+        };
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        audiences_login_page_state(&mut websocket)
+            .map(|state| state.remaining_attempts)
+            .ok_or_else(|| "无法读取 Audiences 剩余登录次数".to_string())
+    }
+
+    pub async fn audiences_captcha_base64(&self, tab_id: &str) -> Result<String, String> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
+            return Err("无法连接 Audiences 标签页".to_string());
+        };
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        let expression = r#"(() => {
+            const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i]');
+            if (!image || !image.complete || !image.naturalWidth) return { ok: false };
+            try {
+                const scale = 3;
+                const padding = 8;
+                const canvas = document.createElement('canvas');
+                canvas.width = image.naturalWidth * scale + padding * 2;
+                canvas.height = image.naturalHeight * scale + padding * 2;
+                const context = canvas.getContext('2d', { alpha: false });
+                context.fillStyle = '#ffffff';
+                context.fillRect(0, 0, canvas.width, canvas.height);
+                context.imageSmoothingEnabled = false;
+                context.filter = 'contrast(140%) saturate(120%)';
+                context.drawImage(
+                    image,
+                    padding,
+                    padding,
+                    image.naturalWidth * scale,
+                    image.naturalHeight * scale
+                );
+                context.filter = 'none';
+                return {
+                    ok: true,
+                    image: canvas.toDataURL('image/png').split(',')[1],
+                    width: canvas.width,
+                    height: canvas.height
+                };
+            } catch (_) {
+                return { ok: false };
+            }
+        })()"#;
+        let response = websocket
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": expression,
+                    "returnByValue": true
+                }),
+            )
+            .map_err(|err| format!("截取验证码失败：{}", err))?;
+        let value = response
+            .get("result")
+            .and_then(|value| value.get("result"))
+            .and_then(|value| value.get("value"))
+            .ok_or_else(|| "未读取到验证码图片".to_string())?;
+        if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+            return Err("验证码图片尚未加载或无法截取".to_string());
+        }
+        value
+            .get("image")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "验证码截图数据为空".to_string())
+    }
+
+    /// 如果当前是 Audiences 图片代码无效页面，进入新的验证码登录页。
+    pub async fn prepare_audiences_captcha_retry(&self, tab_id: &str) -> Result<bool, String> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
+            return Err("无法连接 Audiences 标签页".to_string());
+        };
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        let expression = r#"(() => {
+            if (document.querySelector('input[name="imagestring"]')) {
+                return { ok: true, renewed: false };
+            }
+            const body = document.body?.innerText || '';
+            if (!body.includes('图片代码无效')) return { ok: false, renewed: false };
+            const link = Array.from(document.querySelectorAll('a')).find((element) =>
+                (element.textContent || '').includes('获取新的图片代码')
+                || (element.getAttribute('href') || '').includes('login.php')
+            );
+            if (!link) return { ok: false, renewed: false };
+            link.click();
+            return { ok: true, renewed: true };
+        })()"#;
+        let response = websocket
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "userGesture": true
+                }),
+            )
+            .map_err(|err| format!("检查 Audiences 验证码页面失败：{}", err))?;
+        let value = response
+            .get("result")
+            .and_then(|value| value.get("result"))
+            .and_then(|value| value.get("value"))
+            .ok_or_else(|| "无法读取 Audiences 验证码页面状态".to_string())?;
+        if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+            return Err("当前页面没有可识别的验证码，也不是图片代码无效页面".to_string());
+        }
+        let renewed = value
+            .get("renewed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if renewed {
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if audiences_login_page_state(&mut websocket)
+                    .is_some_and(|state| state.has_login_form && state.has_captcha)
+                {
+                    return Ok(true);
+                }
+            }
+            return Err("已请求新的图片验证码，但登录页加载超时".to_string());
+        }
+        Ok(false)
+    }
+
+    pub async fn fill_audiences_captcha(&self, tab_id: &str, code: &str) -> Result<(), String> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
+            return Err("无法连接 Audiences 标签页".to_string());
+        };
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        if type_runtime_input(
+            &mut websocket,
+            "input[name=\"imagestring\"]",
+            code,
+            70,
+            145,
+        )
+        .await
+        {
+            Ok(())
+        } else {
+            Err("未找到 Audiences 图片验证码输入框".to_string())
+        }
     }
 
     fn request(&self, method: &str, path: &str, timeout: Duration) -> Result<HttpResponse, String> {
@@ -881,6 +1047,7 @@ struct AudiencesLoginPageState {
     has_login_form: bool,
     has_captcha: bool,
     challenge: bool,
+    remaining_attempts: Option<u32>,
 }
 
 fn audiences_login_page_state(websocket: &mut CdpWebSocket) -> Option<AudiencesLoginPageState> {
@@ -889,13 +1056,16 @@ fn audiences_login_page_state(websocket: &mut CdpWebSocket) -> Option<AudiencesL
         const password = document.querySelector('input[name="password"]');
         const submit = document.querySelector('input[type="submit"][value="登录"]');
         const captcha = document.querySelector('input[name="imagestring"]');
-        const body = (document.body?.innerText || '').slice(0, 5000).toLowerCase();
+        const rawBody = (document.body?.innerText || '').slice(0, 5000);
+        const body = rawBody.toLowerCase();
+        const attempts = rawBody.match(/你还有\s*\[(\d+)\]\s*次尝试机会/);
         return {
             path: location.pathname,
             ready: document.readyState === 'interactive' || document.readyState === 'complete',
             hasLoginForm: Boolean(username && password && submit),
             hasCaptcha: Boolean(captcha && captcha.type !== 'hidden'),
-            challenge: /(just a moment|checking your browser|cloudflare|正在进行安全验证|安全验证)/.test(body)
+            challenge: /(just a moment|checking your browser|cloudflare|正在进行安全验证|安全验证)/.test(body),
+            remainingAttempts: attempts ? Number(attempts[1]) : null
         };
     })()"#;
     let response = websocket
@@ -914,6 +1084,10 @@ fn audiences_login_page_state(websocket: &mut CdpWebSocket) -> Option<AudiencesL
         has_login_form: value.get("hasLoginForm")?.as_bool()?,
         has_captcha: value.get("hasCaptcha")?.as_bool()?,
         challenge: value.get("challenge")?.as_bool()?,
+        remaining_attempts: value
+            .get("remainingAttempts")
+            .and_then(|attempts| attempts.as_u64())
+            .map(|attempts| attempts as u32),
     })
 }
 

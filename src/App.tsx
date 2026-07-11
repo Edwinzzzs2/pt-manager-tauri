@@ -40,6 +40,7 @@ type Site = {
   password: string;
   totp_secret: string;
   auto_login: boolean;
+  login_attempts_remaining: number | null;
 };
 
 type SiteDraft = Pick<
@@ -58,6 +59,9 @@ type AppConfig = {
   log_retention: number;
   auto_sync_cookie: boolean;
   auto_close_sync_tabs: boolean;
+  ocr_server_url: string;
+  ocr_retry_count: number;
+  min_login_attempts_remaining: number;
   cookiecloud: CookieCloudConfig;
 };
 
@@ -113,6 +117,9 @@ const defaultConfig: AppConfig = {
   log_retention: 500,
   auto_sync_cookie: false,
   auto_close_sync_tabs: false,
+  ocr_server_url: "http://192.168.31.80:8060",
+  ocr_retry_count: 2,
+  min_login_attempts_remaining: 5,
   cookiecloud: {
     server_url: "",
     uuid: "",
@@ -171,8 +178,10 @@ function App() {
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [testingSiteId, setTestingSiteId] = useState<string | null>(null);
+  const [recognizingSiteId, setRecognizingSiteId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
 
@@ -216,6 +225,18 @@ function App() {
   function showError(err: unknown) {
     setError(err instanceof Error ? err.message : String(err));
   }
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = window.setTimeout(() => setError(null), 6000);
+    return () => window.clearTimeout(timer);
+  }, [error]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   function toggleColorMode() {
     setColorMode((mode) => (mode === "dark" ? "light" : "dark"));
@@ -483,9 +504,25 @@ function App() {
     } catch (err) {
       showError(err);
     } finally {
+      await refreshConfig().catch(showError);
       await refreshLogs().catch(showError);
       await refreshStatus().catch(showError);
       setTestingSiteId(null);
+    }
+  }
+
+  async function recognizeSiteCaptcha(site: Site) {
+    setRecognizingSiteId(site.id);
+    setError(null);
+    try {
+      const result = await invoke<string>("recognize_site_captcha", { id: site.id });
+      setNotice(result);
+    } catch (err) {
+      showError(err);
+    } finally {
+      await refreshConfig().catch(showError);
+      await refreshLogs().catch(showError);
+      setRecognizingSiteId(null);
     }
   }
 
@@ -498,6 +535,13 @@ function App() {
       cron: settingsDraft.cron.trim() || defaultConfig.cron,
       cron_offset_minutes: clampNumber(Number(settingsDraft.cron_offset_minutes) || 0, 0, 1440),
       random_delay: Number(settingsDraft.cron_offset_minutes) > 0,
+      ocr_server_url: settingsDraft.ocr_server_url.trim(),
+      ocr_retry_count: clampNumber(Number(settingsDraft.ocr_retry_count) || 2, 1, 5),
+      min_login_attempts_remaining: clampNumber(
+        Number(settingsDraft.min_login_attempts_remaining) || 5,
+        1,
+        20,
+      ),
     };
 
     setBusy(true);
@@ -507,6 +551,7 @@ function App() {
       setConfig(next);
       setSettingsDraft(next);
       await refreshStatus();
+      setNotice(next.ocr_server_url ? "设置已保存，OCR 服务已就绪" : "设置已保存");
     } catch (err) {
       showError(err);
     } finally {
@@ -660,11 +705,20 @@ function App() {
 
         <div className="workspace-scroll">
           {error ? (
-            <div className="error-banner">
+            <div className="error-banner" role="alert">
               <XCircle size={18} />
               <span>{error}</span>
-              <button onClick={() => setError(null)} type="button">
-                关闭
+              <button aria-label="关闭提示" onClick={() => setError(null)} type="button">
+                <XCircle size={15} />
+              </button>
+            </div>
+          ) : null}
+          {notice ? (
+            <div className="notice-toast" role="status">
+              <CheckCircle2 size={18} />
+              <span>{notice}</span>
+              <button aria-label="关闭提示" onClick={() => setNotice(null)} type="button">
+                <XCircle size={15} />
               </button>
             </div>
           ) : null}
@@ -699,10 +753,12 @@ function App() {
               onNewSiteChange={setNewSite}
               onRemove={removeSite}
               onRemoveSelected={removeSites}
+              onRecognizeCaptcha={recognizeSiteCaptcha}
               onSave={saveSite}
               onStartEdit={startEdit}
               onTestLogin={testSiteLogin}
               testingSiteId={testingSiteId}
+              recognizingSiteId={recognizingSiteId}
             />
           ) : null}
 
@@ -973,7 +1029,16 @@ function Dashboard({
               <div
                 className="compact-log-row"
                 key={`${entry.timestamp}-${index}`}
-                title={entry.message}
+                onClick={() => copyLogEntry(entry)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    copyLogEntry(entry);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title="点击复制完整日志"
               >
                 <span className={levelClass(entry.level)}>{entry.level}</span>
                 <time>{formatLogTime(entry.timestamp)}</time>
@@ -1018,11 +1083,13 @@ function SitesPanel({
   onCancelEdit,
   onEditChange,
   onNewSiteChange,
+  onRecognizeCaptcha,
   onRemove,
   onRemoveSelected,
   onSave,
   onStartEdit,
   onTestLogin,
+  recognizingSiteId,
   testingSiteId,
 }: {
   busy: boolean;
@@ -1035,11 +1102,13 @@ function SitesPanel({
   onCancelEdit: () => void;
   onEditChange: (site: SiteDraft) => void;
   onNewSiteChange: (site: SiteDraft) => void;
+  onRecognizeCaptcha: (site: Site) => void;
   onRemove: (id: string) => Promise<void>;
   onRemoveSelected: (ids: string[]) => Promise<boolean>;
   onSave: (id: string) => void;
   onStartEdit: (site: Site) => void;
   onTestLogin: (site: Site) => void;
+  recognizingSiteId: string | null;
   testingSiteId: string | null;
 }) {
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
@@ -1250,10 +1319,21 @@ function SitesPanel({
                     </div>
                     <div className="site-details">
                       <span className="site-url">{site.url}</span>
-                      {site.username || site.totp_secret ? (
+                      {site.username || site.totp_secret || site.login_attempts_remaining != null ? (
                         <div className="site-auth-details">
                           {site.username ? <span>账号：{site.username}</span> : null}
                           {site.totp_secret ? <TotpCode secret={site.totp_secret} /> : null}
+                          {site.login_attempts_remaining != null ? (
+                            <span
+                              className={`site-attempts${
+                                site.login_attempts_remaining <= config.min_login_attempts_remaining
+                                  ? " danger"
+                                  : ""
+                              }`}
+                            >
+                              剩余尝试：{site.login_attempts_remaining}
+                            </span>
+                          ) : null}
                         </div>
                       ) : null}
                     </div>
@@ -1286,6 +1366,22 @@ function SitesPanel({
                             <ShieldCheck size={16} />
                           )}
                           <span>{testingSiteId === site.id ? "测试中" : "测试"}</span>
+                        </button>
+                      ) : null}
+                      {site.auto_login && site.url.toLowerCase().includes("audiences.me") ? (
+                        <button
+                          className="ghost site-captcha-button"
+                          disabled={busy || testingSiteId !== null || recognizingSiteId !== null}
+                          onClick={() => onRecognizeCaptcha(site)}
+                          title="识别并填入当前图片验证码"
+                          type="button"
+                        >
+                          {recognizingSiteId === site.id ? (
+                            <RefreshCw size={16} />
+                          ) : (
+                            <Search size={16} />
+                          )}
+                          <span>{recognizingSiteId === site.id ? "识别中" : "识别码"}</span>
                         </button>
                       ) : null}
                       <button onClick={() => startEditingSite(site)} type="button">
@@ -1524,6 +1620,71 @@ function SettingsPanel({
         </div>
         </section>
 
+        <section className="panel settings-card ocr-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">OCR</p>
+              <div className="title-with-help">
+                <h2>验证码识别</h2>
+                <span
+                  className="help-tip"
+                  title="保存设置时会检查 /status；OCR 未加载时自动调用 /initialize。服务重启后，下次识别也会自动重新检查。"
+                  tabIndex={0}
+                >
+                  <HelpCircle size={16} />
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="settings-form">
+            <label>
+              <span>OCR 服务地址</span>
+              <input
+                onChange={(event) => onChange({ ...draft, ocr_server_url: event.target.value })}
+                placeholder="http://192.168.31.80:8060"
+                type="url"
+                value={draft.ocr_server_url}
+              />
+            </label>
+            <label>
+              <span>识别尝试次数</span>
+              <input
+                max={5}
+                min={1}
+                onChange={(event) =>
+                  onChange({ ...draft, ocr_retry_count: Number(event.target.value) })
+                }
+                type="number"
+                value={draft.ocr_retry_count}
+              />
+            </label>
+            <label>
+              <span className="title-with-help">
+                最低剩余登录次数
+                <span
+                  className="help-tip"
+                  title="站点显示的剩余尝试次数小于或等于该值时，停止自动填写、验证码识别和登录重试，避免 IP 被封锁。"
+                  tabIndex={0}
+                >
+                  <HelpCircle size={15} />
+                </span>
+              </span>
+              <input
+                max={20}
+                min={1}
+                onChange={(event) =>
+                  onChange({
+                    ...draft,
+                    min_login_attempts_remaining: Number(event.target.value),
+                  })
+                }
+                type="number"
+                value={draft.min_login_attempts_remaining}
+              />
+            </label>
+          </div>
+        </section>
+
         <section className="panel settings-card browser-data-panel">
           <div className="panel-heading">
             <div>
@@ -1618,7 +1779,16 @@ function LogsPanel({
               <div
                 className="log-row"
                 key={`${entry.timestamp}-${index}`}
-                title={entry.message}
+                onClick={() => copyLogEntry(entry)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    copyLogEntry(entry);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title="点击复制完整日志"
               >
                 <span className={levelClass(entry.level)}>{entry.level}</span>
                 <time>{formatLogTime(entry.timestamp)}</time>
@@ -1753,6 +1923,11 @@ function formatLogTime(value: string) {
     pad(date.getMonth() + 1),
     pad(date.getDate()),
   ].join("-") + ` ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function copyLogEntry(entry: LogEntry) {
+  const content = `${formatLogTime(entry.timestamp)} [${entry.level}] ${entry.message}`;
+  void navigator.clipboard.writeText(content).catch(() => undefined);
 }
 
 function clampNumber(value: number, min: number, max: number) {

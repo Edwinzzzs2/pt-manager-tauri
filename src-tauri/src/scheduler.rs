@@ -259,7 +259,14 @@ async fn run_keepalive_inner(
 
         match opened_tab {
             Ok(tab_id) => {
-                try_auto_login_site(site, &cdp, &tab_id, logs).await;
+                try_auto_login_site(
+                    site,
+                    &cdp,
+                    &tab_id,
+                    logs,
+                    config.min_login_attempts_remaining as u32,
+                )
+                .await;
                 // 等待页面加载 + 随机抖动
                 let jitter: u64 = rand::thread_rng().gen_range(0..10);
                 let wait = config.visit_duration + jitter;
@@ -408,6 +415,7 @@ async fn try_auto_login_site(
     cdp: &CdpClient,
     tab_id: &str,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
+    min_login_attempts_remaining: u32,
 ) {
     if !site.auto_login {
         return;
@@ -457,7 +465,13 @@ async fn try_auto_login_site(
             .await
     } else {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        cdp.login_audiences(tab_id, &site.username, &site.password, secret)
+        cdp.login_audiences(
+            tab_id,
+            &site.username,
+            &site.password,
+            secret,
+            min_login_attempts_remaining,
+        )
             .await
     };
     match login_result {
@@ -515,6 +529,8 @@ async fn run_keepalive_batch(
                     let login_tab_id = tab_id.clone();
                     let login_logs = Arc::clone(logs);
                     let cdp_port = cdp.port();
+                    let min_login_attempts_remaining =
+                        config.min_login_attempts_remaining as u32;
                     login_jobs.push(tauri::async_runtime::spawn(async move {
                         let login_cdp = CdpClient::new(cdp_port);
                         try_auto_login_site(
@@ -522,6 +538,7 @@ async fn run_keepalive_batch(
                             &login_cdp,
                             &login_tab_id,
                             &login_logs,
+                            min_login_attempts_remaining,
                         )
                         .await;
                     }));

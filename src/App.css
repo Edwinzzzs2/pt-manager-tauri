@@ -332,28 +332,99 @@ button.ghost {
 }
 
 .error-banner {
+  position: fixed;
+  top: 88px;
+  right: 18px;
+  z-index: 1000;
   display: flex;
   align-items: flex-start;
   gap: 10px;
+  width: min(520px, calc(100vw - 36px));
   padding: 12px 14px;
   border: 1px solid var(--danger-soft-border);
   border-radius: 8px;
-  background: var(--danger-soft-bg);
+  background: var(--color-bg-card);
   color: var(--danger-soft-fg);
+  box-shadow: 0 16px 42px var(--panel-shadow);
   line-height: 1.55;
+  animation: toast-in 0.18s ease-out;
 }
 
 .error-banner button {
+  display: inline-flex;
   flex: 0 0 auto;
-  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  margin: -3px -5px -3px auto;
+  padding: 0;
+  border-radius: 6px;
   background: transparent;
   color: var(--danger-soft-fg);
   cursor: pointer;
 }
 
+.error-banner button:hover {
+  background: var(--danger-soft-bg-hover);
+}
+
 .error-banner span {
   flex: 1;
   white-space: pre-line;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.notice-toast {
+  position: fixed;
+  top: 88px;
+  right: 18px;
+  z-index: 1000;
+  display: flex;
+  width: min(520px, calc(100vw - 36px));
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-success);
+  border-radius: 8px;
+  background: var(--color-bg-card);
+  color: var(--success-soft-fg);
+  box-shadow: 0 16px 42px var(--panel-shadow);
+  line-height: 1.55;
+  animation: toast-in 0.18s ease-out;
+}
+
+.notice-toast span {
+  flex: 1;
+}
+
+.notice-toast button {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  margin: -3px -5px -3px auto;
+  padding: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.notice-toast button:hover {
+  background: var(--ghost-button-bg-hover);
 }
 
 .dashboard,
@@ -536,7 +607,7 @@ button.ghost {
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--subtle-surface);
-  cursor: help;
+  cursor: copy;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
@@ -823,12 +894,29 @@ input:focus {
   gap: 6px 18px;
 }
 
+.site-attempts {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--warning-soft-bg);
+  color: var(--warning-soft-fg);
+  font-weight: 700;
+}
+
+.site-attempts.danger {
+  background: var(--danger-soft-bg);
+  color: var(--danger-soft-fg);
+}
+
 .site-delete-button:hover {
   background: var(--danger-soft-bg-hover);
 }
 
 .site-test-button {
   color: var(--color-success) !important;
+}
+
+.site-captcha-button {
+  color: var(--color-accent) !important;
 }
 
 .empty-state {
@@ -1078,7 +1166,7 @@ label {
   border: 1px solid var(--color-border);
   border-radius: 6px;
   background: var(--subtle-surface);
-  cursor: help;
+  cursor: copy;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
@@ -1137,6 +1225,12 @@ label {
     grid-template-columns: 1fr;
     gap: 4px;
   }
+}
+
+.compact-log-row:focus-visible,
+.log-row:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
 }
 
 @media (max-width: 860px) {

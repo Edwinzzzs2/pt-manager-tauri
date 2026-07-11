@@ -1,6 +1,7 @@
 use crate::auth;
 use crate::cdp::{self, CdpClient, CdpLocalStorageParam, CdpProgress};
 use crate::cookiecloud;
+use crate::ocr;
 use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
 use chrono::{DateTime, Local};
@@ -74,6 +75,15 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String>
 #[tauri::command]
 pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<(), String> {
     config.log_retention = store::normalize_log_retention(config.log_retention);
+    config.ocr_server_url = config.ocr_server_url.trim().trim_end_matches('/').to_string();
+    config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
+    config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
+    if !config.ocr_server_url.is_empty() {
+        let ocr_server_url = config.ocr_server_url.clone();
+        tauri::async_runtime::spawn_blocking(move || ocr::ensure_initialized(&ocr_server_url))
+            .await
+            .map_err(|err| err.to_string())??;
+    }
     let auto_launch_changed = state.config.lock().await.auto_launch != config.auto_launch;
     if auto_launch_changed {
         apply_auto_launch(&state.app_handle, config.auto_launch)?;
@@ -108,6 +118,7 @@ pub async fn add_site(
         password,
         totp_secret,
         auto_login,
+        login_attempts_remaining: None,
     };
     config.sites.push(site);
     store::save_config(&state.app_handle, &config);
@@ -154,6 +165,7 @@ pub async fn import_sites_from_json(
             password: site.password,
             totp_secret: site.totp_secret.trim().replace(' ', ""),
             auto_login: site.auto_login,
+            login_attempts_remaining: None,
         });
         imported += 1;
     }
@@ -287,9 +299,35 @@ pub async fn test_site_login(
             .await
     } else {
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        cdp.login_audiences(&tab_id, &site.username, &site.password, secret)
+        cdp.login_audiences(
+            &tab_id,
+            &site.username,
+            &site.password,
+            secret,
+            config.min_login_attempts_remaining as u32,
+        )
             .await
     };
+    if is_audiences {
+        if let Ok(remaining) = cdp.audiences_remaining_attempts(&tab_id).await {
+            let mut current = state.config.lock().await;
+            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+                saved_site.login_attempts_remaining = remaining;
+            }
+            store::save_config(&state.app_handle, &current);
+            drop(current);
+            if let Some(remaining) = remaining {
+                push_log(
+                    &state.logs,
+                    LogEntry::info(format!(
+                        "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
+                        site.name, remaining, config.min_login_attempts_remaining
+                    )),
+                )
+                .await;
+            }
+        }
+    }
     let message = match login_result {
         Ok(true) => format!("{} 自动登录测试成功", site.name),
         Ok(false) => format!("{} 当前已处于登录状态", site.name),
@@ -300,6 +338,133 @@ pub async fn test_site_login(
         }
     };
     push_log(&state.logs, LogEntry::success(message.clone())).await;
+    Ok(message)
+}
+
+#[tauri::command]
+pub async fn recognize_site_captcha(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let config = state.config.lock().await.clone();
+    let site = config
+        .sites
+        .iter()
+        .find(|site| site.id == id)
+        .cloned()
+        .ok_or_else(|| "未找到要识别验证码的站点".to_string())?;
+    if !site.url.to_ascii_lowercase().contains("audiences.me") {
+        return Err("当前验证码识别仅支持 Audiences".to_string());
+    }
+    if config.ocr_server_url.trim().is_empty() {
+        return Err("请先在设置中配置 OCR 服务地址".to_string());
+    }
+    let mut cdp = CdpClient::new(config.cdp_port);
+    let active_port = cdp
+        .available_port()
+        .await
+        .ok_or_else(|| "专用 Chrome 未连接，请先点击该站点的测试按钮".to_string())?;
+    cdp = CdpClient::new(active_port);
+    let tab_id = cdp
+        .find_tab_for_url(&site.url)
+        .await
+        .ok_or_else(|| "未找到 Audiences 登录页，请先点击测试按钮".to_string())?;
+    let renewed = cdp.prepare_audiences_captcha_retry(&tab_id).await?;
+    let remaining = cdp.audiences_remaining_attempts(&tab_id).await?;
+    {
+        let mut current = state.config.lock().await;
+        if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+            saved_site.login_attempts_remaining = remaining;
+        }
+        store::save_config(&state.app_handle, &current);
+    }
+    if let Some(remaining) = remaining {
+        push_log(
+            &state.logs,
+            LogEntry::info(format!(
+                "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
+                site.name, remaining, config.min_login_attempts_remaining
+            )),
+        )
+        .await;
+        if remaining <= config.min_login_attempts_remaining as u32 {
+            let message = format!(
+                "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止验证码识别与登录重试",
+                site.name, remaining, config.min_login_attempts_remaining
+            );
+            push_log(&state.logs, LogEntry::error(message.clone())).await;
+            return Err(message);
+        }
+    }
+    if renewed {
+        push_log(
+            &state.logs,
+            LogEntry::info(format!(
+                "{} 检测到上次验证码无效，已获取新验证码，准备再次尝试登录",
+                site.name
+            )),
+        )
+        .await;
+        if site.username.trim().is_empty() || site.password.is_empty() {
+            return Err("已获取新的图片验证码，但站点用户名或密码未配置".to_string());
+        }
+        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+        match cdp
+            .login_audiences(
+                &tab_id,
+                &site.username,
+                &site.password,
+                secret,
+                config.min_login_attempts_remaining as u32,
+            )
+            .await
+        {
+            Err(err) if err.contains("登录信息已填写") => {}
+            Err(err) => return Err(format!("重新填写 Audiences 登录信息失败：{}", err)),
+            Ok(_) => return Err("Audiences 当前不再需要图片验证码".to_string()),
+        }
+    } else {
+        push_log(
+            &state.logs,
+            LogEntry::info(format!(
+                "{} 未检测到验证码失败页，本次不执行登录重试，仅识别当前验证码",
+                site.name
+            )),
+        )
+        .await;
+    }
+    let image = cdp.audiences_captcha_base64(&tab_id).await?;
+    let image_for_ocr = image.clone();
+    let ocr_server_url = config.ocr_server_url.clone();
+    let ocr_retry_count = config.ocr_retry_count;
+    let recognition = tauri::async_runtime::spawn_blocking(move || {
+        ocr::recognize(&ocr_server_url, &image_for_ocr, ocr_retry_count)
+    })
+        .await
+        .map_err(|err| err.to_string())?;
+    let recognition = match recognition {
+        Ok(result) => result,
+        Err(err) => {
+            let message = format!("{} OCR 识别失败：{}", site.name, err);
+            push_log(&state.logs, LogEntry::error(message.clone())).await;
+            return Err(message);
+        }
+    };
+    push_log(
+        &state.logs,
+        LogEntry::info(format!(
+            "{} OCR 识别：第 {}/{} 次成功，验证码：{}，Base64：{}",
+            site.name,
+            recognition.attempts,
+            ocr_retry_count,
+            recognition.text,
+            image
+        )),
+    )
+    .await;
+    cdp.fill_audiences_captcha(&tab_id, &recognition.text).await?;
+    let message = format!("{} 验证码已识别并填入，请在浏览器中确认后点击登录", site.name);
+    push_log(&state.logs, LogEntry::info(message.clone())).await;
     Ok(message)
 }
 

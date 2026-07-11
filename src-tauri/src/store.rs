@@ -26,6 +26,8 @@ pub struct Site {
     pub totp_secret: String,
     #[serde(default)]
     pub auto_login: bool,
+    #[serde(default)]
+    pub login_attempts_remaining: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +47,12 @@ pub struct AppConfig {
     pub auto_sync_cookie: bool,
     #[serde(default)]
     pub auto_close_sync_tabs: bool,
+    #[serde(default = "default_ocr_server_url")]
+    pub ocr_server_url: String,
+    #[serde(default = "default_ocr_retry_count")]
+    pub ocr_retry_count: u8,
+    #[serde(default = "default_min_login_attempts_remaining")]
+    pub min_login_attempts_remaining: u8,
     #[serde(default)]
     pub cookiecloud: CookieCloudConfig,
 }
@@ -69,9 +77,24 @@ impl Default for AppConfig {
             log_retention: DEFAULT_LOG_RETENTION,
             auto_sync_cookie: false,
             auto_close_sync_tabs: false,
+            ocr_server_url: default_ocr_server_url(),
+            ocr_retry_count: default_ocr_retry_count(),
+            min_login_attempts_remaining: default_min_login_attempts_remaining(),
             cookiecloud: CookieCloudConfig::default(),
         }
     }
+}
+
+fn default_ocr_server_url() -> String {
+    "http://192.168.31.80:8060".to_string()
+}
+
+fn default_ocr_retry_count() -> u8 {
+    2
+}
+
+fn default_min_login_attempts_remaining() -> u8 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +273,8 @@ pub fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
         let data = fs::read_to_string(&path).unwrap_or_default();
         let mut config = serde_json::from_str::<AppConfig>(&data).unwrap_or_default();
         config.log_retention = normalize_log_retention(config.log_retention);
+        config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
+        config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
         config
     } else {
         let config = AppConfig::default();
