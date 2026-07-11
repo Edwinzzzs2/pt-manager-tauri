@@ -119,6 +119,7 @@ pub async fn add_site(
         totp_secret,
         auto_login,
         login_attempts_remaining: None,
+        auto_keepalive: true,
     };
     config.sites.push(site);
     store::save_config(&state.app_handle, &config);
@@ -166,6 +167,7 @@ pub async fn import_sites_from_json(
             totp_secret: site.totp_secret.trim().replace(' ', ""),
             auto_login: site.auto_login,
             login_attempts_remaining: None,
+            auto_keepalive: true,
         });
         imported += 1;
     }
@@ -217,6 +219,7 @@ pub async fn update_site(
     password: String,
     totp_secret: String,
     auto_login: bool,
+    auto_keepalive: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
@@ -226,6 +229,7 @@ pub async fn update_site(
         site.password = password;
         site.totp_secret = totp_secret.trim().replace(' ', "");
         site.auto_login = auto_login;
+        site.auto_keepalive = auto_keepalive;
     }
     store::save_config(&state.app_handle, &config);
     let next = config.clone();
@@ -278,6 +282,26 @@ pub async fn test_site_login(
         Some(tab_id) => tab_id,
         None => cdp.open_tab(&site.url).await?,
     };
+    if is_audiences && !config.ocr_server_url.is_empty() {
+        push_log(&state.logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
+        let ocr_server_url = config.ocr_server_url.clone();
+        let init_result = tauri::async_runtime::spawn_blocking(move || {
+            ocr::ensure_initialized(&ocr_server_url)
+        })
+        .await
+        .unwrap_or_else(|err| Err(err.to_string()));
+        match init_result {
+            Ok(_) => {
+                push_log(&state.logs, LogEntry::success("OCR 服务检查/初始化成功")).await;
+            }
+            Err(err) => {
+                let message = format!("OCR 服务检查/初始化失败：{}", err);
+                push_log(&state.logs, LogEntry::error(message.clone())).await;
+                return Err(message);
+            }
+        }
+    }
+
     let login_result = if is_mteam {
         let totp = if site.totp_secret.trim().is_empty() {
             None
@@ -305,6 +329,8 @@ pub async fn test_site_login(
             &site.password,
             secret,
             config.min_login_attempts_remaining as u32,
+            None,
+            None,
         )
             .await
     };
@@ -358,6 +384,23 @@ pub async fn recognize_site_captcha(
     }
     if config.ocr_server_url.trim().is_empty() {
         return Err("请先在设置中配置 OCR 服务地址".to_string());
+    }
+    push_log(&state.logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
+    let ocr_server_url = config.ocr_server_url.clone();
+    let init_result = tauri::async_runtime::spawn_blocking(move || {
+        ocr::ensure_initialized(&ocr_server_url)
+    })
+    .await
+    .unwrap_or_else(|err| Err(err.to_string()));
+    match init_result {
+        Ok(_) => {
+            push_log(&state.logs, LogEntry::success("OCR 服务检查/初始化成功")).await;
+        }
+        Err(err) => {
+            let message = format!("OCR 服务检查/初始化失败：{}", err);
+            push_log(&state.logs, LogEntry::error(message.clone())).await;
+            return Err(message);
+        }
     }
     let mut cdp = CdpClient::new(config.cdp_port);
     let active_port = cdp
@@ -416,6 +459,8 @@ pub async fn recognize_site_captcha(
                 &site.password,
                 secret,
                 config.min_login_attempts_remaining as u32,
+                None,
+                None,
             )
             .await
         {
@@ -434,6 +479,14 @@ pub async fn recognize_site_captcha(
         .await;
     }
     let image = cdp.audiences_captcha_base64(&tab_id).await?;
+    push_log(
+        &state.logs,
+        LogEntry::info(format!(
+            "{} 获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}",
+            site.name, image
+        )),
+    )
+    .await;
     let image_for_ocr = image.clone();
     let ocr_server_url = config.ocr_server_url.clone();
     let ocr_retry_count = config.ocr_retry_count;
@@ -453,12 +506,11 @@ pub async fn recognize_site_captcha(
     push_log(
         &state.logs,
         LogEntry::info(format!(
-            "{} OCR 识别：第 {}/{} 次成功，验证码：{}，Base64：{}",
+            "{} OCR 识别：第 {}/{} 次成功，验证码：{}",
             site.name,
             recognition.attempts,
             ocr_retry_count,
-            recognition.text,
-            image
+            recognition.text
         )),
     )
     .await;

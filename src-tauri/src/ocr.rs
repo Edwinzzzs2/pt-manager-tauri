@@ -24,7 +24,7 @@ pub fn recognize(
                 "image": &image_base64,
                 "png_fix": false,
                 "probability": false,
-                "charset_range": 6
+                "charset_range": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
             })
         } else {
             serde_json::json!({
@@ -54,12 +54,24 @@ pub fn recognize(
                             attempts: attempt + 1,
                         });
                     }
-                    last_error = "OCR 结果格式异常".to_string();
+                    last_error = format!(
+                        "OCR 结果格式异常 (识别文本: \"{}\", 长度: {}, 仅含英文数字: {}, 完整响应: {})",
+                        text,
+                        text.len(),
+                        text.chars().all(|c| c.is_ascii_alphanumeric()),
+                        payload
+                    );
                 } else {
-                    last_error = "OCR 未返回识别文本".to_string();
+                    last_error = format!("OCR 未返回识别文本 (完整响应: {})", payload);
                 }
             }
-            Ok((_, payload)) => last_error = api_message(&payload, "OCR 识别失败"),
+            Ok((_, payload)) => {
+                last_error = format!(
+                    "{} (完整响应: {})",
+                    api_message(&payload, "OCR 识别失败"),
+                    payload
+                );
+            }
             Err(err) => last_error = err,
         }
         if attempt == 0 && attempts > 1 {
@@ -186,7 +198,7 @@ fn request_json(
     let response = String::from_utf8(response).map_err(|_| "OCR 响应不是 UTF-8".to_string())?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
-        .ok_or_else(|| "OCR 返回了无效 HTTP 响应".to_string())?;
+        .ok_or_else(|| format!("OCR 返回了无效 HTTP 响应 (原始响应: {})", response))?;
     let status = headers
         .lines()
         .next()
@@ -194,9 +206,14 @@ fn request_json(
         .and_then(|value| value.parse::<u16>().ok())
         .ok_or_else(|| "OCR 返回了无效 HTTP 状态".to_string())?;
     let payload: Value = serde_json::from_str(body)
-        .map_err(|err| format!("OCR JSON 解析失败：{}", err))?;
+        .map_err(|err| format!("OCR JSON 解析失败：{} (原始响应: {})", err, body))?;
     if !(200..300).contains(&status) {
-        return Err(format!("OCR 服务返回 HTTP {}：{}", status, api_message(&payload, "请求失败")));
+        return Err(format!(
+            "OCR 服务返回 HTTP {}：{} (完整响应: {})",
+            status,
+            api_message(&payload, "请求失败"),
+            payload
+        ));
     }
     Ok((status, payload))
 }

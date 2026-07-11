@@ -1367,3 +1367,44 @@ label {
     width: 76px;
   }
 }
+
+.site-login-badge.enabled {
+  background: var(--success-soft-bg);
+  color: var(--color-success);
+}
+
+.site-login-badge.disabled {
+  background: var(--color-bg-hover);
+  color: var(--color-fg-muted);
+  opacity: 0.6;
+}
+
+.site-selection-bar .batch-keepalive-enable {
+  margin-left: auto;
+  margin-right: 8px;
+  min-height: 34px;
+  padding: 0 11px;
+}
+
+.site-selection-bar .batch-keepalive-disable {
+  margin-right: 8px;
+  min-height: 34px;
+  padding: 0 11px;
+}
+
+.site-selection-bar .batch-delete-btn {
+  margin-left: 0 !important;
+}
+
+.compact-log-row.copied,
+.log-row.copied {
+  background: var(--accent-soft-bg) !important;
+  color: var(--color-accent);
+  transition: background 0.15s ease;
+}
+
+.compact-log-row.copied p,
+.log-row.copied p {
+  color: var(--color-accent);
+  font-weight: 600;
+}

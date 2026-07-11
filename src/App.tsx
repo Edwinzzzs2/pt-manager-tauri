@@ -41,11 +41,12 @@ type Site = {
   totp_secret: string;
   auto_login: boolean;
   login_attempts_remaining: number | null;
+  auto_keepalive: boolean;
 };
 
 type SiteDraft = Pick<
   Site,
-  "name" | "url" | "username" | "password" | "totp_secret" | "auto_login"
+  "name" | "url" | "username" | "password" | "totp_secret" | "auto_login" | "auto_keepalive"
 >;
 
 type AppConfig = {
@@ -161,6 +162,7 @@ function App() {
     password: "",
     totp_secret: "",
     auto_login: false,
+    auto_keepalive: true,
   });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
   const [editingSite, setEditingSite] = useState<SiteDraft>({
@@ -170,6 +172,7 @@ function App() {
     password: "",
     totp_secret: "",
     auto_login: false,
+    auto_keepalive: true,
   });
   const [busy, setBusy] = useState(false);
   const [cdpBusy, setCdpBusy] = useState(false);
@@ -383,6 +386,7 @@ function App() {
         password: "",
         totp_secret: "",
         auto_login: false,
+        auto_keepalive: true,
       });
       await refreshStatus();
     } catch (err) {
@@ -429,6 +433,7 @@ function App() {
       password: site.password,
       totp_secret: site.totp_secret,
       auto_login: site.auto_login,
+      auto_keepalive: site.auto_keepalive,
     });
   }
 
@@ -451,6 +456,7 @@ function App() {
         password: editingSite.password,
         totpSecret: editingSite.totp_secret.trim(),
         autoLogin: editingSite.auto_login,
+        autoKeepalive: editingSite.auto_keepalive,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -486,6 +492,52 @@ function App() {
       const next = await invoke<AppConfig>("remove_sites", { ids });
       setConfig(next);
       setSettingsDraft(next);
+      await refreshStatus();
+      return true;
+    } catch (err) {
+      showError(err);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleSiteKeepalive(site: Site) {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await invoke<AppConfig>("update_site", {
+        id: site.id,
+        name: site.name,
+        url: site.url,
+        username: site.username,
+        password: site.password,
+        totpSecret: site.totp_secret,
+        autoLogin: site.auto_login,
+        autoKeepalive: !site.auto_keepalive,
+      });
+      setConfig(next);
+      setSettingsDraft(next);
+      await refreshStatus();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function batchToggleKeepalive(ids: string[], enabled: boolean) {
+    if (ids.length === 0) return false;
+    setBusy(true);
+    setError(null);
+    try {
+      const nextSites = config.sites.map((site) =>
+        ids.includes(site.id) ? { ...site, auto_keepalive: enabled } : site
+      );
+      const nextConfig = { ...config, sites: nextSites };
+      await invoke("save_config", { config: nextConfig });
+      setConfig(nextConfig);
+      setSettingsDraft(nextConfig);
       await refreshStatus();
       return true;
     } catch (err) {
@@ -759,6 +811,8 @@ function App() {
               onTestLogin={testSiteLogin}
               testingSiteId={testingSiteId}
               recognizingSiteId={recognizingSiteId}
+              onToggleKeepalive={toggleSiteKeepalive}
+              onBatchToggleKeepalive={batchToggleKeepalive}
             />
           ) : null}
 
@@ -923,6 +977,13 @@ function Dashboard({
   const chromeInstalled = status?.chrome_installed !== false;
   const chromeConnected = !!status?.cdp_connected;
   const latestResult = status?.last_result ?? lastLog;
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  function handleCopyLog(entry: LogEntry, key: string) {
+    copyLogEntry(entry);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1500);
+  }
 
   return (
     <div className="dashboard">
@@ -1025,26 +1086,30 @@ function Dashboard({
           {recentLogs.length === 0 ? (
             <div className="empty-state">暂无日志</div>
           ) : (
-            recentLogs.map((entry, index) => (
-              <div
-                className="compact-log-row"
-                key={`${entry.timestamp}-${index}`}
-                onClick={() => copyLogEntry(entry)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    copyLogEntry(entry);
-                  }
-                }}
-                role="button"
-                tabIndex={0}
-                title="点击复制完整日志"
-              >
-                <span className={levelClass(entry.level)}>{entry.level}</span>
-                <time>{formatLogTime(entry.timestamp)}</time>
-                <p>{entry.message}</p>
-              </div>
-            ))
+            recentLogs.map((entry, index) => {
+              const rowKey = `${entry.timestamp}-${index}`;
+              const copied = copiedKey === rowKey;
+              return (
+                <div
+                  className={copied ? "compact-log-row copied" : "compact-log-row"}
+                  key={rowKey}
+                  onClick={() => handleCopyLog(entry, rowKey)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      handleCopyLog(entry, rowKey);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  title={copied ? "已复制！" : "点击复制完整日志"}
+                >
+                  <span className={levelClass(entry.level)}>{entry.level}</span>
+                  <time>{formatLogTime(entry.timestamp)}</time>
+                  <p>{copied ? "✓ 已复制" : entry.message}</p>
+                </div>
+              );
+            })
           )}
         </div>
       </section>
@@ -1091,6 +1156,8 @@ function SitesPanel({
   onTestLogin,
   recognizingSiteId,
   testingSiteId,
+  onToggleKeepalive,
+  onBatchToggleKeepalive,
 }: {
   busy: boolean;
   config: AppConfig;
@@ -1110,6 +1177,8 @@ function SitesPanel({
   onTestLogin: (site: Site) => void;
   recognizingSiteId: string | null;
   testingSiteId: string | null;
+  onToggleKeepalive: (site: Site) => void;
+  onBatchToggleKeepalive: (ids: string[], enabled: boolean) => Promise<boolean>;
 }) {
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
   const [showSitePassword, setShowSitePassword] = useState(false);
@@ -1153,6 +1222,15 @@ function SitesPanel({
     });
     if (!confirmed) return;
     if (await onRemoveSelected([...selectedSiteIds])) {
+      setSelectedSiteIds(new Set());
+    }
+  }
+
+  async function handleBatchToggleKeepalive(enabled: boolean) {
+    const ids = Array.from(selectedSiteIds);
+    if (ids.length === 0) return;
+    const success = await onBatchToggleKeepalive(ids, enabled);
+    if (success) {
       setSelectedSiteIds(new Set());
     }
   }
@@ -1212,7 +1290,25 @@ function SitesPanel({
           </label>
           <span>已选 {selectedSiteIds.size} 项</span>
           <button
-            className="danger-action"
+            className="ghost batch-keepalive-enable"
+            disabled={busy || selectedSiteIds.size === 0}
+            onClick={() => handleBatchToggleKeepalive(true)}
+            type="button"
+          >
+            <Play size={16} />
+            <span>批量开启保活</span>
+          </button>
+          <button
+            className="ghost batch-keepalive-disable"
+            disabled={busy || selectedSiteIds.size === 0}
+            onClick={() => handleBatchToggleKeepalive(false)}
+            type="button"
+          >
+            <PauseCircle size={16} />
+            <span>批量关闭保活</span>
+          </button>
+          <button
+            className="danger-action batch-delete-btn"
             disabled={busy || selectedSiteIds.size === 0}
             onClick={removeSelectedSites}
             type="button"
@@ -1308,14 +1404,34 @@ function SitesPanel({
                         type="checkbox"
                       />
                     </label>
+                    <label className="switch-row site-auto-keepalive">
+                      <span>开启自动保活</span>
+                      <input
+                        checked={editingSite.auto_keepalive}
+                        onChange={(event) =>
+                          onEditChange({ ...editingSite, auto_keepalive: event.target.checked })
+                        }
+                        type="checkbox"
+                      />
+                    </label>
                   </div>
                 ) : (
                   <div className="site-main">
                     <div className="site-title-line">
                       <strong>{site.name}</strong>
-                      <span className={site.auto_login ? "site-login-badge active" : "site-login-badge"}>
-                        {site.auto_login ? "自动登录" : "仅保活"}
-                      </span>
+                      {!site.auto_keepalive ? (
+                        <span className="site-login-badge disabled">
+                          未启用
+                        </span>
+                      ) : site.auto_login ? (
+                        <span className="site-login-badge active">
+                          自动登录
+                        </span>
+                      ) : (
+                        <span className="site-login-badge enabled">
+                          已启用
+                        </span>
+                      )}
                     </div>
                     <div className="site-details">
                       <span className="site-url">{site.url}</span>
@@ -1728,6 +1844,7 @@ function LogsPanel({
   onRefresh: () => void;
 }) {
   const [searchText, setSearchText] = useState("");
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const filteredLogs = useMemo(() => {
     const query = searchText.trim().toLowerCase();
     if (!query) {
@@ -1740,6 +1857,12 @@ function LogsPanel({
         .includes(query),
     );
   }, [logs, searchText]);
+
+  function handleCopyLog(entry: LogEntry, key: string) {
+    copyLogEntry(entry);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1500);
+  }
 
   return (
     <section className="panel logs-panel">
@@ -1775,26 +1898,30 @@ function LogsPanel({
           filteredLogs
             .slice()
             .reverse()
-            .map((entry, index) => (
-              <div
-                className="log-row"
-                key={`${entry.timestamp}-${index}`}
-                onClick={() => copyLogEntry(entry)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    copyLogEntry(entry);
-                  }
-                }}
-                role="button"
-                tabIndex={0}
-                title="点击复制完整日志"
-              >
-                <span className={levelClass(entry.level)}>{entry.level}</span>
-                <time>{formatLogTime(entry.timestamp)}</time>
-                <p>{entry.message}</p>
-              </div>
-            ))
+            .map((entry, index) => {
+              const rowKey = `${entry.timestamp}-${index}`;
+              const copied = copiedKey === rowKey;
+              return (
+                <div
+                  className={copied ? "log-row copied" : "log-row"}
+                  key={rowKey}
+                  onClick={() => handleCopyLog(entry, rowKey)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      handleCopyLog(entry, rowKey);
+                    }
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  title={copied ? "已复制！" : "点击复制完整日志"}
+                >
+                  <span className={levelClass(entry.level)}>{entry.level}</span>
+                  <time>{formatLogTime(entry.timestamp)}</time>
+                  <p>{copied ? "✓ 已复制" : entry.message}</p>
+                </div>
+              );
+            })
         )}
       </div>
     </section>

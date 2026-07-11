@@ -122,6 +122,28 @@ async fn run_keepalive_inner(
 ) -> bool {
     let mut cdp = CdpClient::new(config.cdp_port);
 
+    if !config.ocr_server_url.is_empty() {
+        push_log(logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
+        let ocr_server_url = config.ocr_server_url.clone();
+        let init_result = tauri::async_runtime::spawn_blocking(move || {
+            crate::ocr::ensure_initialized(&ocr_server_url)
+        })
+        .await
+        .unwrap_or_else(|err| Err(err.to_string()));
+        match init_result {
+            Ok(_) => {
+                push_log(logs, LogEntry::success("OCR 服务检查/初始化成功")).await;
+            }
+            Err(err) => {
+                push_log(
+                    logs,
+                    LogEntry::error(format!("OCR 服务检查/初始化失败：{}", err)),
+                )
+                .await;
+            }
+        }
+    }
+
     if config.sites.is_empty() {
         push_log(logs, LogEntry::info("暂无站点配置，保活任务结束")).await;
         return false;
@@ -159,6 +181,7 @@ async fn run_keepalive_inner(
         config
             .sites
             .iter()
+            .filter(|site| site.auto_keepalive)
             .map(|site| site.url.clone())
             .collect::<Vec<_>>()
     };
@@ -243,6 +266,15 @@ async fn run_keepalive_inner(
             return true;
         }
 
+        if !site.auto_keepalive {
+            push_log(
+                logs,
+                LogEntry::info(format!("{} 已关闭自动保活，跳过", site.name)),
+            )
+            .await;
+            continue;
+        }
+
         {
             let entry = LogEntry::info(format!("正在访问: {} ({})", site.name, site.url));
             push_log(logs, entry).await;
@@ -265,6 +297,8 @@ async fn run_keepalive_inner(
                     &tab_id,
                     logs,
                     config.min_login_attempts_remaining as u32,
+                    Some((config.ocr_server_url.clone(), config.ocr_retry_count)),
+                    Some(Arc::clone(task_cancel_requested)),
                 )
                 .await;
                 // 等待页面加载 + 随机抖动
@@ -371,7 +405,12 @@ async fn sync_cookiecloud_before_keepalive(
         .sum::<usize>();
 
     // Cookie/Local Storage 写入后刷新已打开的站点页面，使新登录态在保活执行前立即生效。
-    let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
+    let site_urls: Vec<String> = config
+        .sites
+        .iter()
+        .filter(|s| s.auto_keepalive)
+        .map(|s| s.url.clone())
+        .collect();
     CdpClient::new(active_port)
         .reload_tabs_for_sites(&site_urls)
         .await;
@@ -416,6 +455,8 @@ async fn try_auto_login_site(
     tab_id: &str,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     min_login_attempts_remaining: u32,
+    ocr_config: Option<(String, u8)>,
+    cancel_requested: Option<Arc<AtomicBool>>,
 ) {
     if !site.auto_login {
         return;
@@ -440,6 +481,9 @@ async fn try_auto_login_site(
         .await;
         return;
     }
+
+    let cancel = cancel_requested.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let progress = CdpProgress::new(Arc::clone(logs), cancel);
 
     let login_result = if is_mteam {
         let totp = if site.totp_secret.trim().is_empty() {
@@ -471,6 +515,8 @@ async fn try_auto_login_site(
             &site.password,
             secret,
             min_login_attempts_remaining,
+            ocr_config,
+            Some(&progress),
         )
             .await
     };
@@ -507,6 +553,15 @@ async fn run_keepalive_batch(
             return true;
         }
 
+        if !site.auto_keepalive {
+            push_log(
+                logs,
+                LogEntry::info(format!("{} 已关闭自动保活，跳过", site.name)),
+            )
+            .await;
+            continue;
+        }
+
         push_log(
             logs,
             LogEntry::info(format!("正在打开: {} ({})", site.name, site.url)),
@@ -531,6 +586,9 @@ async fn run_keepalive_batch(
                     let cdp_port = cdp.port();
                     let min_login_attempts_remaining =
                         config.min_login_attempts_remaining as u32;
+                    let ocr_server_url = config.ocr_server_url.clone();
+                    let ocr_retry_count = config.ocr_retry_count;
+                    let cancel_requested = Arc::clone(task_cancel_requested);
                     login_jobs.push(tauri::async_runtime::spawn(async move {
                         let login_cdp = CdpClient::new(cdp_port);
                         try_auto_login_site(
@@ -539,6 +597,8 @@ async fn run_keepalive_batch(
                             &login_tab_id,
                             &login_logs,
                             min_login_attempts_remaining,
+                            Some((ocr_server_url, ocr_retry_count)),
+                            Some(cancel_requested),
                         )
                         .await;
                     }));

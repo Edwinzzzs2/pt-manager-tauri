@@ -734,6 +734,8 @@ impl CdpClient {
         password: &str,
         totp_secret: Option<&str>,
         min_remaining_attempts: u32,
+        ocr_config: Option<(String, u8)>,
+        progress: Option<&CdpProgress>,
     ) -> Result<bool, String> {
         let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
             return Err("无法连接 Audiences 标签页".to_string());
@@ -811,19 +813,120 @@ impl CdpClient {
             }
         }
 
+        let has_ocr = ocr_config.is_some();
         let current = audiences_login_page_state(&mut websocket)
             .ok_or_else(|| "无法读取 Audiences 登录表单状态".to_string())?;
         if current.has_captcha {
-            let attempts = current
-                .remaining_attempts
-                .map(|value| format!("，当前剩余 {} 次尝试", value))
-                .unwrap_or_default();
-            return Err(format!(
-                "Audiences 登录信息已填写{}，请人工输入图片验证码并点击登录",
-                attempts
-            ));
+            if let Some((ocr_server_url, ocr_retry_count)) = ocr_config {
+                if let Some(p) = progress {
+                    p.info("检测到图片验证码，正在获取图片数据并进行自动 OCR 识别...").await;
+                }
+                
+                let expression = r#"(() => {
+                    const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i]');
+                    if (!image || !image.complete || !image.naturalWidth) return { ok: false };
+                    try {
+                        const scale = 3;
+                        const padding = 8;
+                        const canvas = document.createElement('canvas');
+                        canvas.width = image.naturalWidth * scale + padding * 2;
+                        canvas.height = image.naturalHeight * scale + padding * 2;
+                        const context = canvas.getContext('2d', { alpha: false });
+                        context.fillStyle = '#ffffff';
+                        context.fillRect(0, 0, canvas.width, canvas.height);
+                        context.imageSmoothingEnabled = false;
+                        context.filter = 'contrast(140%) saturate(120%)';
+                        context.drawImage(
+                            image,
+                            padding,
+                            padding,
+                            image.naturalWidth * scale,
+                            image.naturalHeight * scale
+                        );
+                        context.filter = 'none';
+                        return {
+                            ok: true,
+                            image: canvas.toDataURL('image/png').split(',')[1],
+                            width: canvas.width,
+                            height: canvas.height
+                        };
+                    } catch (_) {
+                        return { ok: false };
+                    }
+                })()"#;
+                
+                let response = websocket
+                    .call(
+                        "Runtime.evaluate",
+                        serde_json::json!({
+                            "expression": expression,
+                            "returnByValue": true
+                        }),
+                    )
+                    .map_err(|err| format!("截取验证码失败：{}", err))?;
+                
+                let value = response
+                    .get("result")
+                    .and_then(|value| value.get("result"))
+                    .and_then(|value| value.get("value"))
+                    .ok_or_else(|| "未读取到验证码图片数据".to_string())?;
+                
+                if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+                    return Err("验证码图片尚未加载或无法截取".to_string());
+                }
+                
+                let image_base64 = value
+                    .get("image")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| "验证码截图数据为空".to_string())?;
+
+                if let Some(p) = progress {
+                    p.info(format!("获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}", image_base64)).await;
+                }
+
+                let ocr_server_url_clone = ocr_server_url.clone();
+                let image_base64_clone = image_base64.to_string();
+                let recognition = tauri::async_runtime::spawn_blocking(move || {
+                    crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone, ocr_retry_count)
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+
+                let recognition = match recognition {
+                    Ok(res) => res,
+                    Err(err) => return Err(format!("验证码自动识别失败：{}", err)),
+                };
+
+                if let Some(p) = progress {
+                    p.info(format!("验证码识别成功：{}，尝试次数：{}/{}。正在自动填入...", recognition.text, recognition.attempts, ocr_retry_count)).await;
+                }
+
+                human_delay(500, 1000).await;
+                if !type_runtime_input(
+                    &mut websocket,
+                    "input[name=\"imagestring\"]",
+                    &recognition.text,
+                    70,
+                    145,
+                )
+                .await
+                {
+                    return Err("未找到 Audiences 图片验证码输入框".to_string());
+                }
+            } else {
+                let attempts = current
+                    .remaining_attempts
+                    .map(|value| format!("，当前剩余 {} 次尝试", value))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Audiences 登录信息已填写{}，请人工输入图片验证码并点击登录",
+                    attempts
+                ));
+            }
         }
-        human_delay(750, 1550).await;
+        let delay_min = if has_ocr { 1200 } else { 750 };
+        let delay_max = if has_ocr { 2500 } else { 1550 };
+        human_delay(delay_min, delay_max).await;
         if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"]") {
             return Err("未找到 Audiences 登录按钮".to_string());
         }

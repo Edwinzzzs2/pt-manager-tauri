@@ -28,6 +28,8 @@ pub struct Site {
     pub auto_login: bool,
     #[serde(default)]
     pub login_attempts_remaining: Option<u32>,
+    #[serde(default = "default_auto_keepalive")]
+    pub auto_keepalive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +97,10 @@ fn default_ocr_retry_count() -> u8 {
 
 fn default_min_login_attempts_remaining() -> u8 {
     5
+}
+
+fn default_auto_keepalive() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
