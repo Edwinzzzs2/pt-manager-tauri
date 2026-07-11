@@ -67,6 +67,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
+            commands::test_gotify,
             commands::add_site,
             commands::import_sites_from_json,
             commands::remove_site,

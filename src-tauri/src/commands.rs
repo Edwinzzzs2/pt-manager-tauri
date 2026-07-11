@@ -1,6 +1,7 @@
 use crate::auth;
 use crate::cdp::{self, CdpClient, CdpLocalStorageParam, CdpProgress};
 use crate::cookiecloud;
+use crate::gotify;
 use crate::ocr;
 use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
@@ -90,6 +91,13 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     {
         return Err("启用 Gotify 通知前，请填写服务地址和应用 Token".to_string());
     }
+    if (config.auto_sync_cookie || config.auto_sync_cookie_after_keepalive)
+        && (config.cookiecloud.server_url.trim().is_empty()
+            || config.cookiecloud.uuid.trim().is_empty()
+            || config.cookiecloud.password.is_empty())
+    {
+        return Err("启用 CookieCloud 自动同步前，请填写服务地址、UUID 和密码".to_string());
+    }
     if !config.ocr_server_url.is_empty() {
         let ocr_server_url = config.ocr_server_url.clone();
         tauri::async_runtime::spawn_blocking(move || ocr::ensure_initialized(&ocr_server_url))
@@ -109,6 +117,12 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     store::apply_log_retention(&state.logs).await;
     restart_scheduler(&state, config).await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn test_gotify(config: crate::store::GotifyConfig) -> Result<String, String> {
+    gotify::send_test(&config).await?;
+    Ok("Gotify 测试通知已发送，请检查接收端".to_string())
 }
 
 #[tauri::command]

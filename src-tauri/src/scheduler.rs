@@ -397,6 +397,8 @@ async fn run_keepalive_inner(
         }
     }
 
+    sync_cookiecloud_after_keepalive(config, logs, &cdp).await;
+
     {
         let entry = LogEntry::success("保活任务全部完成".to_string());
         push_log(logs, entry).await;
@@ -489,6 +491,48 @@ fn local_storage_item_count(local_storages: &[crate::cdp::CdpLocalStorageParam])
 enum LoginOutcome {
     Success,
     Failed(String),
+}
+
+async fn sync_cookiecloud_after_keepalive(
+    config: &AppConfig,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    cdp: &CdpClient,
+) {
+    if !config.auto_sync_cookie_after_keepalive {
+        return;
+    }
+
+    push_log(logs, LogEntry::info("保活完成，正在上传最新 Cookie 到 CookieCloud")).await;
+    let cookies = match cdp.get_all_cookies().await {
+        Ok(cookies) => cookies,
+        Err(err) => {
+            push_log(
+                logs,
+                LogEntry::error(format!("保活后 CookieCloud 同步失败：{}", err)),
+            )
+            .await;
+            return;
+        }
+    };
+    match cookiecloud::upload_current_cookies(&config.cookiecloud, &config.sites, cookies).await {
+        Ok(count) => {
+            push_log(
+                logs,
+                LogEntry::success(format!(
+                    "保活后 CookieCloud 同步完成：已上传 {} 条最新 Cookie",
+                    count
+                )),
+            )
+            .await;
+        }
+        Err(err) => {
+            push_log(
+                logs,
+                LogEntry::error(format!("保活后 CookieCloud 同步失败：{}", err)),
+            )
+            .await;
+        }
+    }
 }
 
 async fn try_auto_login_site(
@@ -605,13 +649,13 @@ async fn send_gotify_login_summary(
     successful_sites: &[String],
     failed_sites: &[(String, String)],
 ) {
-    if !config.gotify.enabled || (successful_sites.is_empty() && failed_sites.is_empty()) {
+    if !config.gotify.enabled {
         return;
     }
 
     match gotify::send_login_summary(&config.gotify, successful_sites, failed_sites).await {
         Ok(()) => {
-            push_log(logs, LogEntry::success("Gotify 登录结果通知已发送")).await;
+            push_log(logs, LogEntry::success("Gotify 保活结果通知已发送")).await;
         }
         Err(err) => {
             push_log(logs, LogEntry::error(err)).await;
@@ -749,6 +793,8 @@ async fn run_keepalive_batch(
         close_opened_tabs(cdp, logs, opened_tabs).await;
         return true;
     }
+
+    sync_cookiecloud_after_keepalive(config, logs, cdp).await;
 
     for (site_name, tab_id) in opened_tabs {
         if let Err(e) = cdp.close_tab(&tab_id).await {

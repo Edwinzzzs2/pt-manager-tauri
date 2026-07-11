@@ -21,6 +21,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Send,
   Search,
   Settings,
   ShieldCheck,
@@ -59,6 +60,7 @@ type AppConfig = {
   auto_launch: boolean;
   log_retention: number;
   auto_sync_cookie: boolean;
+  auto_sync_cookie_after_keepalive: boolean;
   auto_close_sync_tabs: boolean;
   ocr_server_url: string;
   ocr_retry_count: number;
@@ -124,6 +126,7 @@ const defaultConfig: AppConfig = {
   auto_launch: false,
   log_retention: 500,
   auto_sync_cookie: false,
+  auto_sync_cookie_after_keepalive: false,
   auto_close_sync_tabs: false,
   ocr_server_url: "http://192.168.31.80:8060",
   ocr_retry_count: 2,
@@ -189,6 +192,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [cdpBusy, setCdpBusy] = useState(false);
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
+  const [gotifyTestBusy, setGotifyTestBusy] = useState(false);
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -690,6 +694,25 @@ function App() {
     }
   }
 
+  async function testGotify() {
+    setGotifyTestBusy(true);
+    setError(null);
+    try {
+      const result = await invoke<string>("test_gotify", {
+        config: {
+          ...settingsDraft.gotify,
+          server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
+          token: settingsDraft.gotify.token.trim(),
+        },
+      });
+      setNotice(result);
+    } catch (err) {
+      showError(err);
+    } finally {
+      setGotifyTestBusy(false);
+    }
+  }
+
   async function clearLogs() {
     setError(null);
     try {
@@ -901,11 +924,13 @@ function App() {
               busy={busy}
               browserDataClearBusy={browserDataClearBusy}
               cookieSyncBusy={cookieSyncBusy}
+              gotifyTestBusy={gotifyTestBusy}
               draft={settingsDraft}
               onChange={setSettingsDraft}
               onClearBrowserData={clearBrowserData}
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
+              onTestGotify={testGotify}
               taskRunning={!!status?.is_running}
               onImportConfig={importConfig}
               onExportConfig={exportConfig}
@@ -1626,11 +1651,13 @@ function SettingsPanel({
   browserDataClearBusy,
   busy,
   cookieSyncBusy,
+  gotifyTestBusy,
   draft,
   onChange,
   onClearBrowserData,
   onSave,
   onSyncCookieCloud,
+  onTestGotify,
   taskRunning,
   onImportConfig,
   onExportConfig,
@@ -1638,11 +1665,13 @@ function SettingsPanel({
   browserDataClearBusy: boolean;
   busy: boolean;
   cookieSyncBusy: boolean;
+  gotifyTestBusy: boolean;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
   onClearBrowserData: () => void;
   onSave: () => void;
   onSyncCookieCloud: () => void;
+  onTestGotify: () => void;
   taskRunning: boolean;
   onImportConfig: () => void;
   onExportConfig: () => void;
@@ -1826,6 +1855,28 @@ function SettingsPanel({
             />
           </label>
           <label className="switch-row">
+            <span className="label-with-help">
+              保活后自动上传
+              <span
+                className="help-tip"
+                title="保活任务完成后，把专用 Chrome 中最新的站点 Cookie 加密上传到当前 CookieCloud。"
+                tabIndex={0}
+              >
+                <HelpCircle size={14} />
+              </span>
+            </span>
+            <input
+              checked={draft.auto_sync_cookie_after_keepalive}
+              onChange={(event) =>
+                onChange({
+                  ...draft,
+                  auto_sync_cookie_after_keepalive: event.target.checked,
+                })
+              }
+              type="checkbox"
+            />
+          </label>
+          <label className="switch-row">
             <span>同步完成 15 秒后自动关闭</span>
             <input
               checked={draft.auto_close_sync_tabs}
@@ -1909,6 +1960,21 @@ function SettingsPanel({
               <p className="eyebrow">Gotify</p>
               <h2>任务通知</h2>
             </div>
+            <div className="row-actions">
+              <button
+                className="ghost"
+                disabled={
+                  gotifyTestBusy ||
+                  !draft.gotify.server_url.trim() ||
+                  !draft.gotify.token.trim()
+                }
+                onClick={onTestGotify}
+                type="button"
+              >
+                {gotifyTestBusy ? <RefreshCw size={16} /> : <Send size={16} />}
+                <span>{gotifyTestBusy ? "测试中" : "测试通知"}</span>
+              </button>
+            </div>
           </div>
           <div className="settings-form">
             <label className="switch-row">
@@ -1963,7 +2029,7 @@ function SettingsPanel({
               </div>
             </label>
             <p className="field-hint">
-              每次保活任务结束后发送一条汇总通知，包含登录成功和登录失败的站点。
+              每次保活任务结束后发送一条通知；开启自动登录时会同时汇总登录结果。
             </p>
           </div>
         </section>

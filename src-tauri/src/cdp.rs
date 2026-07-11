@@ -301,6 +301,18 @@ impl CdpClient {
         Ok(imported)
     }
 
+    pub async fn get_all_cookies(&self) -> Result<Vec<serde_json::Value>, String> {
+        let websocket_url = self.page_websocket_url().await?;
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+        let response = websocket.call("Storage.getCookies", serde_json::json!({}))?;
+        Ok(response
+            .get("result")
+            .and_then(|value| value.get("cookies"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// 写入 Local Storage，并返回本次为写入数据而新打开的标签页 ID。
     /// 调用方可据此延迟关闭标签页，不影响用户原本已经打开的页面。
     pub async fn set_local_storage_with_opened_tabs(

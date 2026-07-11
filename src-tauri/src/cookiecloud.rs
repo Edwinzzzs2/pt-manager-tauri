@@ -1,5 +1,9 @@
 use crate::cdp::{CdpCookieParam, CdpLocalStorageEntry, CdpLocalStorageParam};
 use crate::store::{CookieCloudConfig, Site};
+use aes::Aes128;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use md5::{Digest, Md5};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -8,6 +12,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const MAX_COOKIECLOUD_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
 
 #[derive(Debug, Deserialize)]
 struct CookieCloudCookie {
@@ -29,6 +34,234 @@ struct CookieCloudCookie {
 pub struct CookieCloudSyncData {
     pub cookies: Vec<CdpCookieParam>,
     pub local_storages: Vec<CdpLocalStorageParam>,
+}
+
+pub async fn upload_current_cookies(
+    config: &CookieCloudConfig,
+    sites: &[Site],
+    browser_cookies: Vec<Value>,
+) -> Result<usize, String> {
+    let current_payload = fetch_sync_payload_async(config).await?;
+    let config = config.clone();
+    let sites = sites.to_vec();
+    let (endpoint, request_body, cookie_count) = tauri::async_runtime::spawn_blocking(move || {
+        prepare_upload_request(&config, &sites, browser_cookies, current_payload)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| err.to_string())?
+        .post(endpoint)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|err| format!("CookieCloud 上传失败：{}", err.without_url()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("CookieCloud 上传失败：HTTP {}", status));
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("CookieCloud 上传响应解析失败：{}", err.without_url()))?;
+    if payload.get("action").and_then(Value::as_str) != Some("done") {
+        return Err("CookieCloud 服务端未确认上传成功".to_string());
+    }
+
+    Ok(cookie_count)
+}
+
+async fn fetch_sync_payload_async(config: &CookieCloudConfig) -> Result<Value, String> {
+    let server_url = config.server_url.trim();
+    let uuid = config.uuid.trim();
+    let password = config.password.as_str();
+    if server_url.is_empty() || uuid.is_empty() || password.is_empty() {
+        return Err("请先填写 CookieCloud 地址、UUID 和密码".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| err.to_string())?;
+    let mut last_error = "未知错误".to_string();
+    for endpoint in build_endpoint_candidates(server_url, uuid) {
+        let response = match client
+            .post(&endpoint)
+            .json(&serde_json::json!({ "password": password }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                last_error = err.without_url().to_string();
+                continue;
+            }
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(serde_json::json!({
+                "cookie_data": {},
+                "local_storage_data": {}
+            }));
+        }
+        if !response.status().is_success() {
+            last_error = format!("HTTP {}", response.status());
+            continue;
+        }
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|err| format!("CookieCloud 响应解析失败：{}", err.without_url()))?;
+        if payload.get("cookie_data").is_some() || payload.get("local_storage_data").is_some() {
+            return Ok(payload);
+        }
+        last_error = "返回数据缺少 cookie_data/local_storage_data".to_string();
+    }
+    Err(format!("读取 CookieCloud 当前数据失败：{}", last_error))
+}
+
+fn prepare_upload_request(
+    config: &CookieCloudConfig,
+    sites: &[Site],
+    browser_cookies: Vec<Value>,
+    mut current_payload: Value,
+) -> Result<(String, Value, usize), String> {
+    let uuid = config.uuid.trim();
+    let password = config.password.as_str();
+    if config.server_url.trim().is_empty() || uuid.is_empty() || password.is_empty() {
+        return Err("请先填写 CookieCloud 地址、UUID 和密码".to_string());
+    }
+
+    let payload = current_payload
+        .as_object_mut()
+        .ok_or_else(|| "CookieCloud 当前数据格式无效".to_string())?;
+    let cookie_data = payload
+        .entry("cookie_data".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "CookieCloud cookie_data 格式无效".to_string())?;
+    let target_hosts = site_targets(sites)
+        .into_iter()
+        .map(|target| target.match_host)
+        .collect::<Vec<_>>();
+
+    cookie_data.retain(|domain, cookies| {
+        let group_host = match_host(domain);
+        if target_hosts
+            .iter()
+            .any(|target| cookie_host_matches_site(&group_host, target))
+        {
+            return false;
+        }
+        if let Some(items) = cookies.as_array_mut() {
+            items.retain(|cookie| {
+                let host = cookie
+                    .get("domain")
+                    .and_then(Value::as_str)
+                    .map(match_host)
+                    .unwrap_or_default();
+                !target_hosts
+                    .iter()
+                    .any(|target| cookie_host_matches_site(&host, target))
+            });
+            return !items.is_empty();
+        }
+        true
+    });
+
+    let mut uploaded_count = 0usize;
+    for cookie in browser_cookies {
+        let Some(object) = cookie.as_object() else {
+            continue;
+        };
+        let Some(domain) = object.get("domain").and_then(Value::as_str) else {
+            continue;
+        };
+        let cookie_host = match_host(domain);
+        if !target_hosts
+            .iter()
+            .any(|target| cookie_host_matches_site(&cookie_host, target))
+        {
+            continue;
+        }
+
+        let expires = object.get("expires").and_then(Value::as_f64).unwrap_or(-1.0);
+        let same_site = match object.get("sameSite").and_then(Value::as_str) {
+            Some(value) if value.eq_ignore_ascii_case("strict") => "strict",
+            Some(value) if value.eq_ignore_ascii_case("lax") => "lax",
+            Some(value) if value.eq_ignore_ascii_case("none") => "no_restriction",
+            _ => "unspecified",
+        };
+        let mut exported = serde_json::json!({
+            "domain": domain,
+            "hostOnly": !domain.starts_with('.'),
+            "httpOnly": object.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
+            "name": object.get("name").and_then(Value::as_str).unwrap_or(""),
+            "path": object.get("path").and_then(Value::as_str).unwrap_or("/"),
+            "sameSite": same_site,
+            "secure": object.get("secure").and_then(Value::as_bool).unwrap_or(false),
+            "session": expires <= 0.0,
+            "storeId": "0",
+            "value": object.get("value").and_then(Value::as_str).unwrap_or("")
+        });
+        if expires > 0.0 {
+            exported["expirationDate"] = serde_json::json!(expires);
+        }
+        cookie_data
+            .entry(domain.trim_start_matches('.').to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| "CookieCloud Cookie 分组格式无效".to_string())?
+            .push(exported);
+        uploaded_count += 1;
+    }
+
+    if uploaded_count == 0 {
+        return Err("专用 Chrome 中没有匹配已配置站点的 Cookie".to_string());
+    }
+    payload.insert(
+        "update_time".to_string(),
+        Value::String(chrono::Local::now().to_rfc3339()),
+    );
+    let plaintext = serde_json::to_string(&current_payload).map_err(|err| err.to_string())?;
+    let encrypted = encrypt_cookiecloud_payload(uuid, password, plaintext.as_bytes())?;
+    Ok((
+        cookiecloud_update_endpoint(&config.server_url),
+        serde_json::json!({
+            "uuid": uuid,
+            "encrypted": encrypted,
+            "crypto_type": "aes-128-cbc-fixed"
+        }),
+        uploaded_count,
+    ))
+}
+
+fn encrypt_cookiecloud_payload(uuid: &str, password: &str, plaintext: &[u8]) -> Result<String, String> {
+    let digest = Md5::digest(format!("{}-{}", uuid, password));
+    let key_hex = format!("{:x}", digest);
+    let key = &key_hex.as_bytes()[..16];
+    let iv = [0_u8; 16];
+    let encrypted = Aes128CbcEncryptor::new_from_slices(key, &iv)
+        .map_err(|err| err.to_string())?
+        .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+    Ok(STANDARD.encode(encrypted))
+}
+
+fn cookiecloud_update_endpoint(server_url: &str) -> String {
+    let clean = server_url.trim().trim_end_matches('/');
+    let lower = clean.to_ascii_lowercase();
+    let base = lower
+        .find("/get/")
+        .or_else(|| lower.ends_with("/get").then_some(clean.len() - 4))
+        .map(|index| &clean[..index])
+        .unwrap_or(clean);
+    format!("{}/update", base.trim_end_matches('/'))
+}
+
+fn cookie_host_matches_site(cookie_host: &str, site_host: &str) -> bool {
+    cookie_host == site_host || site_host.ends_with(&format!(".{}", cookie_host))
 }
 
 struct HttpUrl {
