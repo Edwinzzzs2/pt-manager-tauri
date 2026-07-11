@@ -2,7 +2,7 @@ use crate::cdp::{CdpCookieParam, CdpLocalStorageEntry, CdpLocalStorageParam};
 use crate::store::{CookieCloudConfig, Site};
 use aes::Aes128;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,6 +13,7 @@ use std::time::Duration;
 
 const MAX_COOKIECLOUD_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
+type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
 
 #[derive(Debug, Deserialize)]
 struct CookieCloudCookie {
@@ -114,6 +115,7 @@ async fn fetch_sync_payload_async(config: &CookieCloudConfig) -> Result<Value, S
             .json::<Value>()
             .await
             .map_err(|err| format!("CookieCloud 响应解析失败：{}", err.without_url()))?;
+        let payload = decrypt_cookiecloud_payload_if_needed(payload, uuid, password)?;
         if payload.get("cookie_data").is_some() || payload.get("local_storage_data").is_some() {
             return Ok(payload);
         }
@@ -249,6 +251,29 @@ fn encrypt_cookiecloud_payload(uuid: &str, password: &str, plaintext: &[u8]) -> 
     Ok(STANDARD.encode(encrypted))
 }
 
+fn decrypt_cookiecloud_payload_if_needed(
+    payload: Value,
+    uuid: &str,
+    password: &str,
+) -> Result<Value, String> {
+    let Some(encrypted) = payload.get("encrypted").and_then(Value::as_str) else {
+        return Ok(payload);
+    };
+    let encrypted = STANDARD
+        .decode(encrypted.trim())
+        .map_err(|err| format!("CookieCloud 密文 Base64 解码失败：{}", err))?;
+    let digest = Md5::digest(format!("{}-{}", uuid, password));
+    let key_hex = format!("{:x}", digest);
+    let key = &key_hex.as_bytes()[..16];
+    let iv = [0_u8; 16];
+    let plaintext = Aes128CbcDecryptor::new_from_slices(key, &iv)
+        .map_err(|err| err.to_string())?
+        .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
+        .map_err(|_| "CookieCloud 密文解密失败，请检查 UUID 和密码是否与浏览器插件一致".to_string())?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|err| format!("CookieCloud 解密数据解析失败：{}", err))
+}
+
 fn cookiecloud_update_endpoint(server_url: &str) -> String {
     let clean = server_url.trim().trim_end_matches('/');
     let lower = clean.to_ascii_lowercase();
@@ -283,16 +308,17 @@ pub fn fetch_sync_payload(config: &CookieCloudConfig) -> Result<Value, String> {
     for endpoint in endpoints {
         match request_cookiecloud_payload(&endpoint, password) {
             Ok(payload) => {
+                let payload = match decrypt_cookiecloud_payload_if_needed(payload, uuid, password) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        errors.push(format!("{}：{}", mask_uuid(&endpoint, uuid), err));
+                        continue;
+                    }
+                };
                 if payload.get("cookie_data").is_some()
                     || payload.get("local_storage_data").is_some()
                 {
                     return Ok(payload);
-                }
-                if payload.get("encrypted").is_some() {
-                    return Err(
-                        "CookieCloud 服务端返回了密文，请确认服务端支持 password 解密接口"
-                            .to_string(),
-                    );
                 }
                 errors.push(format!(
                     "{}：返回数据缺少 cookie_data/local_storage_data",
