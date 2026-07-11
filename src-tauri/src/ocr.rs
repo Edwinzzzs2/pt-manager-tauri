@@ -1,7 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 pub struct RecognitionResult {
@@ -167,46 +165,39 @@ fn request_json(
     body: Option<Value>,
     timeout: Duration,
 ) -> Result<(u16, Value), String> {
-    let endpoint = parse_endpoint(server_url, path)?;
-    let addr = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()
-        .map_err(|err| format!("无法解析 OCR 服务地址：{}", err))?
-        .next()
-        .ok_or_else(|| "无法解析 OCR 服务地址".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .map_err(|err| format!("OCR 服务连接失败：{}", err))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
-
-    let body = body.map(|value| value.to_string()).unwrap_or_default();
-    let request = format!(
-        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        method,
-        endpoint.path,
-        endpoint.host,
-        endpoint.port,
-        body.len(),
-        body
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|err| format!("发送 OCR 请求失败：{}", err))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
+    let base_url = server_url.trim().trim_end_matches('/');
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err("OCR 地址必须以 http:// 或 https:// 开头".to_string());
+    }
+    let url = format!("{}/{}", base_url, path.trim_start_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|err| format!("OCR HTTP 客户端初始化失败：{}", err))?;
+    let mut request = match method {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        _ => return Err(format!("OCR 不支持的请求方法：{}", method)),
+    };
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().map_err(|err| {
+        if err.is_timeout() {
+            "OCR 服务请求超时".to_string()
+        } else if err.is_connect() {
+            format!("OCR 服务连接失败：{}", err)
+        } else {
+            format!("OCR 请求失败：{}", err)
+        }
+    })?;
+    let status = response.status().as_u16();
+    let response_text = response
+        .text()
         .map_err(|err| format!("读取 OCR 响应失败：{}", err))?;
-    let response = String::from_utf8(response).map_err(|_| "OCR 响应不是 UTF-8".to_string())?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| format!("OCR 返回了无效 HTTP 响应 (原始响应: {})", response))?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| "OCR 返回了无效 HTTP 状态".to_string())?;
-    let payload: Value = serde_json::from_str(body)
-        .map_err(|err| format!("OCR JSON 解析失败：{} (原始响应: {})", err, body))?;
+    let payload: Value = serde_json::from_str(&response_text).map_err(|err| {
+        format!("OCR JSON 解析失败：{} (原始响应: {})", err, response_text)
+    })?;
     if !(200..300).contains(&status) {
         return Err(format!(
             "OCR 服务返回 HTTP {}：{} (完整响应: {})",
@@ -216,40 +207,4 @@ fn request_json(
         ));
     }
     Ok((status, payload))
-}
-
-struct Endpoint {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_endpoint(server_url: &str, route: &str) -> Result<Endpoint, String> {
-    let input = server_url.trim().trim_end_matches('/');
-    let rest = input
-        .strip_prefix("http://")
-        .ok_or_else(|| "OCR 地址目前仅支持 http:// 协议".to_string())?;
-    let (authority, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (
-            host,
-            port.parse::<u16>().map_err(|_| "OCR 地址端口无效".to_string())?,
-        ),
-        None => (authority, 80),
-    };
-    if host.is_empty() {
-        return Err("OCR 地址缺少主机名".to_string());
-    }
-    let prefix = prefix.trim_matches('/');
-    let route = route.trim_start_matches('/');
-    let path = if prefix.is_empty() {
-        format!("/{}", route)
-    } else {
-        format!("/{}/{}", prefix, route)
-    };
-    Ok(Endpoint {
-        host: host.to_string(),
-        port,
-        path,
-    })
 }
