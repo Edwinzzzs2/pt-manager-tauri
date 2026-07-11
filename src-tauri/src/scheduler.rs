@@ -248,6 +248,13 @@ async fn run_keepalive_inner(
         let entry = LogEntry::info(format!("开始保活任务，共 {} 个站点", config.sites.len()));
         push_log(logs, entry).await;
     }
+    if config.auto_sync_cookie_after_keepalive {
+        push_log(
+            logs,
+            LogEntry::info("已启用保活后自动上传，将在所有站点保活完成后同步到 CookieCloud"),
+        )
+        .await;
+    }
 
     let random_delay_minutes = config.cron_offset_minutes.max(0) as u64;
     if allow_random_delay && random_delay_minutes > 0 {
