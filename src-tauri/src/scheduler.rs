@@ -1,6 +1,7 @@
+use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress, CDP_CANCELLED};
 use crate::cookiecloud;
-use crate::store::{self, AppConfig, LogEntry};
+use crate::store::{self, AppConfig, LogEntry, Site};
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone};
 use rand::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -258,6 +259,7 @@ async fn run_keepalive_inner(
 
         match opened_tab {
             Ok(tab_id) => {
+                try_auto_login_site(site, &cdp, &tab_id, logs).await;
                 // 等待页面加载 + 随机抖动
                 let jitter: u64 = rand::thread_rng().gen_range(0..10);
                 let wait = config.visit_duration + jitter;
@@ -401,6 +403,75 @@ fn local_storage_item_count(local_storages: &[crate::cdp::CdpLocalStorageParam])
         .sum()
 }
 
+async fn try_auto_login_site(
+    site: &Site,
+    cdp: &CdpClient,
+    tab_id: &str,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+) {
+    if !site.auto_login {
+        return;
+    }
+    if site.username.trim().is_empty() || site.password.is_empty() {
+        push_log(
+            logs,
+            LogEntry::error(format!("{} 已开启自动登录，但用户名或密码未配置", site.name)),
+        )
+        .await;
+        return;
+    }
+    let site_url = site.url.to_ascii_lowercase();
+    let is_mteam = site_url.contains("kp.m-team.cc");
+    let is_hdkylin = site_url.contains("hdkyl.in");
+    if !is_mteam && !is_hdkylin {
+        push_log(
+            logs,
+            LogEntry::info(format!("{} 已开启自动登录，但该站点暂未适配", site.name)),
+        )
+        .await;
+        return;
+    }
+
+    let login_result = if is_mteam {
+        let totp = if site.totp_secret.trim().is_empty() {
+            None
+        } else {
+            match auth::current_totp(&site.totp_secret) {
+                Ok(code) => Some(code),
+                Err(err) => {
+                    push_log(
+                        logs,
+                        LogEntry::error(format!("{} 自动登录失败：{}", site.name, err)),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        };
+        cdp.login_mteam(tab_id, &site.username, &site.password, totp.as_deref())
+            .await
+    } else {
+        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+        cdp.login_hdkylin(tab_id, &site.username, &site.password, secret)
+            .await
+    };
+    match login_result {
+        Ok(true) => {
+            push_log(logs, LogEntry::success(format!("{} 自动登录成功", site.name))).await
+        }
+        Ok(false) => {
+            push_log(logs, LogEntry::info(format!("{} 已处于登录状态", site.name))).await
+        }
+        Err(err) => {
+            push_log(
+                logs,
+                LogEntry::error(format!("{} 自动登录失败：{}", site.name, err)),
+            )
+            .await
+        }
+    }
+}
+
 async fn run_keepalive_batch(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
@@ -409,6 +480,7 @@ async fn run_keepalive_batch(
     launched_with_initial_sites: bool,
 ) -> bool {
     let mut opened_tabs: Vec<(String, String)> = Vec::new();
+    let mut login_jobs = Vec::new();
 
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
@@ -433,6 +505,22 @@ async fn run_keepalive_batch(
 
         match opened_tab {
             Ok(tab_id) => {
+                if site.auto_login {
+                    let login_site = site.clone();
+                    let login_tab_id = tab_id.clone();
+                    let login_logs = Arc::clone(logs);
+                    let cdp_port = cdp.port();
+                    login_jobs.push(tauri::async_runtime::spawn(async move {
+                        let login_cdp = CdpClient::new(cdp_port);
+                        try_auto_login_site(
+                            &login_site,
+                            &login_cdp,
+                            &login_tab_id,
+                            &login_logs,
+                        )
+                        .await;
+                    }));
+                }
                 push_log(logs, LogEntry::info(format!("{} 已打开", site.name))).await;
                 opened_tabs.push((site.name.clone(), tab_id));
             }
@@ -444,6 +532,10 @@ async fn run_keepalive_batch(
                 .await;
             }
         }
+    }
+
+    for job in login_jobs {
+        let _ = job.await;
     }
 
     if opened_tabs.is_empty() {

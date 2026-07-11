@@ -827,6 +827,10 @@ input:focus {
   background: var(--danger-soft-bg-hover);
 }
 
+.site-test-button {
+  color: var(--color-success) !important;
+}
+
 .empty-state {
   display: grid;
   min-height: 160px;

@@ -170,6 +170,7 @@ function App() {
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [testingSiteId, setTestingSiteId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -474,6 +475,20 @@ function App() {
     }
   }
 
+  async function testSiteLogin(site: Site) {
+    setTestingSiteId(site.id);
+    setError(null);
+    try {
+      await invoke<string>("test_site_login", { id: site.id });
+    } catch (err) {
+      showError(err);
+    } finally {
+      await refreshLogs().catch(showError);
+      await refreshStatus().catch(showError);
+      setTestingSiteId(null);
+    }
+  }
+
   async function saveSettings() {
     const next: AppConfig = {
       ...settingsDraft,
@@ -686,6 +701,8 @@ function App() {
               onRemoveSelected={removeSites}
               onSave={saveSite}
               onStartEdit={startEdit}
+              onTestLogin={testSiteLogin}
+              testingSiteId={testingSiteId}
             />
           ) : null}
 
@@ -1005,6 +1022,8 @@ function SitesPanel({
   onRemoveSelected,
   onSave,
   onStartEdit,
+  onTestLogin,
+  testingSiteId,
 }: {
   busy: boolean;
   config: AppConfig;
@@ -1020,6 +1039,8 @@ function SitesPanel({
   onRemoveSelected: (ids: string[]) => Promise<boolean>;
   onSave: (id: string) => void;
   onStartEdit: (site: Site) => void;
+  onTestLogin: (site: Site) => void;
+  testingSiteId: string | null;
 }) {
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
   const [showSitePassword, setShowSitePassword] = useState(false);
@@ -1251,6 +1272,22 @@ function SitesPanel({
                     </>
                   ) : (
                     <>
+                      {site.auto_login ? (
+                        <button
+                          className="ghost site-test-button"
+                          disabled={busy || testingSiteId !== null}
+                          onClick={() => onTestLogin(site)}
+                          title="单独测试自动登录"
+                          type="button"
+                        >
+                          {testingSiteId === site.id ? (
+                            <RefreshCw size={16} />
+                          ) : (
+                            <ShieldCheck size={16} />
+                          )}
+                          <span>{testingSiteId === site.id ? "测试中" : "测试"}</span>
+                        </button>
+                      ) : null}
                       <button onClick={() => startEditingSite(site)} type="button">
                         编辑
                       </button>

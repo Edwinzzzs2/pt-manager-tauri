@@ -1,3 +1,4 @@
+mod auth;
 mod cdp;
 mod commands;
 mod cookiecloud;
@@ -66,6 +67,7 @@ pub fn run() {
             commands::remove_site,
             commands::remove_sites,
             commands::update_site,
+            commands::test_site_login,
             commands::check_cdp,
             commands::ensure_cdp,
             commands::sync_cookiecloud_cookies,

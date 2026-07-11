@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::cdp::{self, CdpClient, CdpLocalStorageParam, CdpProgress};
 use crate::cookiecloud;
 use crate::scheduler;
@@ -219,6 +220,82 @@ pub async fn update_site(
     drop(config);
     restart_scheduler(&state, next.clone()).await;
     Ok(next)
+}
+
+#[tauri::command]
+pub async fn test_site_login(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<String, String> {
+    let config = state.config.lock().await.clone();
+    let site = config
+        .sites
+        .iter()
+        .find(|site| site.id == id)
+        .cloned()
+        .ok_or_else(|| "未找到要测试的站点".to_string())?;
+    if !site.auto_login {
+        return Err("请先开启该站点的自动登录开关".to_string());
+    }
+    let site_url = site.url.to_ascii_lowercase();
+    let is_mteam = site_url.contains("kp.m-team.cc");
+    let is_hdkylin = site_url.contains("hdkyl.in");
+    if !is_mteam && !is_hdkylin {
+        return Err("当前单站测试仅支持 M-Team 和 HDKylin".to_string());
+    }
+    if site.username.trim().is_empty() || site.password.is_empty() {
+        return Err("请先配置登录用户名和密码".to_string());
+    }
+
+    let mut cdp = CdpClient::new(config.cdp_port);
+    if let Some(active_port) = cdp.available_port().await {
+        cdp = CdpClient::new(active_port);
+    } else {
+        let progress = CdpProgress::new(
+            Arc::clone(&state.logs),
+            Arc::clone(&state.task_cancel_requested),
+        );
+        let result = cdp
+            .ensure_available_with_progress(&[site.url.clone()], &progress)
+            .await?;
+        cdp = CdpClient::new(result.port);
+    }
+
+    let tab_id = match cdp.find_tab_for_url(&site.url).await {
+        Some(tab_id) => tab_id,
+        None => cdp.open_tab(&site.url).await?,
+    };
+    let login_result = if is_mteam {
+        let totp = if site.totp_secret.trim().is_empty() {
+            None
+        } else {
+            match auth::current_totp(&site.totp_secret) {
+                Ok(code) => Some(code),
+                Err(err) => {
+                    let message = format!("{} 登录测试失败：{}", site.name, err);
+                    push_log(&state.logs, LogEntry::error(message.clone())).await;
+                    return Err(message);
+                }
+            }
+        };
+        cdp.login_mteam(&tab_id, &site.username, &site.password, totp.as_deref())
+            .await
+    } else {
+        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+        cdp.login_hdkylin(&tab_id, &site.username, &site.password, secret)
+            .await
+    };
+    let message = match login_result {
+        Ok(true) => format!("{} 自动登录测试成功", site.name),
+        Ok(false) => format!("{} 当前已处于登录状态", site.name),
+        Err(err) => {
+            let message = format!("{} 登录测试失败：{}", site.name, err);
+            push_log(&state.logs, LogEntry::error(message.clone())).await;
+            return Err(message);
+        }
+    };
+    push_log(&state.logs, LogEntry::success(message.clone())).await;
+    Ok(message)
 }
 
 #[tauri::command]
