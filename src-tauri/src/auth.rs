@@ -18,8 +18,8 @@ pub fn current_totp(secret: &str) -> Result<String, String> {
         .map_err(|_| "系统时间无效，无法生成 2FA 验证码".to_string())?
         .as_secs();
     let counter = unix_seconds / 30;
-    let mut mac = HmacSha1::new_from_slice(&key)
-        .map_err(|_| "无法使用当前 2FA 密钥".to_string())?;
+    let mut mac =
+        HmacSha1::new_from_slice(&key).map_err(|_| "无法使用当前 2FA 密钥".to_string())?;
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
     let offset = (digest[digest.len() - 1] & 0x0f) as usize;

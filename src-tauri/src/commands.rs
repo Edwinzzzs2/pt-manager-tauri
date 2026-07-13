@@ -9,9 +9,9 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::process::Command;
 use std::time::Duration;
 use tauri::State;
 use tauri_plugin_autostart::ManagerExt;
@@ -76,7 +76,11 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String>
 #[tauri::command]
 pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<(), String> {
     config.log_retention = store::normalize_log_retention(config.log_retention);
-    config.ocr_server_url = config.ocr_server_url.trim().trim_end_matches('/').to_string();
+    config.ocr_server_url = config
+        .ocr_server_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
     config.gotify.server_url = config
@@ -175,11 +179,15 @@ pub async fn import_sites_from_json(
         let name = site.name.trim();
         let url = site.url.trim();
         let valid_url = (url.starts_with("http://") || url.starts_with("https://"))
-            && url.split_once("://").is_some_and(|(_, rest)| !rest.is_empty());
-        let duplicate = config
-            .sites
-            .iter()
-            .any(|existing| existing.url.trim_end_matches('/').eq_ignore_ascii_case(url.trim_end_matches('/')));
+            && url
+                .split_once("://")
+                .is_some_and(|(_, rest)| !rest.is_empty());
+        let duplicate = config.sites.iter().any(|existing| {
+            existing
+                .url
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(url.trim_end_matches('/'))
+        });
         if name.is_empty() || !valid_url || duplicate {
             skipped += 1;
             continue;
@@ -265,10 +273,7 @@ pub async fn update_site(
 }
 
 #[tauri::command]
-pub async fn test_site_login(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<String, String> {
+pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<String, String> {
     state.task_cancel_requested.store(false, Ordering::SeqCst);
     let config = state.config.lock().await.clone();
     let site = config
@@ -306,11 +311,10 @@ pub async fn test_site_login(
     if is_nexusphp && !config.ocr_server_url.is_empty() {
         push_log(&state.logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
         let ocr_server_url = config.ocr_server_url.clone();
-        let init_result = tauri::async_runtime::spawn_blocking(move || {
-            ocr::ensure_initialized(&ocr_server_url)
-        })
-        .await
-        .unwrap_or_else(|err| Err(err.to_string()));
+        let init_result =
+            tauri::async_runtime::spawn_blocking(move || ocr::ensure_initialized(&ocr_server_url))
+                .await
+                .unwrap_or_else(|err| Err(err.to_string()));
         match init_result {
             Ok(_) => {
                 push_log(&state.logs, LogEntry::success("OCR 服务检查/初始化成功")).await;
@@ -352,7 +356,8 @@ pub async fn test_site_login(
             Arc::clone(&state.logs),
             Arc::clone(&state.task_cancel_requested),
         );
-        let ocr_cfg = (!config.ocr_server_url.is_empty()).then(|| (config.ocr_server_url.clone(), config.ocr_retry_count));
+        let ocr_cfg = (!config.ocr_server_url.is_empty())
+            .then(|| (config.ocr_server_url.clone(), config.ocr_retry_count));
         cdp.login_nexusphp(
             &tab_id,
             &site.username,
@@ -428,11 +433,10 @@ pub async fn recognize_site_captcha(
     }
     push_log(&state.logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
     let ocr_server_url = config.ocr_server_url.clone();
-    let init_result = tauri::async_runtime::spawn_blocking(move || {
-        ocr::ensure_initialized(&ocr_server_url)
-    })
-    .await
-    .unwrap_or_else(|err| Err(err.to_string()));
+    let init_result =
+        tauri::async_runtime::spawn_blocking(move || ocr::ensure_initialized(&ocr_server_url))
+            .await
+            .unwrap_or_else(|err| Err(err.to_string()));
     match init_result {
         Ok(_) => {
             push_log(&state.logs, LogEntry::success("OCR 服务检查/初始化成功")).await;
@@ -550,8 +554,8 @@ pub async fn recognize_site_captcha(
     let recognition = tauri::async_runtime::spawn_blocking(move || {
         ocr::recognize(&ocr_server_url, &image_for_ocr, ocr_retry_count)
     })
-        .await
-        .map_err(|err| err.to_string())?;
+    .await
+    .map_err(|err| err.to_string())?;
     let recognition = match recognition {
         Ok(result) => result,
         Err(err) => {
@@ -564,15 +568,16 @@ pub async fn recognize_site_captcha(
         &state.logs,
         LogEntry::info(format!(
             "{} OCR 识别：第 {}/{} 次成功，验证码：{}",
-            site.name,
-            recognition.attempts,
-            ocr_retry_count,
-            recognition.text
+            site.name, recognition.attempts, ocr_retry_count, recognition.text
         )),
     )
     .await;
-    cdp.fill_audiences_captcha(&tab_id, &recognition.text).await?;
-    let message = format!("{} 验证码已识别并填入，请在浏览器中确认后点击登录", site.name);
+    cdp.fill_audiences_captcha(&tab_id, &recognition.text)
+        .await?;
+    let message = format!(
+        "{} 验证码已识别并填入，请在浏览器中确认后点击登录",
+        site.name
+    );
     push_log(&state.logs, LogEntry::info(message.clone())).await;
     Ok(message)
 }
@@ -658,7 +663,10 @@ async fn import_cookiecloud_cookies(
     };
 
     let mut write_port = active_port;
-    let imported_cookie_params = match CdpClient::new(write_port).set_cookies(&sync_data.cookies).await {
+    let imported_cookie_params = match CdpClient::new(write_port)
+        .set_cookies(&sync_data.cookies)
+        .await
+    {
         Ok(cookies) => cookies,
         Err(err) if is_connection_refused(&err) => {
             push_log(
@@ -720,7 +728,8 @@ async fn import_cookiecloud_cookies(
         imported_local_storages: local_storage_item_count(&imported_local_storages),
     };
     // 匹配站点按 CookieCloud 解析命中统计；写入数量另算，方便区分“没匹配到”和“匹配到但写入失败”。
-    let site_match = site_match_summary(&config.sites, &sync_data.cookies, &sync_data.local_storages);
+    let site_match =
+        site_match_summary(&config.sites, &sync_data.cookies, &sync_data.local_storages);
     let (_, detail) = cookie_summary(&imported_cookie_params);
     let storage_detail = local_storage_summary(&imported_local_storages);
     push_log(
@@ -871,10 +880,7 @@ fn cookie_summary(cookies: &[crate::cdp::CdpCookieParam]) -> (usize, String) {
         if host.is_empty() {
             continue;
         }
-        grouped
-            .entry(host)
-            .or_default()
-            .push(cookie.name.clone());
+        grouped.entry(host).or_default().push(cookie.name.clone());
     }
 
     let site_count = grouped.len();
@@ -1024,13 +1030,17 @@ pub async fn clear_browser_data(state: State<'_, AppState>) -> Result<(), String
         CdpClient::new(active_port)
             .clear_browser_data(&site_urls)
             .await?;
-        format!("已通过 CDP 清除专用 Chrome 浏览器数据：localhost:{}", active_port)
+        format!(
+            "已通过 CDP 清除专用 Chrome 浏览器数据：localhost:{}",
+            active_port
+        )
     } else {
         let cleared = cdp::clear_dedicated_profile_data()?;
         if cleared == 0 {
             "专用 Chrome 浏览器数据为空，无需清除".to_string()
         } else {
-            "已清除专用 Chrome Profile，Cookie、Local Storage 和缓存将在下次启动时重新生成".to_string()
+            "已清除专用 Chrome Profile，Cookie、Local Storage 和缓存将在下次启动时重新生成"
+                .to_string()
         }
     };
 
@@ -1117,29 +1127,28 @@ fn open_url(url: &str) -> std::io::Result<()> {
 #[tauri::command]
 pub async fn export_config(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let config = state.config.lock().await;
-    let json_content = serde_json::to_string_pretty(&*config)
-        .map_err(|err| format!("序列化配置失败: {}", err))?;
-    std::fs::write(&path, json_content)
-        .map_err(|err| format!("写入配置文件失败: {}", err))?;
+    let json_content =
+        serde_json::to_string_pretty(&*config).map_err(|err| format!("序列化配置失败: {}", err))?;
+    std::fs::write(&path, json_content).map_err(|err| format!("写入配置文件失败: {}", err))?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<AppConfig, String> {
-    let json_content = std::fs::read_to_string(&path)
-        .map_err(|err| format!("读取配置文件失败: {}", err))?;
+    let json_content =
+        std::fs::read_to_string(&path).map_err(|err| format!("读取配置文件失败: {}", err))?;
     let new_config: AppConfig = serde_json::from_str(&json_content)
         .map_err(|err| format!("解析配置文件失败（文件格式可能不正确）: {}", err))?;
-    
+
     let mut config = state.config.lock().await;
     *config = new_config.clone();
-    
+
     store::save_config(&state.app_handle, &config);
-    
+
     store::set_log_retention(config.log_retention);
     let _ = apply_auto_launch(&state.app_handle, config.auto_launch);
-    
+
     restart_scheduler(&state, config.clone()).await;
-    
+
     Ok(new_config)
 }

@@ -175,7 +175,11 @@ impl CdpClient {
         check_cancel(progress)?;
 
         let profile_dir = dedicated_profile_dir();
-        log_progress(progress, format!("检查专用 Chrome Profile：{}", profile_dir.display())).await;
+        log_progress(
+            progress,
+            format!("检查专用 Chrome Profile：{}", profile_dir.display()),
+        )
+        .await;
         if profile_dir_in_use(&profile_dir) {
             log_progress(
                 progress,
@@ -207,11 +211,14 @@ impl CdpClient {
         } else {
             log_progress(
                 progress,
-                format!("配置端口 localhost:{} 已被占用，准备改用随机端口", self.port),
+                format!(
+                    "配置端口 localhost:{} 已被占用，准备改用随机端口",
+                    self.port
+                ),
             )
             .await;
-            if let Some(result) = launch_and_wait(&profile_dir, false, initial_urls, None, progress)
-                .await?
+            if let Some(result) =
+                launch_and_wait(&profile_dir, false, initial_urls, None, progress).await?
             {
                 return Ok(result);
             }
@@ -341,16 +348,25 @@ impl CdpClient {
             let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
             ensure_storage_page_ready(&mut websocket, storage).await;
             let _ = websocket.call("DOMStorage.enable", serde_json::json!({}));
-            let mut imported_items = set_local_storage_items(&mut websocket, storage, &storage.items);
+            let mut imported_items =
+                set_local_storage_items(&mut websocket, storage, &storage.items);
             let missing_items = storage
                 .items
                 .iter()
-                .filter(|item| !imported_items.iter().any(|written| written.name == item.name))
+                .filter(|item| {
+                    !imported_items
+                        .iter()
+                        .any(|written| written.name == item.name)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if !missing_items.is_empty() {
                 tokio::time::sleep(Duration::from_millis(600)).await;
-                imported_items.extend(set_local_storage_items(&mut websocket, storage, &missing_items));
+                imported_items.extend(set_local_storage_items(
+                    &mut websocket,
+                    storage,
+                    &missing_items,
+                ));
             }
             if !imported_items.is_empty() {
                 imported_items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -480,7 +496,9 @@ impl CdpClient {
     }
 
     fn tab_host(&self, tab_id: &str) -> Option<String> {
-        let response = self.request("GET", "/json/list", Duration::from_secs(5)).ok()?;
+        let response = self
+            .request("GET", "/json/list", Duration::from_secs(5))
+            .ok()?;
         if !(200..300).contains(&response.status) {
             return None;
         }
@@ -599,7 +617,8 @@ impl CdpClient {
                 continue;
             };
             if current.has_otp && !otp_submitted {
-                let code = totp_code.ok_or_else(|| "M-Team 要求 2FA，但站点未配置 2FA 密钥".to_string())?;
+                let code = totp_code
+                    .ok_or_else(|| "M-Team 要求 2FA，但站点未配置 2FA 密钥".to_string())?;
                 if !submit_otp(&mut websocket, code).await {
                     return Err("检测到 M-Team 2FA 验证，但未能填写或提交验证码".to_string());
                 }
@@ -631,7 +650,9 @@ impl CdpClient {
         for _ in 0..240 {
             if let Some(current) = hdk_login_page_state(&mut websocket) {
                 if current.blocked_debug {
-                    return Err("雷池 WAF 检测到调试环境，需要在专用 Chrome 中人工完成验证".to_string());
+                    return Err(
+                        "雷池 WAF 检测到调试环境，需要在专用 Chrome 中人工完成验证".to_string()
+                    );
                 }
                 if current.has_captcha {
                     return Err("HDKylin 登录页要求图形验证码，需要人工完成".to_string());
@@ -737,21 +758,32 @@ impl CdpClient {
         progress: Option<&CdpProgress>,
         site_name: &str,
     ) -> Result<(bool, Option<u32>), (String, Option<u32>)> {
-        let Some(websocket_url) = self.websocket_url_for_tab(tab_id).map_err(|err| (err, None))? else {
+        let Some(websocket_url) = self
+            .websocket_url_for_tab(tab_id)
+            .map_err(|err| (err, None))?
+        else {
             return Err((format!("无法连接 {} 标签页", site_name), None));
         };
-        
+
         let ocr_cfg = ocr_config.clone();
-        let max_attempts = ocr_config.as_ref().map(|(_, count)| *count as usize).unwrap_or(1);
+        let max_attempts = ocr_config
+            .as_ref()
+            .map(|(_, count)| *count as usize)
+            .unwrap_or(1);
         let mut last_remaining_attempts = None;
-        
+
         for attempt in 0..max_attempts {
             if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
                 return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
             }
             if attempt > 0 {
                 if let Some(p) = progress {
-                    p.info(format!("前一次登录尝试失败，准备点击获取新的图片代码进行第 {}/{} 次重试...", attempt + 1, max_attempts)).await;
+                    p.info(format!(
+                        "前一次登录尝试失败，准备点击获取新的图片代码进行第 {}/{} 次重试...",
+                        attempt + 1,
+                        max_attempts
+                    ))
+                    .await;
                 }
                 self.prepare_audiences_captcha_retry(tab_id)
                     .await
@@ -759,7 +791,8 @@ impl CdpClient {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             }
 
-            let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10)).map_err(|err| (err.to_string(), last_remaining_attempts))?;
+            let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))
+                .map_err(|err| (err.to_string(), last_remaining_attempts))?;
             let mut login_state = None;
             let mut stable_logged_in = 0usize;
 
@@ -786,18 +819,24 @@ impl CdpClient {
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            
+
             let Some(login_state) = login_state else {
-                return Err((format!("等待 {} Cloudflare 验证放行超时（120 秒）", site_name), last_remaining_attempts));
+                return Err((
+                    format!("等待 {} Cloudflare 验证放行超时（120 秒）", site_name),
+                    last_remaining_attempts,
+                ));
             };
-            
+
             if let Some(remaining) = login_state.remaining_attempts {
                 last_remaining_attempts = Some(remaining);
                 if remaining <= min_remaining_attempts {
-                    return Err((format!(
-                        "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止自动登录与重试",
-                        site_name, remaining, min_remaining_attempts
-                    ), last_remaining_attempts));
+                    return Err((
+                        format!(
+                            "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止自动登录与重试",
+                            site_name, remaining, min_remaining_attempts
+                        ),
+                        last_remaining_attempts,
+                    ));
                 }
             }
 
@@ -823,11 +862,15 @@ impl CdpClient {
             )
             .await
             {
-                return Err((format!("未找到 {} 密码输入框", site_name), last_remaining_attempts));
+                return Err((
+                    format!("未找到 {} 密码输入框", site_name),
+                    last_remaining_attempts,
+                ));
             }
             if let Some(secret) = totp_secret {
                 if login_state.has_two_factor {
-                    let code = auth::current_totp(secret).map_err(|err| (err, last_remaining_attempts))?;
+                    let code =
+                        auth::current_totp(secret).map_err(|err| (err, last_remaining_attempts))?;
                     human_delay(450, 950).await;
                     if !type_runtime_input(
                         &mut websocket,
@@ -844,19 +887,24 @@ impl CdpClient {
             }
 
             let has_ocr = ocr_config.is_some();
-            let current = nexus_login_page_state(&mut websocket)
-                .ok_or_else(|| (format!("无法读取 {} 登录表单状态", site_name), last_remaining_attempts))?;
-            
+            let current = nexus_login_page_state(&mut websocket).ok_or_else(|| {
+                (
+                    format!("无法读取 {} 登录表单状态", site_name),
+                    last_remaining_attempts,
+                )
+            })?;
+
             if let Some(rem) = current.remaining_attempts {
                 last_remaining_attempts = Some(rem);
             }
-            
+
             if current.has_captcha {
                 if let Some((ocr_server_url, ocr_retry_count)) = ocr_cfg.clone() {
                     if let Some(p) = progress {
-                        p.info("检测到图片验证码，正在获取图片数据并进行自动 OCR 识别...").await;
+                        p.info("检测到图片验证码，正在获取图片数据并进行自动 OCR 识别...")
+                            .await;
                     }
-                    
+
                     let expression = r#"(() => {
                         const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i], img[src*="image.php" i]');
                         if (!image || !image.complete || !image.naturalWidth) return { ok: false };
@@ -889,7 +937,7 @@ impl CdpClient {
                             return { ok: false };
                         }
                     })()"#;
-                    
+
                     let response = websocket
                         .call(
                             "Runtime.evaluate",
@@ -898,42 +946,75 @@ impl CdpClient {
                                 "returnByValue": true
                             }),
                         )
-                        .map_err(|err| (format!("截取验证码失败：{}", err), last_remaining_attempts))?;
-                    
+                        .map_err(|err| {
+                            (format!("截取验证码失败：{}", err), last_remaining_attempts)
+                        })?;
+
                     let value = response
                         .get("result")
                         .and_then(|value| value.get("result"))
                         .and_then(|value| value.get("value"))
-                        .ok_or_else(|| ("未读取到验证码图片数据".to_string(), last_remaining_attempts))?;
-                    
-                    if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
-                        return Err(("验证码图片尚未加载或无法截取".to_string(), last_remaining_attempts));
+                        .ok_or_else(|| {
+                            (
+                                "未读取到验证码图片数据".to_string(),
+                                last_remaining_attempts,
+                            )
+                        })?;
+
+                    if !value
+                        .get("ok")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return Err((
+                            "验证码图片尚未加载或无法截取".to_string(),
+                            last_remaining_attempts,
+                        ));
                     }
-                    
+
                     let image_base64 = value
                         .get("image")
                         .and_then(|value| value.as_str())
-                        .ok_or_else(|| ("验证码截图数据为空".to_string(), last_remaining_attempts))?;
+                        .ok_or_else(|| {
+                            ("验证码截图数据为空".to_string(), last_remaining_attempts)
+                        })?;
 
                     if let Some(p) = progress {
-                        p.info(format!("获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}", image_base64)).await;
+                        p.info(format!(
+                            "获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}",
+                            image_base64
+                        ))
+                        .await;
                     }
 
                     let ocr_server_url_clone = ocr_server_url.clone();
                     let image_base64_clone = image_base64.to_string();
                     let recognition = tauri::async_runtime::spawn_blocking(move || {
-                        crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone, ocr_retry_count)
+                        crate::ocr::recognize(
+                            &ocr_server_url_clone,
+                            &image_base64_clone,
+                            ocr_retry_count,
+                        )
                     })
                     .await
                     .map_err(|err| (err.to_string(), last_remaining_attempts))?;
 
                     let recognition = match recognition {
                         Ok(res) => res,
-                        Err(err) => return Err((format!("验证码自动识别失败：{}", err), last_remaining_attempts)),
+                        Err(err) => {
+                            return Err((
+                                format!("验证码自动识别失败：{}", err),
+                                last_remaining_attempts,
+                            ))
+                        }
                     };
 
                     if let Some(p) = progress {
-                        p.info(format!("验证码识别成功：{}，尝试次数：{}/{}。正在自动填入...", recognition.text, recognition.attempts, ocr_retry_count)).await;
+                        p.info(format!(
+                            "验证码识别成功：{}，尝试次数：{}/{}。正在自动填入...",
+                            recognition.text, recognition.attempts, ocr_retry_count
+                        ))
+                        .await;
                     }
 
                     human_delay(500, 1000).await;
@@ -946,29 +1027,36 @@ impl CdpClient {
                     )
                     .await
                     {
-                        return Err((format!("未找到 {} 图片验证码输入框", site_name), last_remaining_attempts));
+                        return Err((
+                            format!("未找到 {} 图片验证码输入框", site_name),
+                            last_remaining_attempts,
+                        ));
                     }
                 } else {
                     let attempts = current
                         .remaining_attempts
                         .map(|value| format!("，当前剩余 {} 次尝试", value))
                         .unwrap_or_default();
-                    return Err((format!(
-                        "{} 登录信息已填写{}，请人工输入图片验证码并点击登录",
-                        site_name, attempts
-                    ), last_remaining_attempts));
+                    return Err((
+                        format!(
+                            "{} 登录信息已填写{}，请人工输入图片验证码并点击登录",
+                            site_name, attempts
+                        ),
+                        last_remaining_attempts,
+                    ));
                 }
             }
 
             let mut captcha_solved = false;
             let mut logged_challenge_msg = false;
             let mut stable_solved_samples = 0usize;
-            
-            for _ in 0..120 { // 最多等待 60 秒
+
+            for _ in 0..120 {
+                // 最多等待 60 秒
                 if progress.map(|p| p.is_cancelled()).unwrap_or(false) {
                     return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
                 }
-                
+
                 let eval_expr = r#"(() => {
                     const fields = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
                     const challengeElement = document.querySelector([
@@ -991,17 +1079,27 @@ impl CdpClient {
                     );
                     return { hasChallenge, solved };
                 })()"#;
-                
-                let val_res = websocket.call("Runtime.evaluate", serde_json::json!({
-                    "expression": eval_expr,
-                    "returnByValue": true
-                }));
-                
+
+                let val_res = websocket.call(
+                    "Runtime.evaluate",
+                    serde_json::json!({
+                        "expression": eval_expr,
+                        "returnByValue": true
+                    }),
+                );
+
                 if let Ok(response) = val_res {
-                    if let Some(val) = response.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")) {
-                        let has_challenge = val.get("hasChallenge").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if let Some(val) = response
+                        .get("result")
+                        .and_then(|r| r.get("result"))
+                        .and_then(|r| r.get("value"))
+                    {
+                        let has_challenge = val
+                            .get("hasChallenge")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let solved = val.get("solved").and_then(|v| v.as_bool()).unwrap_or(true);
-                        
+
                         if !has_challenge {
                             captcha_solved = true;
                             break;
@@ -1016,7 +1114,7 @@ impl CdpClient {
                         } else {
                             stable_solved_samples = 0;
                         }
-                        
+
                         if !logged_challenge_msg {
                             if let Some(p) = progress {
                                 p.info("检测到页面存在人机验证（如 Cloudflare Turnstile），请在浏览器中完成验证...").await;
@@ -1025,12 +1123,15 @@ impl CdpClient {
                         }
                     }
                 }
-                
+
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
             if !captcha_solved {
-                return Err((format!("等待 {} 人机验证通过超时", site_name), last_remaining_attempts));
+                return Err((
+                    format!("等待 {} 人机验证通过超时", site_name),
+                    last_remaining_attempts,
+                ));
             }
 
             let delay_min = if has_ocr { 1200 } else { 750 };
@@ -1070,11 +1171,18 @@ impl CdpClient {
             })()"#;
 
             let mut submitted = false;
-            if let Ok(response) = websocket.call("Runtime.evaluate", serde_json::json!({
-                "expression": submit_expr,
-                "returnByValue": true
-            })) {
-                if let Some(val) = response.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")) {
+            if let Ok(response) = websocket.call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": submit_expr,
+                    "returnByValue": true
+                }),
+            ) {
+                if let Some(val) = response
+                    .get("result")
+                    .and_then(|r| r.get("result"))
+                    .and_then(|r| r.get("value"))
+                {
                     submitted = val.as_bool().unwrap_or(false);
                 }
             }
@@ -1117,25 +1225,46 @@ impl CdpClient {
             }
             if captcha_failed {
                 if attempt + 1 >= max_attempts {
-                    return Err((format!("{} 自动登录失败：图片验证码错误，已达到最大重试次数 {} 次", site_name, max_attempts), last_remaining_attempts));
+                    return Err((
+                        format!(
+                            "{} 自动登录失败：图片验证码错误，已达到最大重试次数 {} 次",
+                            site_name, max_attempts
+                        ),
+                        last_remaining_attempts,
+                    ));
                 }
                 continue;
             }
-            
+
             let final_state = nexus_login_page_state(&mut websocket);
             if let Some(state) = final_state {
                 if let Some(rem) = state.remaining_attempts {
                     last_remaining_attempts = Some(rem);
                 }
                 if !state.has_login_form && !state.logged_in {
-                    return Err((format!("{} 自动登录失败：跳转到了非预期页面（可能是用户名或密码错误）", site_name), last_remaining_attempts));
+                    return Err((
+                        format!(
+                            "{} 自动登录失败：跳转到了非预期页面（可能是用户名或密码错误）",
+                            site_name
+                        ),
+                        last_remaining_attempts,
+                    ));
                 }
             }
-            
-            return Err((format!("{} 登录后仍停留在登录页，请检查凭据", site_name), last_remaining_attempts));
+
+            return Err((
+                format!("{} 登录后仍停留在登录页，请检查凭据", site_name),
+                last_remaining_attempts,
+            ));
         }
 
-        Err((format!("{} 自动登录失败：已尝试 {} 次均未成功", site_name, max_attempts), last_remaining_attempts))
+        Err((
+            format!(
+                "{} 自动登录失败：已尝试 {} 次均未成功",
+                site_name, max_attempts
+            ),
+            last_remaining_attempts,
+        ))
     }
 
     /// 等待 Audiences 的 Cloudflare 自动验证，并填写可自动处理的登录字段。
@@ -1162,10 +1291,7 @@ impl CdpClient {
         .await
     }
 
-    pub async fn audiences_remaining_attempts(
-        &self,
-        tab_id: &str,
-    ) -> Result<Option<u32>, String> {
+    pub async fn audiences_remaining_attempts(&self, tab_id: &str) -> Result<Option<u32>, String> {
         let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
             return Err("无法连接 Audiences 标签页".to_string());
         };
@@ -1226,7 +1352,11 @@ impl CdpClient {
             .and_then(|value| value.get("result"))
             .and_then(|value| value.get("value"))
             .ok_or_else(|| "未读取到验证码图片".to_string())?;
-        if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+        if !value
+            .get("ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
             return Err("验证码图片尚未加载或无法截取".to_string());
         }
         value
@@ -1271,7 +1401,11 @@ impl CdpClient {
             .and_then(|value| value.get("result"))
             .and_then(|value| value.get("value"))
             .ok_or_else(|| "无法读取 Audiences 验证码页面状态".to_string())?;
-        if !value.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+        if !value
+            .get("ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
             return Err("当前页面没有可识别的验证码，也不是图片代码无效页面".to_string());
         }
         let renewed = value
@@ -1297,15 +1431,7 @@ impl CdpClient {
             return Err("无法连接 Audiences 标签页".to_string());
         };
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
-        if type_runtime_input(
-            &mut websocket,
-            "input[name=\"imagestring\"]",
-            code,
-            70,
-            145,
-        )
-        .await
-        {
+        if type_runtime_input(&mut websocket, "input[name=\"imagestring\"]", code, 70, 145).await {
             Ok(())
         } else {
             Err("未找到 Audiences 图片验证码输入框".to_string())
@@ -1728,10 +1854,7 @@ fn set_local_storage_items(
     imported
 }
 
-async fn ensure_storage_page_ready(
-    websocket: &mut CdpWebSocket,
-    storage: &CdpLocalStorageParam,
-) {
+async fn ensure_storage_page_ready(websocket: &mut CdpWebSocket, storage: &CdpLocalStorageParam) {
     if wait_for_storage_host_ready(websocket, storage).await {
         return;
     }
@@ -1780,10 +1903,7 @@ fn current_page_location(websocket: &mut CdpWebSocket) -> Option<PageLocation> {
             }),
         )
         .ok()?;
-    let value = response
-        .get("result")?
-        .get("result")?
-        .get("value")?;
+    let value = response.get("result")?.get("result")?.get("value")?;
     Some(PageLocation {
         host: value.get("host")?.as_str()?.to_string(),
         ready_state: value.get("readyState")?.as_str()?.to_string(),
@@ -1913,16 +2033,18 @@ fn dom_storage_item_matches(
     storage: &CdpLocalStorageParam,
     item: &CdpLocalStorageEntry,
 ) -> bool {
-    dom_storage_ids(websocket, storage).into_iter().any(|storage_id| {
-        let params = serde_json::json!({
-            "storageId": storage_id
-        });
-        websocket
-            .call("DOMStorage.getDOMStorageItems", params)
-            .ok()
-            .and_then(dom_storage_response_has_item(item))
-            .unwrap_or(false)
-    })
+    dom_storage_ids(websocket, storage)
+        .into_iter()
+        .any(|storage_id| {
+            let params = serde_json::json!({
+                "storageId": storage_id
+            });
+            websocket
+                .call("DOMStorage.getDOMStorageItems", params)
+                .ok()
+                .and_then(dom_storage_response_has_item(item))
+                .unwrap_or(false)
+        })
 }
 
 fn runtime_local_storage_item_matches(
@@ -2247,9 +2369,7 @@ fn parse_ws_url(url: &str) -> Result<WsEndpoint, String> {
         .ok_or_else(|| "CDP WebSocket 地址缺少路径".to_string())?;
     let (host, port) = parse_ws_host_port(host_port)?;
     let normalized_host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    if normalized_host != "127.0.0.1"
-        && normalized_host != "localhost"
-        && normalized_host != "::1"
+    if normalized_host != "127.0.0.1" && normalized_host != "localhost" && normalized_host != "::1"
     {
         return Err("只允许连接本机 CDP WebSocket".to_string());
     }
@@ -2423,7 +2543,11 @@ async fn launch_and_wait(
                 )
                 .await;
             }
-            let prefix = if recovery { "已启动备用专用调试 Chrome" } else { "已启动专用调试 Chrome" };
+            let prefix = if recovery {
+                "已启动备用专用调试 Chrome"
+            } else {
+                "已启动专用调试 Chrome"
+            };
             let message = connected_message(prefix, port, opened_initial_urls);
             return Ok(Some(CdpLaunchResult {
                 port,
@@ -2441,9 +2565,14 @@ async fn launch_and_wait(
     Ok(None)
 }
 
-fn launch_chrome(profile_dir: &Path, urls: &[String], fixed_port: Option<u16>) -> Result<(), String> {
-    let chrome_path = find_chrome_executable()
-        .ok_or_else(|| "未检测到 Google Chrome。请在总览点击“安装 Chrome”，安装完成后再重试。".to_string())?;
+fn launch_chrome(
+    profile_dir: &Path,
+    urls: &[String],
+    fixed_port: Option<u16>,
+) -> Result<(), String> {
+    let chrome_path = find_chrome_executable().ok_or_else(|| {
+        "未检测到 Google Chrome。请在总览点击“安装 Chrome”，安装完成后再重试。".to_string()
+    })?;
 
     let mut command = Command::new(chrome_path);
     fs::create_dir_all(profile_dir)

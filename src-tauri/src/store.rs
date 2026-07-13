@@ -197,10 +197,7 @@ pub fn append_log(entry: &LogEntry) {
 
 pub fn load_logs() -> Vec<LogEntry> {
     let data = fs::read_to_string(log_file_path()).unwrap_or_default();
-    let mut logs = data
-        .lines()
-        .filter_map(parse_log_line)
-        .collect::<Vec<_>>();
+    let mut logs = data.lines().filter_map(parse_log_line).collect::<Vec<_>>();
     if trim_logs(&mut logs, current_log_retention()) {
         write_log_file(&logs);
     }

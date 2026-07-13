@@ -1,6 +1,19 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use image::{DynamicImage, ImageFormat};
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    io::Cursor,
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
+
+const CAPTCHA_LENGTH: usize = 6;
+const BINARY_THRESHOLD: u8 = 80;
+const CAPTCHA_CHARSET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+static BETA_INITIALIZED_SERVERS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub struct RecognitionResult {
     pub text: String,
@@ -13,24 +26,17 @@ pub fn recognize(
     retry_count: u8,
 ) -> Result<RecognitionResult, String> {
     ensure_initialized(server_url)?;
-    let image_base64 = normalize_image_base64(image_base64)?;
+    let image_base64 = preprocess_captcha(image_base64)?;
     let attempts = retry_count.clamp(1, 5);
     let mut last_error = "OCR 未返回识别文本".to_string();
     for attempt in 0..attempts {
-        let request = if attempt == 0 {
-            serde_json::json!({
-                "image": &image_base64,
-                "png_fix": false,
-                "probability": false,
-                "charset_range": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            })
-        } else {
-            serde_json::json!({
-                "image": &image_base64,
-                "png_fix": true,
-                "probability": false
-            })
-        };
+        // 重新初始化会重置字符范围，所以每次重试都要传递英数限制。
+        let request = serde_json::json!({
+            "image": &image_base64,
+            "png_fix": attempt > 0,
+            "probability": false,
+            "charset_range": CAPTCHA_CHARSET
+        });
         match request_json(
             server_url,
             "POST",
@@ -46,16 +52,20 @@ pub fn recognize(
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                 {
-                    if text.len() <= 16 && text.chars().all(|char| char.is_ascii_alphanumeric()) {
+                    // 站点验证码固定为六位，拒绝缺字结果，避免自动填写后消耗登录次数。
+                    if text.len() == CAPTCHA_LENGTH
+                        && text.chars().all(|char| char.is_ascii_alphanumeric())
+                    {
                         return Ok(RecognitionResult {
                             text: text.to_string(),
                             attempts: attempt + 1,
                         });
                     }
                     last_error = format!(
-                        "OCR 结果格式异常 (识别文本: \"{}\", 长度: {}, 仅含英文数字: {}, 完整响应: {})",
+                        "OCR 结果格式异常 (识别文本: \"{}\", 长度: {}, 要求长度: {}, 仅含英文数字: {}, 完整响应: {})",
                         text,
                         text.len(),
+                        CAPTCHA_LENGTH,
                         text.chars().all(|c| c.is_ascii_alphanumeric()),
                         payload
                     );
@@ -108,13 +118,44 @@ fn normalize_image_base64(value: &str) -> Result<String, String> {
     Ok(STANDARD.encode(image))
 }
 
+fn preprocess_captcha(value: &str) -> Result<String, String> {
+    let normalized = normalize_image_base64(value)?;
+    let image_bytes = STANDARD
+        .decode(normalized.as_bytes())
+        .map_err(|err| format!("验证码图片 Base64 格式无效：{}", err))?;
+    let mut grayscale = image::load_from_memory(&image_bytes)
+        .map_err(|err| format!("验证码图片解码失败：{}", err))?
+        .to_luma8();
+
+    // 低阈值保留深色字符，同时清除彩色背景块和大部分噪点。
+    for pixel in grayscale.pixels_mut() {
+        pixel[0] = if pixel[0] <= BINARY_THRESHOLD { 0 } else { 255 };
+    }
+
+    let mut output = Cursor::new(Vec::new());
+    DynamicImage::ImageLuma8(grayscale)
+        .write_to(&mut output, ImageFormat::Png)
+        .map_err(|err| format!("验证码图片预处理失败：{}", err))?;
+    Ok(STANDARD.encode(output.into_inner()))
+}
+
 pub fn ensure_initialized(server_url: &str) -> Result<(), String> {
     let (_, status) = request_json(server_url, "GET", "/status", None, Duration::from_secs(15))?;
-    if ocr_ready(&status) {
+    let normalized_url = server_url.trim().trim_end_matches('/');
+    let beta_ready = BETA_INITIALIZED_SERVERS
+        .lock()
+        .map_err(|_| "OCR 模型初始化状态已损坏".to_string())?
+        .contains(normalized_url);
+    if ocr_ready(&status) && beta_ready {
         return Ok(());
     }
 
-    initialize(server_url)
+    initialize(server_url)?;
+    BETA_INITIALIZED_SERVERS
+        .lock()
+        .map_err(|_| "OCR 模型初始化状态已损坏".to_string())?
+        .insert(normalized_url.to_string());
+    Ok(())
 }
 
 fn initialize(server_url: &str) -> Result<(), String> {
@@ -122,7 +163,7 @@ fn initialize(server_url: &str) -> Result<(), String> {
         server_url,
         "POST",
         "/initialize",
-        Some(serde_json::json!({ "ocr": true, "det": false })),
+        Some(serde_json::json!({ "ocr": true, "det": false, "beta": true })),
         Duration::from_secs(120),
     )?;
     if initialized.get("success").and_then(Value::as_bool) != Some(true) {
@@ -195,9 +236,8 @@ fn request_json(
     let response_text = response
         .text()
         .map_err(|err| format!("读取 OCR 响应失败：{}", err))?;
-    let payload: Value = serde_json::from_str(&response_text).map_err(|err| {
-        format!("OCR JSON 解析失败：{} (原始响应: {})", err, response_text)
-    })?;
+    let payload: Value = serde_json::from_str(&response_text)
+        .map_err(|err| format!("OCR JSON 解析失败：{} (原始响应: {})", err, response_text))?;
     if !(200..300).contains(&status) {
         return Err(format!(
             "OCR 服务返回 HTTP {}：{} (完整响应: {})",

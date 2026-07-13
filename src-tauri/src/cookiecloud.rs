@@ -189,7 +189,10 @@ fn prepare_upload_request(
             continue;
         }
 
-        let expires = object.get("expires").and_then(Value::as_f64).unwrap_or(-1.0);
+        let expires = object
+            .get("expires")
+            .and_then(Value::as_f64)
+            .unwrap_or(-1.0);
         let same_site = match object.get("sameSite").and_then(Value::as_str) {
             Some(value) if value.eq_ignore_ascii_case("strict") => "strict",
             Some(value) if value.eq_ignore_ascii_case("lax") => "lax",
@@ -240,7 +243,11 @@ fn prepare_upload_request(
     ))
 }
 
-fn encrypt_cookiecloud_payload(uuid: &str, password: &str, plaintext: &[u8]) -> Result<String, String> {
+fn encrypt_cookiecloud_payload(
+    uuid: &str,
+    password: &str,
+    plaintext: &[u8],
+) -> Result<String, String> {
     let digest = Md5::digest(format!("{}-{}", uuid, password));
     let key_hex = format!("{:x}", digest);
     let key = &key_hex.as_bytes()[..16];
@@ -269,7 +276,9 @@ fn decrypt_cookiecloud_payload_if_needed(
     let plaintext = Aes128CbcDecryptor::new_from_slices(key, &iv)
         .map_err(|err| err.to_string())?
         .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
-        .map_err(|_| "CookieCloud 密文解密失败，请检查 UUID 和密码是否与浏览器插件一致".to_string())?;
+        .map_err(|_| {
+            "CookieCloud 密文解密失败，请检查 UUID 和密码是否与浏览器插件一致".to_string()
+        })?;
     serde_json::from_slice(&plaintext)
         .map_err(|err| format!("CookieCloud 解密数据解析失败：{}", err))
 }
@@ -331,7 +340,10 @@ pub fn fetch_sync_payload(config: &CookieCloudConfig) -> Result<Value, String> {
 
     Err(format!(
         "CookieCloud 无法连接，请确认服务地址和协议是否与浏览器插件一致。最近一次错误：{}",
-        errors.last().cloned().unwrap_or_else(|| "未知错误".to_string())
+        errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "未知错误".to_string())
     ))
 }
 
@@ -400,10 +412,7 @@ fn cookies_from_cookie_data(
                 cookie.secure
             };
 
-            let Some(url) = cookie_url(
-                &domain,
-                is_secure,
-            ) else {
+            let Some(url) = cookie_url(&domain, is_secure) else {
                 continue;
             };
             result.push(CdpCookieParam {
@@ -479,7 +488,10 @@ fn site_targets(sites: &[Site]) -> Vec<SiteTarget> {
         .collect()
 }
 
-fn local_storage_param(target: &SiteTarget, items: &[CdpLocalStorageEntry]) -> CdpLocalStorageParam {
+fn local_storage_param(
+    target: &SiteTarget,
+    items: &[CdpLocalStorageEntry],
+) -> CdpLocalStorageParam {
     CdpLocalStorageParam {
         origin: target.origin.clone(),
         host: target.write_host.clone(),
@@ -708,9 +720,10 @@ fn parse_http_response(raw: Vec<u8>) -> Result<RawHttpResponse, String> {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| "CookieCloud 返回了无效 HTTP 状态".to_string())?;
-    let chunked = header_text
-        .lines()
-        .any(|line| line.to_ascii_lowercase().starts_with("transfer-encoding: chunked"));
+    let chunked = header_text.lines().any(|line| {
+        line.to_ascii_lowercase()
+            .starts_with("transfer-encoding: chunked")
+    });
     let body_bytes = &raw[split_at + 4..];
     let body = if chunked {
         decode_chunked_body(body_bytes)?
@@ -761,9 +774,6 @@ fn parse_payload(text: &str) -> Result<Value, String> {
         Ok(parsed)
     }
 }
-
-
-
 
 fn cookie_url(domain: &str, secure: bool) -> Option<String> {
     let host = domain.trim().trim_start_matches('.');

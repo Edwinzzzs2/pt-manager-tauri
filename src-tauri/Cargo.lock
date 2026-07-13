@@ -2918,6 +2918,7 @@ dependencies = [
  "chrono",
  "data-encoding",
  "hmac",
+ "image",
  "md-5",
  "rand 0.8.5",
  "reqwest",

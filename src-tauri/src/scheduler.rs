@@ -115,8 +115,15 @@ pub async fn run_with_flag(
         task_cancel_requested.store(false, Ordering::SeqCst);
     }
 
-    let canceled =
-        run_keepalive_inner(config, logs, task_cancel_requested, allow_random_delay, app_handle, config_state).await;
+    let canceled = run_keepalive_inner(
+        config,
+        logs,
+        task_cancel_requested,
+        allow_random_delay,
+        app_handle,
+        config_state,
+    )
+    .await;
     if canceled {
         push_log(logs, LogEntry::info("保活任务已终止")).await;
     }
@@ -186,7 +193,10 @@ async fn run_keepalive_inner(
                 }
                 push_log(
                     logs,
-                    LogEntry::error(format!("保活前 CookieCloud 自动同步失败：{}，继续执行保活", err)),
+                    LogEntry::error(format!(
+                        "保活前 CookieCloud 自动同步失败：{}，继续执行保活",
+                        err
+                    )),
                 )
                 .await;
             }
@@ -437,7 +447,9 @@ async fn sync_cookiecloud_before_keepalive(
         Some(port) => port,
         None => {
             let progress = CdpProgress::new(Arc::clone(logs), Arc::clone(task_cancel_requested));
-            cdp.ensure_available_with_progress(&[], &progress).await?.port
+            cdp.ensure_available_with_progress(&[], &progress)
+                .await?
+                .port
         }
     };
     let active_cdp = CdpClient::new(active_port);
@@ -509,7 +521,11 @@ async fn sync_cookiecloud_after_keepalive(
         return;
     }
 
-    push_log(logs, LogEntry::info("保活完成，正在上传最新 Cookie 到 CookieCloud")).await;
+    push_log(
+        logs,
+        LogEntry::info("保活完成，正在上传最新 Cookie 到 CookieCloud"),
+    )
+    .await;
     let cookies = match cdp.get_all_cookies().await {
         Ok(cookies) => cookies,
         Err(err) => {
@@ -631,11 +647,19 @@ async fn try_auto_login_site(
 
     match success {
         Ok(true) => {
-            push_log(logs, LogEntry::success(format!("{} 自动登录成功", site.name))).await;
+            push_log(
+                logs,
+                LogEntry::success(format!("{} 自动登录成功", site.name)),
+            )
+            .await;
             Some(LoginOutcome::Success)
         }
         Ok(false) => {
-            push_log(logs, LogEntry::info(format!("{} 已处于登录状态", site.name))).await;
+            push_log(
+                logs,
+                LogEntry::info(format!("{} 已处于登录状态", site.name)),
+            )
+            .await;
             Some(LoginOutcome::Success)
         }
         Err(err) => {
@@ -721,8 +745,7 @@ async fn run_keepalive_batch(
                     let login_tab_id = tab_id.clone();
                     let login_logs = Arc::clone(logs);
                     let cdp_port = cdp.port();
-                    let min_login_attempts_remaining =
-                        config.min_login_attempts_remaining as u32;
+                    let min_login_attempts_remaining = config.min_login_attempts_remaining as u32;
                     let ocr_server_url = config.ocr_server_url.clone();
                     let ocr_retry_count = config.ocr_retry_count;
                     let cancel_requested = Arc::clone(task_cancel_requested);
@@ -769,7 +792,11 @@ async fn run_keepalive_batch(
             }
             Ok((_, None)) => {}
             Err(err) => {
-                push_log(logs, LogEntry::error(format!("自动登录任务异常结束：{}", err))).await;
+                push_log(
+                    logs,
+                    LogEntry::error(format!("自动登录任务异常结束：{}", err)),
+                )
+                .await;
             }
         }
     }
