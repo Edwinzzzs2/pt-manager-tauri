@@ -58,6 +58,8 @@ pub struct AppConfig {
     #[serde(default = "default_min_login_attempts_remaining")]
     pub min_login_attempts_remaining: u8,
     #[serde(default)]
+    pub update_proxy_url: String,
+    #[serde(default)]
     pub cookiecloud: CookieCloudConfig,
     #[serde(default)]
     pub gotify: GotifyConfig,
@@ -94,6 +96,7 @@ impl Default for AppConfig {
             ocr_server_url: default_ocr_server_url(),
             ocr_retry_count: default_ocr_retry_count(),
             min_login_attempts_remaining: default_min_login_attempts_remaining(),
+            update_proxy_url: String::new(),
             cookiecloud: CookieCloudConfig::default(),
             gotify: GotifyConfig::default(),
         }

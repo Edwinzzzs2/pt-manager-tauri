@@ -5,6 +5,7 @@ use crate::gotify;
 use crate::ocr;
 use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
+use crate::updater;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -83,6 +84,7 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
         .to_string();
     config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
+    config.update_proxy_url = updater::normalize_proxy_url(&config.update_proxy_url)?;
     config.gotify.server_url = config
         .gotify
         .server_url
@@ -1137,8 +1139,9 @@ pub async fn export_config(state: State<'_, AppState>, path: String) -> Result<(
 pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<AppConfig, String> {
     let json_content =
         std::fs::read_to_string(&path).map_err(|err| format!("读取配置文件失败: {}", err))?;
-    let new_config: AppConfig = serde_json::from_str(&json_content)
+    let mut new_config: AppConfig = serde_json::from_str(&json_content)
         .map_err(|err| format!("解析配置文件失败（文件格式可能不正确）: {}", err))?;
+    new_config.update_proxy_url = updater::normalize_proxy_url(&new_config.update_proxy_url)?;
 
     let mut config = state.config.lock().await;
     *config = new_config.clone();

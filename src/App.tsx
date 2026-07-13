@@ -4,7 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { check } from "@tauri-apps/plugin-updater";
 import {
   Activity,
   CheckCircle2,
@@ -65,6 +64,7 @@ type AppConfig = {
   ocr_server_url: string;
   ocr_retry_count: number;
   min_login_attempts_remaining: number;
+  update_proxy_url: string;
   cookiecloud: CookieCloudConfig;
   gotify: GotifyConfig;
 };
@@ -110,6 +110,10 @@ type SiteImportResult = {
   skipped: number;
 };
 
+type AppUpdateInfo = {
+  version: string;
+};
+
 type TabKey = "dashboard" | "sites" | "settings" | "logs";
 type ColorMode = "dark" | "light";
 
@@ -131,6 +135,7 @@ const defaultConfig: AppConfig = {
   ocr_server_url: "http://192.168.31.80:8060",
   ocr_retry_count: 2,
   min_login_attempts_remaining: 5,
+  update_proxy_url: "",
   cookiecloud: {
     server_url: "",
     uuid: "",
@@ -672,6 +677,7 @@ function App() {
         1,
         20,
       ),
+      update_proxy_url: settingsDraft.update_proxy_url.trim().replace(/\/+$/, ""),
       gotify: {
         ...settingsDraft.gotify,
         server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
@@ -727,7 +733,7 @@ function App() {
     setUpdateBusy(true);
     setError(null);
     try {
-      const update = await check();
+      const update = await invoke<AppUpdateInfo | null>("check_for_app_update");
       if (!update) {
         await message("当前已是最新版本", {
           kind: "info",
@@ -749,11 +755,13 @@ function App() {
         return;
       }
 
-      await update.downloadAndInstall();
+      await invoke("download_and_install_app_update", {
+        expectedVersion: update.version,
+      });
       await relaunch();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setError(`检查更新失败：${message}`);
+      setError(`更新失败：${message}`);
     } finally {
       setUpdateBusy(false);
     }
@@ -1682,6 +1690,38 @@ function SettingsPanel({
   return (
     <div className="settings-stack">
       <div className="settings-scroll">
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Updater</p>
+              <div className="title-with-help">
+                <h2>应用更新</h2>
+                <span
+                  className="help-tip"
+                  title="检查清单和下载安装包都会通过该地址转发；留空时直接连接 GitHub。"
+                  tabIndex={0}
+                >
+                  <HelpCircle size={16} />
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="settings-form">
+            <label>
+              <span>更新代理地址</span>
+              <input
+                onChange={(event) => onChange({ ...draft, update_proxy_url: event.target.value })}
+                placeholder="https://vercel-proxy.decoffee.top"
+                type="url"
+                value={draft.update_proxy_url}
+              />
+            </label>
+            <p className="field-hint">
+              填写 URL 前缀型代理地址；保存后，检查更新和安装包下载均不再直连 GitHub。
+            </p>
+          </div>
+        </section>
+
         <section className="panel settings-card">
           <div className="panel-heading">
             <div>

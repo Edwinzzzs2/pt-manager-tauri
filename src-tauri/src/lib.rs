@@ -6,6 +6,7 @@ mod gotify;
 mod ocr;
 mod scheduler;
 mod store;
+mod updater;
 
 use chrono::{DateTime, Local};
 use commands::AppState;
@@ -88,6 +89,8 @@ pub fn run() {
             commands::open_chrome_download,
             commands::export_config,
             commands::import_config,
+            updater::check_for_app_update,
+            updater::download_and_install_app_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
