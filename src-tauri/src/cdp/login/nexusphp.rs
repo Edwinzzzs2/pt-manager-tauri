@@ -4,6 +4,7 @@ use super::common::{
     click_runtime_element, human_delay, nexus_captcha_page_state, nexus_login_page_state,
     type_runtime_input,
 };
+use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
 use std::time::Duration;
 

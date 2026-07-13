@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 // 登录适配器作为 CDP 的子模块，可以复用内部 WebSocket，同时不向业务层暴露传输细节。
 mod login;
 
-pub use login::{LoginError, LoginOutcome, LoginRequest, LoginState, SiteAdapter};
+pub use login::{LoginRequest, LoginState, SiteAdapter};
 
 const MAX_CDP_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 

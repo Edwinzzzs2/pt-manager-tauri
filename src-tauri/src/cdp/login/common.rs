@@ -2,6 +2,7 @@
 
 use crate::cdp::CdpWebSocket;
 use rand::Rng;
+use std::time::Duration;
 
 pub(super) struct LoginPageState {
     pub(super) host: String,
