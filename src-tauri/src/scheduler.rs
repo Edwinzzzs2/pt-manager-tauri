@@ -1,5 +1,4 @@
-use crate::auth;
-use crate::cdp::{CdpClient, CdpProgress, CDP_CANCELLED};
+use crate::cdp::{CdpClient, CdpProgress, LoginRequest, LoginState, CDP_CANCELLED};
 use crate::cookiecloud;
 use crate::gotify;
 use crate::store::{self, AppConfig, LogEntry, Site};
@@ -581,58 +580,31 @@ async fn try_auto_login_site(
         .await;
         return Some(LoginOutcome::Failed(reason));
     }
-    let site_url = site.url.to_ascii_lowercase();
-    let is_mteam = site_url.contains("kp.m-team.cc");
-    let is_hdkylin = site_url.contains("hdkyl.in");
-
     let cancel = cancel_requested.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let progress = CdpProgress::new(Arc::clone(logs), cancel);
-
-    let login_result = if is_mteam {
-        let totp = if site.totp_secret.trim().is_empty() {
-            None
-        } else {
-            match auth::current_totp(&site.totp_secret) {
-                Ok(code) => Some(code),
-                Err(err) => {
-                    let reason = err.clone();
-                    push_log(
-                        logs,
-                        LogEntry::error(format!("{} 自动登录失败：{}", site.name, err)),
-                    )
-                    .await;
-                    return Some(LoginOutcome::Failed(reason));
-                }
-            }
-        };
-        cdp.login_mteam(tab_id, &site.username, &site.password, totp.as_deref())
-            .await
-            .map(|logged_in| (logged_in, None))
-            .map_err(|err| (err, None))
-    } else if is_hdkylin {
-        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        cdp.login_hdkylin(tab_id, &site.username, &site.password, secret)
-            .await
-            .map(|logged_in| (logged_in, None))
-            .map_err(|err| (err, None))
-    } else {
-        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
-        cdp.login_nexusphp(
+    let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+    let login_result = cdp
+        .login_site(
             tab_id,
-            &site.username,
-            &site.password,
-            secret,
-            min_login_attempts_remaining,
-            ocr_config,
+            LoginRequest {
+                site_name: &site.name,
+                site_url: &site.url,
+                username: &site.username,
+                password: &site.password,
+                totp_secret: secret,
+                min_remaining_attempts: min_login_attempts_remaining,
+                ocr_config,
+            },
             Some(&progress),
-            &site.name,
         )
-        .await
-    };
+        .await;
 
     let (success, remaining) = match login_result {
-        Ok((logged_in, remaining)) => (Ok(logged_in), remaining),
-        Err((err, remaining)) => (Err(err), remaining),
+        Ok(outcome) => (
+            Ok(outcome.state == LoginState::LoggedIn),
+            outcome.remaining_attempts,
+        ),
+        Err(error) => (Err(error.message), error.remaining_attempts),
     };
 
     if let Some(val) = remaining {
