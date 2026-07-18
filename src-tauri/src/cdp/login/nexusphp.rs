@@ -31,7 +31,7 @@ impl CdpClient {
         let ocr_cfg = ocr_config.clone();
         let max_attempts = ocr_config
             .as_ref()
-            .map(|(_, count)| *count as usize)
+            .map(|(_, count)| (*count as usize).max(1))
             .unwrap_or(1);
         let mut last_remaining_attempts = None;
 
@@ -252,12 +252,9 @@ impl CdpClient {
 
                     let ocr_server_url_clone = ocr_server_url.clone();
                     let image_base64_clone = image_base64.to_string();
+                    // 每张验证码只识别一次；识别失败时由外层登录重试刷新页面并获取新验证码。
                     let recognition = tauri::async_runtime::spawn_blocking(move || {
-                        crate::ocr::recognize(
-                            &ocr_server_url_clone,
-                            &image_base64_clone,
-                            ocr_retry_count,
-                        )
+                        crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone, 1)
                     })
                     .await
                     .map_err(|err| (err.to_string(), last_remaining_attempts))?;
@@ -265,17 +262,25 @@ impl CdpClient {
                     let recognition = match recognition {
                         Ok(res) => res,
                         Err(err) => {
-                            return Err((
-                                format!("验证码自动识别失败：{}", err),
-                                last_remaining_attempts,
-                            ))
+                            if let Some(p) = progress {
+                                p.info(format!(
+                                    "第 {}/{} 张验证码识别失败：{}，准备刷新页面获取新验证码",
+                                    attempt + 1,
+                                    max_attempts,
+                                    err
+                                ))
+                                .await;
+                            }
+                            continue;
                         }
                     };
 
                     if let Some(p) = progress {
                         p.info(format!(
-                            "验证码识别成功：{}，尝试次数：{}/{}。正在自动填入...",
-                            recognition.text, recognition.attempts, ocr_retry_count
+                            "验证码识别成功：{}，验证码尝试次数：{}/{}。正在自动填入...",
+                            recognition.text,
+                            attempt + 1,
+                            max_attempts
                         ))
                         .await;
                     }
