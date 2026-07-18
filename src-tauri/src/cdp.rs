@@ -41,6 +41,7 @@ pub struct CdpLaunchResult {
     pub port: u16,
     pub message: String,
     pub opened_initial_urls: usize,
+    pub launched: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +174,7 @@ impl CdpClient {
                 port: self.port,
                 message: connected_message("Chrome CDP 已连接", self.port, opened_initial_urls),
                 opened_initial_urls,
+                launched: false,
             });
         }
         check_cancel(progress)?;
@@ -556,6 +558,26 @@ impl CdpClient {
         } else {
             Err(format!("CDP 返回 HTTP {}", response.status))
         }
+    }
+
+    /// 关闭当前 CDP 浏览器实例。仅用于本次任务自动启动的专用 Chrome。
+    pub async fn close_browser(&self) -> Result<(), String> {
+        #[derive(Deserialize)]
+        struct CdpVersion {
+            #[serde(rename = "webSocketDebuggerUrl")]
+            web_socket_debugger_url: String,
+        }
+
+        let response = self.request("GET", "/json/version", Duration::from_secs(5))?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("CDP 返回 HTTP {}", response.status));
+        }
+        let version = serde_json::from_str::<CdpVersion>(&response.body)
+            .map_err(|err| format!("解析 Chrome 版本信息失败: {}", err))?;
+        let mut websocket =
+            CdpWebSocket::connect(&version.web_socket_debugger_url, Duration::from_secs(10))?;
+        websocket.call("Browser.close", serde_json::json!({}))?;
+        Ok(())
     }
 
     fn request(&self, method: &str, path: &str, timeout: Duration) -> Result<HttpResponse, String> {
@@ -1331,6 +1353,7 @@ async fn launch_and_wait(
                 port,
                 message,
                 opened_initial_urls,
+                launched: true,
             }));
         }
 

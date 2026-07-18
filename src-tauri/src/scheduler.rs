@@ -146,6 +146,8 @@ async fn run_keepalive_inner(
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
     let mut cdp = CdpClient::new(config.cdp_port);
+    let mut launched_browser = false;
+    let had_cdp_before_sync = cdp.available_port().await.is_some();
 
     if !config.ocr_server_url.is_empty() {
         push_log(logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
@@ -215,6 +217,8 @@ async fn run_keepalive_inner(
     };
     let mut launched_with_initial_sites = false;
     if let Some(active_port) = cdp.available_port().await {
+        // CookieCloud 保活前同步可能在没有现成 CDP 时自动启动 Chrome；这种实例也属于本次任务。
+        launched_browser = !had_cdp_before_sync;
         if active_port != config.cdp_port {
             push_log(
                 logs,
@@ -237,6 +241,7 @@ async fn run_keepalive_inner(
             Ok(result) => {
                 cdp = CdpClient::new(result.port);
                 launched_with_initial_sites = result.opened_initial_urls > 0;
+                launched_browser = result.launched;
                 push_log(logs, LogEntry::info(result.message)).await;
             }
             Err(err) => {
@@ -250,6 +255,7 @@ async fn run_keepalive_inner(
     }
 
     if task_cancel_requested.load(Ordering::SeqCst) {
+        close_browser_instance(&cdp, logs, launched_browser).await;
         return true;
     }
 
@@ -280,6 +286,7 @@ async fn run_keepalive_inner(
         )
         .await
         {
+            close_browser_instance(&cdp, logs, launched_browser).await;
             return true;
         }
     }
@@ -292,6 +299,7 @@ async fn run_keepalive_inner(
             &cdp,
             task_cancel_requested,
             launched_with_initial_sites,
+            launched_browser,
             app_handle,
             config_state,
         )
@@ -303,6 +311,7 @@ async fn run_keepalive_inner(
 
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
+            close_browser_instance(&cdp, logs, launched_browser).await;
             return true;
         }
 
@@ -366,7 +375,9 @@ async fn run_keepalive_inner(
                 )
                 .await
                 {
-                    if let Err(e) = cdp.close_tab(&tab_id).await {
+                    if launched_browser {
+                        close_browser_instance(&cdp, logs, true).await;
+                    } else if let Err(e) = cdp.close_tab(&tab_id).await {
                         push_log(
                             logs,
                             LogEntry::error(format!("终止时关闭标签页失败: {}", e)),
@@ -377,9 +388,11 @@ async fn run_keepalive_inner(
                 }
 
                 // 关闭标签页
-                if let Err(e) = cdp.close_tab(&tab_id).await {
-                    let entry = LogEntry::error(format!("关闭标签页失败: {}", e));
-                    push_log(logs, entry).await;
+                if !launched_browser {
+                    if let Err(e) = cdp.close_tab(&tab_id).await {
+                        let entry = LogEntry::error(format!("关闭标签页失败: {}", e));
+                        push_log(logs, entry).await;
+                    }
                 }
 
                 let entry = LogEntry::success(format!("{} 保活完成", site.name));
@@ -414,6 +427,7 @@ async fn run_keepalive_inner(
     }
 
     sync_cookiecloud_after_keepalive(config, logs, &cdp).await;
+    close_browser_instance(&cdp, logs, launched_browser).await;
 
     {
         let entry = LogEntry::success("保活任务全部完成".to_string());
@@ -672,6 +686,7 @@ async fn run_keepalive_batch(
     cdp: &CdpClient,
     task_cancel_requested: &Arc<AtomicBool>,
     launched_with_initial_sites: bool,
+    launched_browser: bool,
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
@@ -682,7 +697,7 @@ async fn run_keepalive_batch(
 
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
-            close_opened_tabs(cdp, logs, opened_tabs).await;
+            close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
             return true;
         }
 
@@ -775,6 +790,7 @@ async fn run_keepalive_batch(
 
     if opened_tabs.is_empty() {
         push_log(logs, LogEntry::error("没有成功打开任何站点，保活任务结束")).await;
+        close_browser_instance(cdp, logs, launched_browser).await;
         send_gotify_login_summary(config, logs, &successful_logins, &failed_logins).await;
         return false;
     }
@@ -796,22 +812,29 @@ async fn run_keepalive_batch(
     )
     .await
     {
-        close_opened_tabs(cdp, logs, opened_tabs).await;
+        close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
         return true;
     }
 
     sync_cookiecloud_after_keepalive(config, logs, cdp).await;
 
-    for (site_name, tab_id) in opened_tabs {
-        if let Err(e) = cdp.close_tab(&tab_id).await {
-            push_log(
-                logs,
-                LogEntry::error(format!("{} 关闭标签页失败: {}", site_name, e)),
-            )
-            .await;
-            continue;
+    if launched_browser {
+        close_browser_instance(cdp, logs, true).await;
+        for (site_name, _) in opened_tabs {
+            push_log(logs, LogEntry::success(format!("{} 保活完成", site_name))).await;
         }
-        push_log(logs, LogEntry::success(format!("{} 保活完成", site_name))).await;
+    } else {
+        for (site_name, tab_id) in opened_tabs {
+            if let Err(e) = cdp.close_tab(&tab_id).await {
+                push_log(
+                    logs,
+                    LogEntry::error(format!("{} 关闭标签页失败: {}", site_name, e)),
+                )
+                .await;
+                continue;
+            }
+            push_log(logs, LogEntry::success(format!("{} 保活完成", site_name))).await;
+        }
     }
 
     push_log(logs, LogEntry::success("保活任务全部完成".to_string())).await;
@@ -859,6 +882,38 @@ async fn close_opened_tabs(
             )
             .await;
         }
+    }
+}
+
+async fn close_opened_tabs_or_browser(
+    cdp: &CdpClient,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    opened_tabs: Vec<(String, String)>,
+    launched_browser: bool,
+) {
+    if launched_browser {
+        close_browser_instance(cdp, logs, true).await;
+    } else {
+        close_opened_tabs(cdp, logs, opened_tabs).await;
+    }
+}
+
+async fn close_browser_instance(
+    cdp: &CdpClient,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    launched_browser: bool,
+) {
+    if !launched_browser {
+        return;
+    }
+    if let Err(err) = cdp.close_browser().await {
+        push_log(
+            logs,
+            LogEntry::error(format!("关闭专用 Chrome 实例失败: {}", err)),
+        )
+        .await;
+    } else {
+        push_log(logs, LogEntry::info("已关闭本次保活启动的专用 Chrome 实例")).await;
     }
 }
 
