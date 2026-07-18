@@ -79,6 +79,7 @@ type GotifyConfig = {
   enabled: boolean;
   server_url: string;
   token: string;
+  title: string;
 };
 
 type LogEntry = {
@@ -145,6 +146,7 @@ const defaultConfig: AppConfig = {
     enabled: false,
     server_url: "",
     token: "",
+    title: "PT Manager 保活结果",
   },
 };
 
@@ -682,6 +684,7 @@ function App() {
         ...settingsDraft.gotify,
         server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
         token: settingsDraft.gotify.token.trim(),
+        title: settingsDraft.gotify.title.trim() || "PT Manager 保活结果",
       },
     };
 
@@ -2042,6 +2045,20 @@ function SettingsPanel({
                 placeholder="https://gotify.example.com"
                 type="url"
                 value={draft.gotify.server_url}
+              />
+            </label>
+            <label>
+              <span>通知标题</span>
+              <input
+                onChange={(event) =>
+                  onChange({
+                    ...draft,
+                    gotify: { ...draft.gotify, title: event.target.value },
+                  })
+                }
+                placeholder="PT Manager 保活结果"
+                type="text"
+                value={draft.gotify.title}
               />
             </label>
             <label>

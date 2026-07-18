@@ -72,11 +72,28 @@ pub struct CookieCloudConfig {
     pub password: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GotifyConfig {
     pub enabled: bool,
     pub server_url: String,
     pub token: String,
+    #[serde(default = "default_gotify_title")]
+    pub title: String,
+}
+
+impl Default for GotifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: String::new(),
+            token: String::new(),
+            title: default_gotify_title(),
+        }
+    }
+}
+
+fn default_gotify_title() -> String {
+    "PT Manager 保活结果".to_string()
 }
 
 impl Default for AppConfig {

@@ -51,7 +51,11 @@ pub async fn send_login_summary(
         .post(format!("{}/message", server_url))
         .query(&[("token", token)])
         .json(&serde_json::json!({
-            "title": "PT Manager 保活结果",
+            "title": if config.title.trim().is_empty() {
+                "PT Manager 保活结果"
+            } else {
+                config.title.trim()
+            },
             "message": sections.join("\n\n"),
             "priority": if failed_sites.is_empty() { 2 } else { 5 }
         }))
@@ -87,7 +91,11 @@ pub async fn send_test(config: &GotifyConfig) -> Result<(), String> {
         .post(format!("{}/message", server_url))
         .query(&[("token", token)])
         .json(&serde_json::json!({
-            "title": "PT Manager 测试通知",
+            "title": if config.title.trim().is_empty() {
+                "PT Manager 测试通知"
+            } else {
+                config.title.trim()
+            },
             "message": "Gotify 连接测试成功，通知配置可用。",
             "priority": 5
         }))

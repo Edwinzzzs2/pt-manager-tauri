@@ -93,6 +93,10 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
         .trim_end_matches('/')
         .to_string();
     config.gotify.token = config.gotify.token.trim().to_string();
+    config.gotify.title = config.gotify.title.trim().to_string();
+    if config.gotify.title.is_empty() {
+        config.gotify.title = "PT Manager 保活结果".to_string();
+    }
     if config.gotify.enabled
         && (config.gotify.server_url.is_empty() || config.gotify.token.is_empty())
     {
