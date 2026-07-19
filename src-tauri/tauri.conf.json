@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "PT Manager",
-        "width": 960,
-        "height": 680,
+        "width": 1152,
+        "height": 864,
         "minWidth": 800,
         "minHeight": 600,
         "center": true,
