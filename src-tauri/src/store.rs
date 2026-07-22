@@ -60,6 +60,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub update_proxy_url: String,
     #[serde(default)]
+    pub update_proxy_password: String,
+    #[serde(default)]
     pub cookiecloud: CookieCloudConfig,
     #[serde(default)]
     pub gotify: GotifyConfig,
@@ -114,6 +116,7 @@ impl Default for AppConfig {
             ocr_retry_count: default_ocr_retry_count(),
             min_login_attempts_remaining: default_min_login_attempts_remaining(),
             update_proxy_url: String::new(),
+            update_proxy_password: String::new(),
             cookiecloud: CookieCloudConfig::default(),
             gotify: GotifyConfig::default(),
         }

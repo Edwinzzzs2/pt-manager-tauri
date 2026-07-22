@@ -65,6 +65,7 @@ type AppConfig = {
   ocr_retry_count: number;
   min_login_attempts_remaining: number;
   update_proxy_url: string;
+  update_proxy_password: string;
   cookiecloud: CookieCloudConfig;
   gotify: GotifyConfig;
 };
@@ -137,6 +138,7 @@ const defaultConfig: AppConfig = {
   ocr_retry_count: 2,
   min_login_attempts_remaining: 5,
   update_proxy_url: "",
+  update_proxy_password: "",
   cookiecloud: {
     server_url: "",
     uuid: "",
@@ -680,6 +682,7 @@ function App() {
         20,
       ),
       update_proxy_url: settingsDraft.update_proxy_url.trim().replace(/\/+$/, ""),
+      update_proxy_password: settingsDraft.update_proxy_password,
       gotify: {
         ...settingsDraft.gotify,
         server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
@@ -1687,6 +1690,7 @@ function SettingsPanel({
   onImportConfig: () => void;
   onExportConfig: () => void;
 }) {
+  const [showProxyPassword, setShowProxyPassword] = useState(false);
   const [showCookiePassword, setShowCookiePassword] = useState(false);
   const [showGotifyToken, setShowGotifyToken] = useState(false);
 
@@ -1719,8 +1723,31 @@ function SettingsPanel({
                 value={draft.update_proxy_url}
               />
             </label>
+            <label>
+              <span>更新代理密码</span>
+              <div className="password-field">
+                <input
+                  autoComplete="new-password"
+                  onChange={(event) =>
+                    onChange({ ...draft, update_proxy_password: event.target.value })
+                  }
+                  placeholder="X-Proxy-Token"
+                  type={showProxyPassword ? "text" : "password"}
+                  value={draft.update_proxy_password}
+                />
+                <button
+                  aria-label={showProxyPassword ? "隐藏代理密码" : "显示代理密码"}
+                  onClick={() => setShowProxyPassword((value) => !value)}
+                  title={showProxyPassword ? "隐藏代理密码" : "显示代理密码"}
+                  type="button"
+                >
+                  {showProxyPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
             <p className="field-hint">
-              填写 URL 前缀型代理地址；保存后，检查更新和安装包下载均不再直连 GitHub。
+              填写 URL 前缀型代理地址；如代理启用了鉴权，请填写与服务端
+              PROXY_AUTH_TOKEN 一致的密码。检查更新和安装包下载都会使用该配置。
             </p>
           </div>
         </section>

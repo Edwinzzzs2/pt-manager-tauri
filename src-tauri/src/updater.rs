@@ -5,6 +5,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 
 const UPDATE_ENDPOINT: &str =
     "https://github.com/Edwinzzzs2/pt-manager-tauri/releases/latest/download/latest.json";
+const PROXY_AUTH_HEADER: &str = "X-Proxy-Token";
 
 #[derive(Debug, Serialize)]
 pub struct AppUpdateInfo {
@@ -32,8 +33,12 @@ pub fn normalize_proxy_url(value: &str) -> Result<String, String> {
 pub async fn check_for_app_update(
     state: State<'_, AppState>,
 ) -> Result<Option<AppUpdateInfo>, String> {
-    let proxy_url = state.config.lock().await.update_proxy_url.clone();
-    let update = find_update(&state.app_handle, &proxy_url).await?;
+    let config = state.config.lock().await;
+    let proxy_url = config.update_proxy_url.clone();
+    let proxy_password = config.update_proxy_password.clone();
+    drop(config);
+
+    let update = find_update(&state.app_handle, &proxy_url, &proxy_password).await?;
     Ok(update.map(|update| AppUpdateInfo {
         version: update.version,
     }))
@@ -44,8 +49,12 @@ pub async fn download_and_install_app_update(
     state: State<'_, AppState>,
     expected_version: String,
 ) -> Result<(), String> {
-    let proxy_url = state.config.lock().await.update_proxy_url.clone();
-    let update = find_update(&state.app_handle, &proxy_url)
+    let config = state.config.lock().await;
+    let proxy_url = config.update_proxy_url.clone();
+    let proxy_password = config.update_proxy_password.clone();
+    drop(config);
+
+    let update = find_update(&state.app_handle, &proxy_url, &proxy_password)
         .await?
         .ok_or_else(|| "当前已是最新版本".to_string())?;
 
@@ -65,13 +74,23 @@ pub async fn download_and_install_app_update(
 async fn find_update(
     app_handle: &tauri::AppHandle,
     proxy_url: &str,
+    proxy_password: &str,
 ) -> Result<Option<Update>, String> {
     let endpoint = Url::parse(UPDATE_ENDPOINT).map_err(|err| err.to_string())?;
     let endpoint = prepend_proxy_url(proxy_url, &endpoint)?;
-    let updater = app_handle
+    let mut updater_builder = app_handle
         .updater_builder()
         .endpoints(vec![endpoint])
-        .map_err(|err| format!("更新地址配置失败：{err}"))?
+        .map_err(|err| format!("更新地址配置失败：{err}"))?;
+
+    // 代理密码只发送给更新代理；直连 GitHub 时绝不能携带该凭据。
+    if !normalize_proxy_url(proxy_url)?.is_empty() && !proxy_password.is_empty() {
+        updater_builder = updater_builder
+            .header(PROXY_AUTH_HEADER, proxy_password)
+            .map_err(|err| format!("更新代理密码配置失败：{err}"))?;
+    }
+
+    let updater = updater_builder
         .build()
         .map_err(|err| format!("更新器初始化失败：{err}"))?;
 
