@@ -13,6 +13,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const MAX_COOKIECLOUD_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const SYNC_BROWSER_CLOSE_DELAY_SECONDS: u64 = 30;
 type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
 type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
 type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;

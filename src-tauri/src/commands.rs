@@ -754,6 +754,7 @@ async fn import_cookiecloud_cookies(
     }
 
     let cdp = CdpClient::new(config.cdp_port);
+    let mut launched_sync_browser = false;
     let active_port = match cdp.available_port().await {
         Some(port) => port,
         None => {
@@ -762,6 +763,7 @@ async fn import_cookiecloud_cookies(
                 Arc::clone(&state.task_cancel_requested),
             );
             let result = cdp.ensure_available_with_progress(&[], &progress).await?;
+            launched_sync_browser = result.launched;
             push_log(&state.logs, LogEntry::info(result.message)).await;
             result.port
         }
@@ -784,6 +786,7 @@ async fn import_cookiecloud_cookies(
                 Arc::clone(&state.task_cancel_requested),
             );
             let result = cdp.ensure_available_with_progress(&[], &progress).await?;
+            launched_sync_browser |= result.launched;
             write_port = result.port;
             CdpClient::new(write_port)
                 .set_cookies(&sync_data.cookies)
@@ -805,11 +808,25 @@ async fn import_cookiecloud_cookies(
         .reload_tabs_for_sites(&site_urls)
         .await;
 
-    if config.auto_close_sync_tabs && !opened_sync_tabs.is_empty() {
+    if launched_sync_browser || !opened_sync_tabs.is_empty() {
         let logs = Arc::clone(&state.logs);
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_secs(
+                cookiecloud::SYNC_BROWSER_CLOSE_DELAY_SECONDS,
+            ))
+            .await;
             let cdp = CdpClient::new(write_port);
+            if launched_sync_browser {
+                let entry = match cdp.close_browser().await {
+                    Ok(()) => LogEntry::info("Cookie 同步启动的专用 Chrome 已自动关闭"),
+                    Err(err) => LogEntry::error(format!(
+                        "Cookie 同步启动的专用 Chrome 自动关闭失败：{}",
+                        err
+                    )),
+                };
+                push_log(&logs, entry).await;
+                return;
+            }
             let mut closed = 0usize;
             for tab_id in opened_sync_tabs {
                 if cdp.close_tab(&tab_id).await.is_ok() {
@@ -819,7 +836,10 @@ async fn import_cookiecloud_cookies(
             if closed > 0 {
                 push_log(
                     &logs,
-                    LogEntry::info(format!("Cookie 同步自动打开的 {} 个标签页已关闭", closed)),
+                    LogEntry::info(format!(
+                        "Cookie 同步自动打开的 {} 个标签页已在完成 30 秒后关闭",
+                        closed
+                    )),
                 )
                 .await;
             }

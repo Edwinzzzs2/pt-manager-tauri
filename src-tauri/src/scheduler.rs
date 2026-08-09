@@ -536,10 +536,13 @@ async fn sync_cookiecloud_before_keepalive(
         .reload_tabs_for_sites(&site_urls)
         .await;
 
-    if config.auto_close_sync_tabs && !opened_sync_tabs.is_empty() {
+    if !opened_sync_tabs.is_empty() {
         let logs = Arc::clone(logs);
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_secs(
+                cookiecloud::SYNC_BROWSER_CLOSE_DELAY_SECONDS,
+            ))
+            .await;
             let cdp = CdpClient::new(active_port);
             let mut closed = 0usize;
             for tab_id in opened_sync_tabs {
@@ -550,7 +553,10 @@ async fn sync_cookiecloud_before_keepalive(
             if closed > 0 {
                 push_log(
                     &logs,
-                    LogEntry::info(format!("Cookie 同步自动打开的 {} 个标签页已关闭", closed)),
+                    LogEntry::info(format!(
+                        "Cookie 同步自动打开的 {} 个标签页已在完成 30 秒后关闭",
+                        closed
+                    )),
                 )
                 .await;
             }

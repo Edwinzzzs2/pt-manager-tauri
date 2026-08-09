@@ -54,8 +54,6 @@ pub struct AppConfig {
     pub auto_sync_cookie: bool,
     #[serde(default)]
     pub auto_sync_cookie_after_keepalive: bool,
-    #[serde(default)]
-    pub auto_close_sync_tabs: bool,
     #[serde(default = "default_ocr_server_url")]
     pub ocr_server_url: String,
     #[serde(default = "default_ocr_retry_count")]
@@ -116,7 +114,6 @@ impl Default for AppConfig {
             log_retention: DEFAULT_LOG_RETENTION,
             auto_sync_cookie: false,
             auto_sync_cookie_after_keepalive: false,
-            auto_close_sync_tabs: false,
             ocr_server_url: default_ocr_server_url(),
             ocr_retry_count: default_ocr_retry_count(),
             min_login_attempts_remaining: default_min_login_attempts_remaining(),

@@ -69,7 +69,6 @@ type AppConfig = {
   log_retention: number;
   auto_sync_cookie: boolean;
   auto_sync_cookie_after_keepalive: boolean;
-  auto_close_sync_tabs: boolean;
   ocr_server_url: string;
   ocr_retry_count: number;
   min_login_attempts_remaining: number;
@@ -142,7 +141,6 @@ const defaultConfig: AppConfig = {
   log_retention: 500,
   auto_sync_cookie: false,
   auto_sync_cookie_after_keepalive: false,
-  auto_close_sync_tabs: false,
   ocr_server_url: "http://192.168.31.80:8060",
   ocr_retry_count: 2,
   min_login_attempts_remaining: 5,
@@ -2017,16 +2015,6 @@ function SettingsPanel({
                   ...draft,
                   auto_sync_cookie_after_keepalive: event.target.checked,
                 })
-              }
-              type="checkbox"
-            />
-          </label>
-          <label className="switch-row">
-            <span>同步完成 15 秒后自动关闭</span>
-            <input
-              checked={draft.auto_close_sync_tabs}
-              onChange={(event) =>
-                onChange({ ...draft, auto_close_sync_tabs: event.target.checked })
               }
               type="checkbox"
             />
