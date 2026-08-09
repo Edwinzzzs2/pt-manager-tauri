@@ -392,6 +392,51 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
             return Err(message);
         }
     };
+
+    if config.auto_sync_cookie_after_keepalive {
+        push_log(
+            &state.logs,
+            LogEntry::info(format!(
+                "{} 测试完成，正在上传该站点最新 Cookie 到 CookieCloud",
+                site.name
+            )),
+        )
+        .await;
+        match cdp.get_all_cookies().await {
+            Ok(cookies) => match cookiecloud::upload_current_cookies(
+                &config.cookiecloud,
+                std::slice::from_ref(&site),
+                cookies,
+            )
+            .await
+            {
+                Ok(count) => {
+                    let upload_message = format!(
+                        "{} CookieCloud 上传完成：已上传 {} 条 Cookie",
+                        site.name, count
+                    );
+                    push_log(&state.logs, LogEntry::success(upload_message)).await;
+                }
+                Err(err) => {
+                    push_log(
+                        &state.logs,
+                        LogEntry::error(format!("{} CookieCloud 上传失败：{}", site.name, err)),
+                    )
+                    .await;
+                }
+            },
+            Err(err) => {
+                push_log(
+                    &state.logs,
+                    LogEntry::error(format!(
+                        "{} CookieCloud 上传失败：读取浏览器 Cookie 失败：{}",
+                        site.name, err
+                    )),
+                )
+                .await;
+            }
+        }
+    }
     push_log(&state.logs, LogEntry::success(message.clone())).await;
     Ok(message)
 }

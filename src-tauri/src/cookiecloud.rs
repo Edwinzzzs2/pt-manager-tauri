@@ -1,9 +1,10 @@
 use crate::cdp::{CdpCookieParam, CdpLocalStorageEntry, CdpLocalStorageParam};
 use crate::store::{CookieCloudConfig, Site};
-use aes::Aes128;
+use aes::{Aes128, Aes256};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use md5::{Digest, Md5};
+use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,8 +13,9 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 const MAX_COOKIECLOUD_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
 type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
+type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
+type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;
 
 #[derive(Debug, Deserialize)]
 struct CookieCloudCookie {
@@ -116,6 +118,23 @@ async fn fetch_sync_payload_async(config: &CookieCloudConfig) -> Result<Value, S
             .await
             .map_err(|err| format!("CookieCloud 响应解析失败：{}", err.without_url()))?;
         let payload = decrypt_cookiecloud_payload_if_needed(payload, uuid, password)?;
+        if payload.get("cookie_data").is_none() && payload.get("local_storage_data").is_none() {
+            // MoviePilot cannot decrypt fixed-IV data written by older versions of
+            // this app. Read its raw envelope so the next upload can migrate it.
+            if let Ok(response) = client.get(&endpoint).send().await {
+                if response.status().is_success() {
+                    if let Ok(raw_payload) = response.json::<Value>().await {
+                        let raw_payload =
+                            decrypt_cookiecloud_payload_if_needed(raw_payload, uuid, password)?;
+                        if raw_payload.get("cookie_data").is_some()
+                            || raw_payload.get("local_storage_data").is_some()
+                        {
+                            return Ok(raw_payload);
+                        }
+                    }
+                }
+            }
+        }
         if payload.get("cookie_data").is_some() || payload.get("local_storage_data").is_some() {
             return Ok(payload);
         }
@@ -237,7 +256,7 @@ fn prepare_upload_request(
         serde_json::json!({
             "uuid": uuid,
             "encrypted": encrypted,
-            "crypto_type": "aes-128-cbc-fixed"
+            "crypto_type": "legacy"
         }),
         uploaded_count,
     ))
@@ -248,17 +267,50 @@ fn encrypt_cookiecloud_payload(
     password: &str,
     plaintext: &[u8],
 ) -> Result<String, String> {
-    let digest = Md5::digest(format!("{}-{}", uuid, password));
-    let key_hex = format!("{:x}", digest);
-    let key = &key_hex.as_bytes()[..16];
-    let iv = [0_u8; 16];
-    let encrypted = Aes128CbcEncryptor::new_from_slices(key, &iv)
+    // CookieCloud's legacy format is the interoperable default used by MoviePilot:
+    // Base64("Salted__" + 8-byte salt + AES-256-CBC ciphertext).
+    let passphrase = cookiecloud_passphrase(uuid, password);
+    let mut salt = [0_u8; 8];
+    OsRng.fill_bytes(&mut salt);
+    let key_iv = evp_bytes_to_key(&passphrase, &salt, 48);
+    let encrypted = Aes256CbcEncryptor::new_from_slices(&key_iv[..32], &key_iv[32..])
         .map_err(|err| err.to_string())?
         .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
-    Ok(STANDARD.encode(encrypted))
+    let mut envelope = Vec::with_capacity(16 + encrypted.len());
+    envelope.extend_from_slice(b"Salted__");
+    envelope.extend_from_slice(&salt);
+    envelope.extend_from_slice(&encrypted);
+    Ok(STANDARD.encode(envelope))
 }
 
 fn decrypt_cookiecloud_payload_if_needed(
+    payload: Value,
+    uuid: &str,
+    password: &str,
+) -> Result<Value, String> {
+    let Some(encrypted) = payload.get("encrypted").and_then(Value::as_str) else {
+        return Ok(payload);
+    };
+    let decoded = STANDARD
+        .decode(encrypted.trim())
+        .map_err(|err| format!("CookieCloud 密文 Base64 解码失败：{}", err))?;
+    if !decoded.starts_with(b"Salted__") {
+        return decrypt_cookiecloud_fixed_payload_if_needed(payload, uuid, password);
+    }
+    if decoded.len() < 32 || (decoded.len() - 16) % 16 != 0 {
+        return Err("CookieCloud legacy 密文格式无效".to_string());
+    }
+    let passphrase = cookiecloud_passphrase(uuid, password);
+    let key_iv = evp_bytes_to_key(&passphrase, &decoded[8..16], 48);
+    let plaintext = Aes256CbcDecryptor::new_from_slices(&key_iv[..32], &key_iv[32..])
+        .map_err(|err| err.to_string())?
+        .decrypt_padded_vec_mut::<Pkcs7>(&decoded[16..])
+        .map_err(|_| "CookieCloud 密文解密失败，请检查 UUID 和密码".to_string())?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|err| format!("CookieCloud 解密数据解析失败：{}", err))
+}
+
+fn decrypt_cookiecloud_fixed_payload_if_needed(
     payload: Value,
     uuid: &str,
     password: &str,
@@ -281,6 +333,31 @@ fn decrypt_cookiecloud_payload_if_needed(
         })?;
     serde_json::from_slice(&plaintext)
         .map_err(|err| format!("CookieCloud 解密数据解析失败：{}", err))
+}
+
+fn cookiecloud_passphrase(uuid: &str, password: &str) -> [u8; 16] {
+    let digest = Md5::digest(format!("{}-{}", uuid, password));
+    let key_hex = format!("{:x}", digest);
+    let mut passphrase = [0_u8; 16];
+    passphrase.copy_from_slice(&key_hex.as_bytes()[..16]);
+    passphrase
+}
+
+/// OpenSSL EVP_BytesToKey (MD5, one iteration), which is what CryptoJS uses
+/// when AES.encrypt receives a passphrase string instead of a raw key.
+fn evp_bytes_to_key(passphrase: &[u8], salt: &[u8], output_len: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(output_len);
+    let mut previous = Vec::new();
+    while output.len() < output_len {
+        let mut hasher = Md5::new();
+        hasher.update(&previous);
+        hasher.update(passphrase);
+        hasher.update(salt);
+        previous = hasher.finalize().to_vec();
+        output.extend_from_slice(&previous);
+    }
+    output.truncate(output_len);
+    output
 }
 
 fn cookiecloud_update_endpoint(server_url: &str) -> String {
@@ -588,6 +665,17 @@ fn match_host(value: &str) -> String {
 fn request_cookiecloud_payload(endpoint: &str, password: &str) -> Result<Value, String> {
     let body = serde_json::json!({ "password": password }).to_string();
     let response = http_request(endpoint, "POST", Some(&body))?;
+    if (200..300).contains(&response.status) {
+        let payload = parse_payload(&response.body)?;
+        if payload.get("cookie_data").is_some()
+            || payload.get("local_storage_data").is_some()
+            || payload.get("encrypted").is_some()
+        {
+            return Ok(payload);
+        }
+    }
+
+    let response = http_request(endpoint, "GET", None)?;
     if (200..300).contains(&response.status) {
         return parse_payload(&response.body);
     }

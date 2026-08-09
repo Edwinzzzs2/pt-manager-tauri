@@ -1926,10 +1926,10 @@ function SettingsPanel({
           </label>
           <label className="switch-row">
             <span className="label-with-help">
-              保活后自动上传
+              保活/测试后自动上传
               <span
                 className="help-tip"
-                title="保活任务完成后，把专用 Chrome 中最新的站点 Cookie 加密上传到当前 CookieCloud。"
+                title="保活任务完成后上传全部配置站点；单站点测试完成后只上传该站点的最新 Cookie。"
                 tabIndex={0}
               >
                 <HelpCircle size={14} />
