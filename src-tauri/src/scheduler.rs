@@ -682,7 +682,7 @@ async fn try_auto_login_site(
     if let (Some(app), Some(cfg)) = (app_handle, config_state) {
         let mut current = cfg.lock().await;
         if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-            store::record_login_attempt(saved_site, remaining);
+            let _ = store::record_login_outcome(saved_site, remaining, success.is_ok());
         }
         store::save_config(app, &current);
     }

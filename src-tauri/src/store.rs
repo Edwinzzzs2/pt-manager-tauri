@@ -31,6 +31,8 @@ pub struct Site {
     pub login_attempts_remaining: Option<u32>,
     #[serde(default)]
     pub login_attempts_recorded_at: Option<i64>,
+    #[serde(default)]
+    pub login_success_recorded_at: Option<i64>,
     #[serde(default = "default_auto_keepalive")]
     pub auto_keepalive: bool,
     #[serde(default)]
@@ -181,43 +183,61 @@ pub fn effective_login_attempt_threshold(site_url: &str, configured: u32) -> u32
 pub fn observe_login_attempts(site: &mut Site, remaining: Option<u32>) {
     if let Some(remaining) = remaining {
         site.login_attempts_remaining = Some(remaining);
+        if known_login_attempt_limit(&site.url).is_some_and(|limit| remaining >= limit) {
+            site.login_success_recorded_at = None;
+        }
     }
 }
 
-/// 本地执行一次登录流程后启动 24 小时重置计时；页面返回的实际剩余次数优先保存。
-pub fn record_login_attempt(site: &mut Site, remaining: Option<u32>) {
+/// 保存一次登录流程的结果。失败时只采用页面返回的实际剩余次数；
+/// 确认进入登录状态且次数尚未恢复时，才启动 24 小时恢复计时。
+pub fn record_login_outcome(
+    site: &mut Site,
+    remaining: Option<u32>,
+    logged_in: bool,
+) -> Option<u32> {
     observe_login_attempts(site, remaining);
-    if site.login_attempts_remaining.is_some() || known_login_attempt_limit(&site.url).is_some() {
-        site.login_attempts_recorded_at = Some(Local::now().timestamp());
+    if logged_in {
+        if let Some(limit) = known_login_attempt_limit(&site.url) {
+            if site
+                .login_attempts_remaining
+                .map_or(true, |remaining| remaining < limit)
+            {
+                site.login_success_recorded_at = Some(Local::now().timestamp());
+            }
+        }
     }
+    site.login_attempts_recorded_at = None;
+    site.login_attempts_remaining
 }
 
-/// 将本地登录后满 24 小时的记录恢复为该站点的已知上限。
-pub fn refresh_expired_login_attempts(config: &mut AppConfig) -> bool {
+/// 仅在确认成功登录满 24 小时后，将仍未恢复的次数恢复到站点已知上限。
+pub fn refresh_login_attempt_resets(config: &mut AppConfig) -> bool {
     let now = Local::now().timestamp();
     let mut changed = false;
     for site in &mut config.sites {
-        if site.login_attempts_remaining.is_none() {
-            if known_login_attempt_limit(&site.url).is_none() {
-                if site.login_attempts_recorded_at.take().is_some() {
-                    changed = true;
-                }
-                continue;
-            }
-            if site.login_attempts_recorded_at.is_none() {
-                continue;
-            }
-        }
+        // 旧版本的时间戳可能由失败登录产生，不能再作为恢复依据。
+        changed |= site.login_attempts_recorded_at.take().is_some();
 
-        let Some(recorded_at) = site.login_attempts_recorded_at else {
+        let Some(success_at) = site.login_success_recorded_at else {
             continue;
         };
-        if now.saturating_sub(recorded_at) < LOGIN_ATTEMPT_RESET_SECONDS {
+        let Some(limit) = known_login_attempt_limit(&site.url) else {
+            site.login_success_recorded_at = None;
+            changed = true;
+            continue;
+        };
+        if now.saturating_sub(success_at) < LOGIN_ATTEMPT_RESET_SECONDS {
             continue;
         }
 
-        site.login_attempts_remaining = known_login_attempt_limit(&site.url);
-        site.login_attempts_recorded_at = None;
+        if site
+            .login_attempts_remaining
+            .map_or(true, |remaining| remaining < limit)
+        {
+            site.login_attempts_remaining = Some(limit);
+        }
+        site.login_success_recorded_at = None;
         changed = true;
     }
     changed
@@ -398,7 +418,7 @@ pub fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
         config.log_retention = normalize_log_retention(config.log_retention);
         config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
         config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
-        if refresh_expired_login_attempts(&mut config) {
+        if refresh_login_attempt_resets(&mut config) {
             save_config(app_handle, &config);
         }
         config

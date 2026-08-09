@@ -75,7 +75,7 @@ pub struct SiteImportResult {
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
-    if store::refresh_expired_login_attempts(&mut config) {
+    if store::refresh_login_attempt_resets(&mut config) {
         store::save_config(&state.app_handle, &config);
     }
     Ok(config.clone())
@@ -89,10 +89,11 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
             if let Some(saved_site) = current.sites.iter().find(|saved| saved.id == site.id) {
                 site.login_attempts_remaining = saved_site.login_attempts_remaining;
                 site.login_attempts_recorded_at = saved_site.login_attempts_recorded_at;
+                site.login_success_recorded_at = saved_site.login_success_recorded_at;
             }
         }
     }
-    store::refresh_expired_login_attempts(&mut config);
+    store::refresh_login_attempt_resets(&mut config);
     config.log_retention = store::normalize_log_retention(config.log_retention);
     config.ocr_server_url = config
         .ocr_server_url
@@ -174,6 +175,7 @@ pub async fn add_site(
         auto_login,
         login_attempts_remaining: None,
         login_attempts_recorded_at: None,
+        login_success_recorded_at: None,
         auto_keepalive: true,
         auto_signin,
     };
@@ -228,6 +230,7 @@ pub async fn import_sites_from_json(
             auto_login: site.auto_login,
             login_attempts_remaining: None,
             login_attempts_recorded_at: None,
+            login_success_recorded_at: None,
             auto_keepalive: true,
             auto_signin: site.auto_signin,
         });
@@ -392,13 +395,17 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
 
     if is_nexusphp {
         let mut current = state.config.lock().await;
-        if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-            store::record_login_attempt(saved_site, remaining);
-        }
+        let saved_remaining = current
+            .sites
+            .iter_mut()
+            .find(|saved| saved.id == site.id)
+            .and_then(|saved_site| {
+                store::record_login_outcome(saved_site, remaining, success.is_ok())
+            });
         store::save_config(&state.app_handle, &current);
         drop(current);
 
-        if let Some(val) = remaining {
+        if let Some(val) = saved_remaining {
             push_log(
                 &state.logs,
                 LogEntry::info(format!(
@@ -614,7 +621,7 @@ pub async fn recognize_site_captcha(
         {
             let mut current = state.config.lock().await;
             if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-                store::record_login_attempt(saved_site, remaining);
+                store::observe_login_attempts(saved_site, remaining);
             }
             store::save_config(&state.app_handle, &current);
         }

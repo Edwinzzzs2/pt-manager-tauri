@@ -42,6 +42,7 @@ type Site = {
   auto_login: boolean;
   login_attempts_remaining: number | null;
   login_attempts_recorded_at: number | null;
+  login_success_recorded_at: number | null;
   auto_keepalive: boolean;
   auto_signin: boolean;
 };
