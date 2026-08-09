@@ -803,7 +803,8 @@ input:focus {
 }
 
 .site-auto-login,
-.site-auto-keepalive {
+.site-auto-keepalive,
+.site-auto-signin {
   min-height: 44px;
   padding: 6px 12px;
   border-radius: 6px;
@@ -1318,7 +1319,8 @@ label {
 
   .site-secret-field,
   .site-auto-login,
-  .site-auto-keepalive {
+  .site-auto-keepalive,
+  .site-auto-signin {
     grid-column: auto;
   }
 

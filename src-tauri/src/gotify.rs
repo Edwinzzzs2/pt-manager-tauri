@@ -1,3 +1,4 @@
+use crate::cdp::{SigninResult, SiteTraffic};
 use crate::store::GotifyConfig;
 use std::time::Duration;
 
@@ -5,6 +6,8 @@ pub async fn send_login_summary(
     config: &GotifyConfig,
     successful_sites: &[String],
     failed_sites: &[(String, String)],
+    signin_results: &[(String, SigninResult)],
+    traffic_results: &[(String, SiteTraffic)],
 ) -> Result<(), String> {
     if !config.enabled {
         return Ok(());
@@ -17,7 +20,11 @@ pub async fn send_login_summary(
     }
 
     let mut sections = Vec::new();
-    if successful_sites.is_empty() && failed_sites.is_empty() {
+    if successful_sites.is_empty()
+        && failed_sites.is_empty()
+        && signin_results.is_empty()
+        && traffic_results.is_empty()
+    {
         sections.push("保活任务已完成，本次未执行自动登录。".to_string());
     }
     if !successful_sites.is_empty() {
@@ -43,6 +50,48 @@ pub async fn send_login_summary(
         ));
     }
 
+    let successful_signins = signin_results
+        .iter()
+        .filter(|(_, result)| result.successful())
+        .collect::<Vec<_>>();
+    let failed_signins = signin_results
+        .iter()
+        .filter(|(_, result)| !result.successful())
+        .collect::<Vec<_>>();
+    if !successful_signins.is_empty() {
+        sections.push(format!(
+            "签到成功（{}）\n{}",
+            successful_signins.len(),
+            successful_signins
+                .iter()
+                .map(|(name, result)| format!("- {}：{}", name, result.summary()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !failed_signins.is_empty() {
+        sections.push(format!(
+            "签到失败（{}）\n{}",
+            failed_signins.len(),
+            failed_signins
+                .iter()
+                .map(|(name, result)| format!("- {}：{}", name, result.summary()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !traffic_results.is_empty() {
+        sections.push(format!(
+            "站点流量（{}）\n{}",
+            traffic_results.len(),
+            traffic_results
+                .iter()
+                .map(|(name, traffic)| format!("- {}：{}", name, traffic.summary()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -57,7 +106,7 @@ pub async fn send_login_summary(
                 config.title.trim()
             },
             "message": sections.join("\n\n"),
-            "priority": if failed_sites.is_empty() { 2 } else { 5 }
+            "priority": if failed_sites.is_empty() && failed_signins.is_empty() { 2 } else { 5 }
         }))
         .send()
         .await

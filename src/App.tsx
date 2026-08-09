@@ -41,12 +41,21 @@ type Site = {
   totp_secret: string;
   auto_login: boolean;
   login_attempts_remaining: number | null;
+  login_attempts_recorded_at: number | null;
   auto_keepalive: boolean;
+  auto_signin: boolean;
 };
 
 type SiteDraft = Pick<
   Site,
-  "name" | "url" | "username" | "password" | "totp_secret" | "auto_login" | "auto_keepalive"
+  | "name"
+  | "url"
+  | "username"
+  | "password"
+  | "totp_secret"
+  | "auto_login"
+  | "auto_keepalive"
+  | "auto_signin"
 >;
 
 type AppConfig = {
@@ -172,6 +181,36 @@ async function resolveDisplayVersion() {
   return getVersion();
 }
 
+const knownLoginAttemptLimits: Record<string, number> = {
+  "audiences.me": 20,
+  "hdfans.org": 20,
+  "hdkyl.in": 20,
+  "pt.btschool.club": 20,
+  "si-qi.xyz": 20,
+  "xingtan.one": 10,
+  "cspt.top": 10,
+  "pandapt.net": 10,
+  "hxpt.org": 10,
+  "pttime.org": 10,
+  "cyanbug.net": 10,
+  "ptskit.org": 5,
+  "open.cd": 11,
+};
+
+function knownLoginAttemptLimit(siteUrl: string): number | null {
+  try {
+    const parsed = new URL(siteUrl.includes("://") ? siteUrl : `https://${siteUrl}`);
+    return knownLoginAttemptLimits[parsed.hostname.toLowerCase().replace(/^www\./, "")] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function effectiveLoginAttemptThreshold(siteUrl: string, configured: number): number {
+  const limit = knownLoginAttemptLimit(siteUrl);
+  return limit == null ? configured : Math.min(configured, Math.max(1, limit - 1));
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
   const [colorMode, setColorMode] = useState<ColorMode>(() => readStoredTheme());
@@ -187,6 +226,7 @@ function App() {
     totp_secret: "",
     auto_login: false,
     auto_keepalive: true,
+    auto_signin: false,
   });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
   const [editingSite, setEditingSite] = useState<SiteDraft>({
@@ -197,6 +237,7 @@ function App() {
     totp_secret: "",
     auto_login: false,
     auto_keepalive: true,
+    auto_signin: false,
   });
   const [busy, setBusy] = useState(false);
   const [cdpBusy, setCdpBusy] = useState(false);
@@ -249,6 +290,15 @@ function App() {
 
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (activeTab !== "sites") return;
+    refreshConfig().catch(showError);
+    const timer = window.setInterval(() => {
+      refreshConfig().catch(showError);
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [activeTab]);
 
   function showError(err: unknown) {
     setError(err instanceof Error ? err.message : String(err));
@@ -401,6 +451,7 @@ function App() {
         password: newSite.password,
         totpSecret: newSite.totp_secret.trim(),
         autoLogin: newSite.auto_login,
+        autoSignin: newSite.auto_signin,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -412,6 +463,7 @@ function App() {
         totp_secret: "",
         auto_login: false,
         auto_keepalive: true,
+        auto_signin: false,
       });
       await refreshStatus();
     } catch (err) {
@@ -521,6 +573,7 @@ function App() {
       totp_secret: site.totp_secret,
       auto_login: site.auto_login,
       auto_keepalive: site.auto_keepalive,
+      auto_signin: site.auto_signin,
     });
   }
 
@@ -544,6 +597,7 @@ function App() {
         totpSecret: editingSite.totp_secret.trim(),
         autoLogin: editingSite.auto_login,
         autoKeepalive: editingSite.auto_keepalive,
+        autoSignin: editingSite.auto_signin,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -602,6 +656,7 @@ function App() {
         totpSecret: site.totp_secret,
         autoLogin: site.auto_login,
         autoKeepalive: !site.auto_keepalive,
+        autoSignin: site.auto_signin,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -1537,6 +1592,19 @@ function SitesPanel({
                         type="checkbox"
                       />
                     </label>
+                    <label
+                      className="switch-row site-auto-signin"
+                      title="登录状态确认后查找站点签到入口；通用规则无法处理时会记录需要专用适配"
+                    >
+                      <span>登录后自动签到</span>
+                      <input
+                        checked={editingSite.auto_signin}
+                        onChange={(event) =>
+                          onEditChange({ ...editingSite, auto_signin: event.target.checked })
+                        }
+                        type="checkbox"
+                      />
+                    </label>
                   </div>
                 ) : (
                   <div className="site-main">
@@ -1555,6 +1623,9 @@ function SitesPanel({
                           已启用
                         </span>
                       )}
+                      {site.auto_signin ? (
+                        <span className="site-login-badge active">自动签到</span>
+                      ) : null}
                     </div>
                     <div className="site-details">
                       <span className="site-url">{site.url}</span>
@@ -1565,7 +1636,11 @@ function SitesPanel({
                           {site.login_attempts_remaining != null ? (
                             <span
                               className={`site-attempts${
-                                site.login_attempts_remaining <= config.min_login_attempts_remaining
+                                site.login_attempts_remaining <=
+                                effectiveLoginAttemptThreshold(
+                                  site.url,
+                                  config.min_login_attempts_remaining,
+                                )
                                   ? " danger"
                                   : ""
                               }`}

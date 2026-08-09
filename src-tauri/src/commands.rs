@@ -1,5 +1,6 @@
 use crate::cdp::{
-    self, CdpClient, CdpLocalStorageParam, CdpProgress, LoginRequest, LoginState, SiteAdapter,
+    self, CdpClient, CdpLocalStorageParam, CdpProgress, LoginRequest, LoginState, SigninStatus,
+    SiteAdapter,
 };
 use crate::cookiecloud;
 use crate::gotify;
@@ -60,6 +61,8 @@ struct ImportedSite {
     totp_secret: String,
     #[serde(default)]
     auto_login: bool,
+    #[serde(default)]
+    auto_signin: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,12 +74,25 @@ pub struct SiteImportResult {
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
-    let config = state.config.lock().await;
+    let mut config = state.config.lock().await;
+    if store::refresh_expired_login_attempts(&mut config) {
+        store::save_config(&state.app_handle, &config);
+    }
     Ok(config.clone())
 }
 
 #[tauri::command]
 pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<(), String> {
+    {
+        let current = state.config.lock().await;
+        for site in &mut config.sites {
+            if let Some(saved_site) = current.sites.iter().find(|saved| saved.id == site.id) {
+                site.login_attempts_remaining = saved_site.login_attempts_remaining;
+                site.login_attempts_recorded_at = saved_site.login_attempts_recorded_at;
+            }
+        }
+    }
+    store::refresh_expired_login_attempts(&mut config);
     config.log_retention = store::normalize_log_retention(config.log_retention);
     config.ocr_server_url = config
         .ocr_server_url
@@ -145,6 +161,7 @@ pub async fn add_site(
     password: String,
     totp_secret: String,
     auto_login: bool,
+    auto_signin: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     let site = store::Site {
@@ -156,7 +173,9 @@ pub async fn add_site(
         totp_secret,
         auto_login,
         login_attempts_remaining: None,
+        login_attempts_recorded_at: None,
         auto_keepalive: true,
+        auto_signin,
     };
     config.sites.push(site);
     store::save_config(&state.app_handle, &config);
@@ -208,7 +227,9 @@ pub async fn import_sites_from_json(
             totp_secret: site.totp_secret.trim().replace(' ', ""),
             auto_login: site.auto_login,
             login_attempts_remaining: None,
+            login_attempts_recorded_at: None,
             auto_keepalive: true,
+            auto_signin: site.auto_signin,
         });
         imported += 1;
     }
@@ -261,6 +282,7 @@ pub async fn update_site(
     totp_secret: String,
     auto_login: bool,
     auto_keepalive: bool,
+    auto_signin: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
@@ -271,6 +293,7 @@ pub async fn update_site(
         site.totp_secret = totp_secret.trim().replace(' ', "");
         site.auto_login = auto_login;
         site.auto_keepalive = auto_keepalive;
+        site.auto_signin = auto_signin;
     }
     store::save_config(&state.app_handle, &config);
     let next = config.clone();
@@ -291,6 +314,10 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         .ok_or_else(|| "未找到要测试的站点".to_string())?;
     let adapter = SiteAdapter::from_url(&site.url);
     let is_nexusphp = adapter == SiteAdapter::NexusPhp;
+    let login_attempt_threshold = store::effective_login_attempt_threshold(
+        &site.url,
+        config.min_login_attempts_remaining as u32,
+    );
     if site.username.trim().is_empty() || site.password.is_empty() {
         return Err("请先配置登录用户名和密码".to_string());
     }
@@ -348,7 +375,7 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
                 username: &site.username,
                 password: &site.password,
                 totp_secret: secret,
-                min_remaining_attempts: config.min_login_attempts_remaining as u32,
+                min_remaining_attempts: login_attempt_threshold,
                 ocr_config,
             },
             Some(&progress),
@@ -364,19 +391,19 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
     };
 
     if is_nexusphp {
-        if let Some(val) = remaining {
-            let mut current = state.config.lock().await;
-            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-                saved_site.login_attempts_remaining = Some(val);
-            }
-            store::save_config(&state.app_handle, &current);
-            drop(current);
+        let mut current = state.config.lock().await;
+        if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+            store::record_login_attempt(saved_site, remaining);
+        }
+        store::save_config(&state.app_handle, &current);
+        drop(current);
 
+        if let Some(val) = remaining {
             push_log(
                 &state.logs,
                 LogEntry::info(format!(
                     "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
-                    site.name, val, config.min_login_attempts_remaining
+                    site.name, val, login_attempt_threshold
                 )),
             )
             .await;
@@ -392,6 +419,61 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
             return Err(message);
         }
     };
+
+    match cdp.read_site_traffic(&tab_id).await {
+        Ok(traffic) if traffic.available() => {
+            push_log(
+                &state.logs,
+                LogEntry::success(format!("{} 流量：{}", site.name, traffic.summary())),
+            )
+            .await;
+        }
+        Ok(_) => {
+            push_log(
+                &state.logs,
+                LogEntry::info(format!("{} 未识别到上传量、下载量或分享率", site.name)),
+            )
+            .await;
+        }
+        Err(err) => {
+            push_log(
+                &state.logs,
+                LogEntry::error(format!("{} 读取站点流量信息失败：{}", site.name, err)),
+            )
+            .await;
+        }
+    }
+
+    if site.auto_signin {
+        match cdp
+            .signin_site(&tab_id, &site.name, &site.url, Some(&progress))
+            .await
+        {
+            Ok(result) => {
+                let signin_message = format!("{} 签到：{}", site.name, result.summary());
+                if result.successful() {
+                    let entry = if result.status == SigninStatus::Success {
+                        LogEntry::success(signin_message)
+                    } else {
+                        LogEntry::info(signin_message)
+                    };
+                    push_log(&state.logs, entry).await;
+                } else {
+                    push_log(&state.logs, LogEntry::error(signin_message)).await;
+                }
+            }
+            Err(err) => {
+                if err == cdp::CDP_CANCELLED {
+                    return Err(err);
+                }
+                push_log(
+                    &state.logs,
+                    LogEntry::error(format!("{} 签到执行失败：{}", site.name, err)),
+                )
+                .await;
+            }
+        }
+    }
 
     if config.auto_sync_cookie_after_keepalive {
         push_log(
@@ -487,12 +569,14 @@ pub async fn recognize_site_captcha(
         .ok_or_else(|| format!("未找到 {} 登录页，请先点击测试按钮", site.name))?;
     let renewed = cdp.prepare_nexusphp_captcha_retry(&tab_id).await?;
     let remaining = cdp.nexusphp_remaining_attempts(&tab_id).await?;
+    let login_attempt_threshold = store::effective_login_attempt_threshold(
+        &site.url,
+        config.min_login_attempts_remaining as u32,
+    );
     {
         let mut current = state.config.lock().await;
         if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-            if remaining.is_some() {
-                saved_site.login_attempts_remaining = remaining;
-            }
+            store::observe_login_attempts(saved_site, remaining);
         }
         store::save_config(&state.app_handle, &current);
     }
@@ -501,14 +585,14 @@ pub async fn recognize_site_captcha(
             &state.logs,
             LogEntry::info(format!(
                 "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
-                site.name, remaining, config.min_login_attempts_remaining
+                site.name, remaining, login_attempt_threshold
             )),
         )
         .await;
-        if remaining <= config.min_login_attempts_remaining as u32 {
+        if remaining <= login_attempt_threshold {
             let message = format!(
                 "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止验证码识别与登录重试",
-                site.name, remaining, config.min_login_attempts_remaining
+                site.name, remaining, login_attempt_threshold
             );
             push_log(&state.logs, LogEntry::error(message.clone())).await;
             return Err(message);
@@ -527,6 +611,13 @@ pub async fn recognize_site_captcha(
             return Err("已获取新的图片验证码，但站点用户名或密码未配置".to_string());
         }
         let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+        {
+            let mut current = state.config.lock().await;
+            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+                store::record_login_attempt(saved_site, remaining);
+            }
+            store::save_config(&state.app_handle, &current);
+        }
         let remaining_after = cdp
             .refill_nexusphp_login_for_captcha(
                 &tab_id,
@@ -534,17 +625,15 @@ pub async fn recognize_site_captcha(
                 &site.username,
                 &site.password,
                 secret,
-                config.min_login_attempts_remaining as u32,
+                login_attempt_threshold,
             )
             .await?;
 
-        if let Some(val) = remaining_after {
-            let mut current = state.config.lock().await;
-            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-                saved_site.login_attempts_remaining = Some(val);
-            }
-            store::save_config(&state.app_handle, &current);
+        let mut current = state.config.lock().await;
+        if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+            store::observe_login_attempts(saved_site, remaining_after);
         }
+        store::save_config(&state.app_handle, &current);
     } else {
         push_log(
             &state.logs,

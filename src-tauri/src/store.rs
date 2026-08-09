@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 const DEFAULT_LOG_RETENTION: usize = 500;
 const MIN_LOG_RETENTION: usize = 50;
 const MAX_LOG_RETENTION: usize = 5000;
+const LOGIN_ATTEMPT_RESET_SECONDS: i64 = 24 * 60 * 60;
 static LOG_RETENTION: AtomicUsize = AtomicUsize::new(DEFAULT_LOG_RETENTION);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,8 +29,12 @@ pub struct Site {
     pub auto_login: bool,
     #[serde(default)]
     pub login_attempts_remaining: Option<u32>,
+    #[serde(default)]
+    pub login_attempts_recorded_at: Option<i64>,
     #[serde(default = "default_auto_keepalive")]
     pub auto_keepalive: bool,
+    #[serde(default)]
+    pub auto_signin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +142,88 @@ fn default_min_login_attempts_remaining() -> u8 {
 
 fn default_auto_keepalive() -> bool {
     true
+}
+
+/// 已确认的 NexusPHP 站点登录失败上限。站点可能调整策略，下一次读取到登录页时会以实际值纠正。
+pub fn known_login_attempt_limit(site_url: &str) -> Option<u32> {
+    let normalized = site_url.trim().to_ascii_lowercase();
+    let authority = normalized
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(normalized.as_str())
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("www.");
+
+    match host {
+        "audiences.me" | "hdfans.org" | "hdkyl.in" | "pt.btschool.club" | "si-qi.xyz" => Some(20),
+        "xingtan.one" | "cspt.top" | "pandapt.net" | "hxpt.org" | "pttime.org" | "cyanbug.net" => {
+            Some(10)
+        }
+        "ptskit.org" => Some(5),
+        "open.cd" => Some(11),
+        _ => None,
+    }
+}
+
+/// 对登录上限较低的站点至少保留一次可尝试机会，避免配置阈值等于站点上限时永远无法登录。
+pub fn effective_login_attempt_threshold(site_url: &str, configured: u32) -> u32 {
+    known_login_attempt_limit(site_url)
+        .map(|limit| configured.min(limit.saturating_sub(1).max(1)))
+        .unwrap_or(configured)
+}
+
+pub fn observe_login_attempts(site: &mut Site, remaining: Option<u32>) {
+    if let Some(remaining) = remaining {
+        site.login_attempts_remaining = Some(remaining);
+    }
+}
+
+/// 本地执行一次登录流程后启动 24 小时重置计时；页面返回的实际剩余次数优先保存。
+pub fn record_login_attempt(site: &mut Site, remaining: Option<u32>) {
+    observe_login_attempts(site, remaining);
+    if site.login_attempts_remaining.is_some() || known_login_attempt_limit(&site.url).is_some() {
+        site.login_attempts_recorded_at = Some(Local::now().timestamp());
+    }
+}
+
+/// 将本地登录后满 24 小时的记录恢复为该站点的已知上限。
+pub fn refresh_expired_login_attempts(config: &mut AppConfig) -> bool {
+    let now = Local::now().timestamp();
+    let mut changed = false;
+    for site in &mut config.sites {
+        if site.login_attempts_remaining.is_none() {
+            if known_login_attempt_limit(&site.url).is_none() {
+                if site.login_attempts_recorded_at.take().is_some() {
+                    changed = true;
+                }
+                continue;
+            }
+            if site.login_attempts_recorded_at.is_none() {
+                continue;
+            }
+        }
+
+        let Some(recorded_at) = site.login_attempts_recorded_at else {
+            continue;
+        };
+        if now.saturating_sub(recorded_at) < LOGIN_ATTEMPT_RESET_SECONDS {
+            continue;
+        }
+
+        site.login_attempts_remaining = known_login_attempt_limit(&site.url);
+        site.login_attempts_recorded_at = None;
+        changed = true;
+    }
+    changed
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +401,9 @@ pub fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
         config.log_retention = normalize_log_retention(config.log_retention);
         config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
         config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
+        if refresh_expired_login_attempts(&mut config) {
+            save_config(app_handle, &config);
+        }
         config
     } else {
         let config = AppConfig::default();
