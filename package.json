@@ -9,6 +9,9 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "scripts\\tauri-build.cmd",
     "tauri:build:raw": "tauri build",
+    "tauri:build:mac-intel": "tauri build --target x86_64-apple-darwin",
+    "tauri:build:mac-arm": "tauri build --target aarch64-apple-darwin",
+    "tauri:build:mac-universal": "tauri build --target universal-apple-darwin",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

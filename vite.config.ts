@@ -13,6 +13,10 @@ export default defineConfig(async () => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    // Catalina 自带的旧版 WebKit 不能稳定执行 Vite 默认输出的较新语法。
+    target: "safari13",
+  },
   clearScreen: false,
   server: {
     port: 1420,

@@ -5,11 +5,31 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
-  release:
-    runs-on: windows-latest
-    permissions:
-      contents: write
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            artifact_name: windows-x86_64
+            build_command: npm run tauri:build
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            macos_deployment_target: "10.15"
+            artifact_name: darwin-x86_64
+            build_command: npm run tauri:build:mac-intel
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            macos_deployment_target: "10.15"
+            artifact_name: darwin-aarch64
+            build_command: npm run tauri:build:mac-arm
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout code
@@ -19,91 +39,85 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: "https://registry.npmjs.org"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          key: ${{ matrix.rust_target }}
 
       - name: Install frontend dependencies
         run: npm install
 
       - name: Sync tag version to project
-        shell: pwsh
-        run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+        run: node scripts/sync-version.mjs
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
 
-          npm version $version --no-git-tag-version
-
-          $cargoPath = "src-tauri/Cargo.toml"
-          $lines = Get-Content $cargoPath
-          $inPackage = $false
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^\[package\]$') {
-              $inPackage = $true
-              continue
-            }
-            if ($inPackage -and $lines[$i] -match '^\[') {
-              break
-            }
-            if ($inPackage -and $lines[$i] -match '^version\s*=') {
-              $lines[$i] = "version = `"$version`""
-              break
-            }
-          }
-          Set-Content -Path $cargoPath -Value $lines -Encoding utf8
-
-          $tauriConfigPath = "src-tauri/tauri.conf.json"
-          $tauriConfig = Get-Content $tauriConfigPath -Raw | ConvertFrom-Json
-          $tauriConfig.version = $version
-          $tauriConfig | ConvertTo-Json -Depth 20 | Set-Content $tauriConfigPath -Encoding utf8
-
-      - name: Build Windows installer
-        run: npm run tauri:build
+      - name: Build installer
+        run: ${{ matrix.build_command }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           VITE_RELEASE_TAG: ${{ github.ref_name }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
 
-      - name: Generate latest.json
-        shell: pwsh
-        run: |
-          $sigPath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.sig" | Select-Object -First 1
-          if ($null -eq $sigPath) { Write-Error "Signature file not found"; exit 1 }
-          $sig = Get-Content -Path $sigPath.FullName -Raw
+      - name: Upload Windows artifacts
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sig
 
-          # Tauri 2 NSIS builds produce a .exe installer (not .zip), find it directly
-          $exePath = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
-          if ($null -eq $exePath) { Write-Error "Installer .exe not found"; exit 1 }
-          $safeExeName = "PT-Manager-$env:GITHUB_REF_NAME-x64-setup.exe"
-          $safeExePath = Join-Path $exePath.DirectoryName $safeExeName
-          Move-Item -LiteralPath $exePath.FullName -Destination $safeExePath -Force
+      - name: Upload macOS artifacts
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos/*.sig
 
-          $latestJson = @{
-            version = $env:GITHUB_REF_NAME
-            notes = "Update to $($env:GITHUB_REF_NAME)"
-            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            platforms = @{
-              "windows-x86_64" = @{
-                signature = $sig.Trim()
-                url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/$safeExeName"
-              }
-            }
-          }
-          $latestJson | ConvertTo-Json -Depth 5 -Compress | Set-Content "latest.json" -Encoding utf8
+  release:
+    needs: build
+    runs-on: ubuntu-latest
 
-      - name: Create Release
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files and updater manifest
+        run: node scripts/prepare-release.mjs
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/nsis/*.zip
-            src-tauri/target/release/bundle/nsis/*.sig
-            latest.json
+          files: release-assets/*
           draft: false
           prerelease: false
         env:

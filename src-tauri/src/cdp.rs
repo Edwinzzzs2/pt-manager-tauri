@@ -1412,6 +1412,15 @@ fn dedicated_profile_dir() -> PathBuf {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // Profile 保存登录态，不能放在可能被 macOS 自动清理的临时目录。
+        if let Some(root) = env::var_os("HOME") {
+            return PathBuf::from(root)
+                .join("Library/Application Support/com.ptmanager.app/chrome-cdp-profile-auto");
+        }
+    }
+
     env::temp_dir().join("pt-manager-chrome-cdp-profile-auto")
 }
 
@@ -1547,6 +1556,12 @@ fn chrome_candidates() -> Vec<PathBuf> {
         paths.push(PathBuf::from(
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         ));
+        if let Some(root) = env::var_os("HOME") {
+            paths.push(
+                PathBuf::from(root)
+                    .join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -286,6 +286,16 @@ fn local_data_dir() -> PathBuf {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // 临时目录会被系统清理；日志必须与配置一样放进用户的持久应用数据目录。
+        if let Some(root) = std::env::var_os("HOME") {
+            let dir = PathBuf::from(root).join("Library/Application Support/com.ptmanager.app");
+            fs::create_dir_all(&dir).ok();
+            return dir;
+        }
+    }
+
     let dir = std::env::temp_dir().join("pt-manager");
     fs::create_dir_all(&dir).ok();
     dir

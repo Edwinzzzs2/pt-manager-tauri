@@ -100,7 +100,18 @@ OCR 用于通用 NexusPHP 登录页的 6 位英文数字验证码。服务需要
 
 ### 1. 安装并启动
 
-从项目的 [Releases](https://github.com/Edwinzzzs2/pt-manager-tauri/releases) 页面下载 Windows 安装包并安装。首次运行前请确保系统已安装 Google Chrome；如果未检测到 Chrome，也可以在应用总览页打开官方下载页面。
+从项目的 [Releases](https://github.com/Edwinzzzs2/pt-manager-tauri/releases) 页面选择对应安装包：
+
+- Windows 10/11 x64：`windows-x64-setup.exe`；
+- Intel Mac（包括 Mac mini 2012）：`macos-x64.dmg`；
+- Apple Silicon Mac（M1 及更新机型）：`macos-arm64.dmg`。
+
+Mac 用户打开 DMG 后，把 PT Manager 拖入“应用程序”。当前私人分发包使用 ad-hoc 签名，首次启动若被系统拦截，请先尝试打开一次，再到“系统设置 → 隐私与安全性”中选择“仍要打开”。
+
+首次运行前请确保系统已安装 Google Chrome；如果未检测到 Chrome，也可以在应用总览页打开官方下载页面。
+
+> [!WARNING]
+> Mac mini 2012 官方最高支持 macOS Catalina 10.15，本应用以 10.15 作为最低 Mac 版本。Chrome 128 是最后支持 Catalina 的版本，仍可运行 CDP 保活，但已不再获得安全更新。请只访问可信站点，并优先考虑把机器升级到仍受支持的系统和浏览器。
 
 ### 2. 添加站点
 
@@ -207,8 +218,8 @@ URL：https://pt.example.com/
 | 数据 | 位置 | 内容 |
 | --- | --- | --- |
 | 应用配置 | Tauri 应用数据目录下的 `config.json` | 站点、任务设置和第三方服务配置 |
-| 运行日志 | `%LOCALAPPDATA%\pt-manager\run.log` | 保活、登录、同步和错误记录 |
-| 专用 Chrome Profile | `%LOCALAPPDATA%\pt-manager\chrome-cdp-profile-auto` | Cookie、Local Storage、缓存等浏览器数据 |
+| 运行日志 | Windows：`%LOCALAPPDATA%\pt-manager\run.log`；macOS：`~/Library/Application Support/com.ptmanager.app/run.log` | 保活、登录、同步和错误记录 |
+| 专用 Chrome Profile | Windows：`%LOCALAPPDATA%\pt-manager\chrome-cdp-profile-auto`；macOS：`~/Library/Application Support/com.ptmanager.app/chrome-cdp-profile-auto` | Cookie、Local Storage、缓存等浏览器数据 |
 
 > [!WARNING]
 > 站点密码、TOTP 密钥、CookieCloud 密码和 Gotify Token 会保存在本地配置中。导出的完整配置 JSON 也包含这些敏感信息，请勿提交到 Git、上传到公开网盘或直接分享给他人。
@@ -228,11 +239,12 @@ URL：https://pt.example.com/
 
 ### 环境要求
 
-- Windows 10/11；
+- 运行目标：Windows 10/11，或 macOS 10.15 及以上；
+- 开发构建机：能运行 Node.js 22、Rust stable 和当前 Xcode Command Line Tools 的受支持系统；
 - Node.js 22；
 - Rust stable 与 Cargo；
-- Visual Studio 2022 Build Tools，并安装 C++ 桌面开发工具链；
-- Tauri 2 在 Windows 上所需的 WebView2 运行环境；
+- Windows：Visual Studio 2022 Build Tools、C++ 桌面开发工具链和 WebView2；
+- macOS：Xcode Command Line Tools；
 - Google Chrome。
 
 ### 安装依赖
@@ -261,6 +273,27 @@ npm run tauri:build
 
 该命令会先查找 Visual Studio Build Tools、初始化 x64 编译环境，再执行 Tauri 构建。安装包目标格式为 NSIS。
 
+### 构建 macOS 安装包
+
+Mac 安装包必须在 macOS 上构建。根据目标机器执行：
+
+```bash
+# Intel Mac，Mac mini 2012 使用这个版本
+npm run tauri:build:mac-intel
+
+# Apple Silicon Mac
+npm run tauri:build:mac-arm
+```
+
+如需一个同时包含 Intel 与 Apple Silicon 二进制的 DMG，请先安装两个 Rust target，再构建 Universal 版本：
+
+```bash
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+npm run tauri:build:mac-universal
+```
+
+日常 Release 默认分别生成 x64 与 arm64 安装包，下载体积更小，自动更新也能准确匹配机器架构。
+
 ## 项目结构
 
 ```text
@@ -279,14 +312,20 @@ pt-manager-tauri/
 │  │  ├─ auth.rs              TOTP 生成
 │  │  ├─ updater.rs           应用更新与代理地址处理
 │  │  └─ store.rs             配置和日志持久化
-│  ├─ tauri.conf.json         Tauri 窗口、打包和更新配置
+│  ├─ tauri.conf.json         Tauri 窗口、公共打包和更新配置
+│  ├─ tauri.windows.conf.json Windows NSIS 打包配置
+│  ├─ tauri.macos.conf.json   macOS DMG、系统版本和签名配置
 │  └─ docs/自动签名.md         更新签名与发布说明
 ├─ scripts/tauri-build.cmd    Windows 构建环境初始化脚本
+├─ scripts/sync-version.mjs   多平台发布版本同步
+├─ scripts/prepare-release.mjs 多平台产物命名与更新清单生成
 └─ .github/workflows/         GitHub Release 自动发布流程
 ```
 
 ## 发布
 
-推送 `v*` 格式的 Git Tag 会触发 GitHub Actions：同步项目版本号、构建 Windows NSIS 安装包、生成更新签名和 `latest.json`，最后创建 GitHub Release。
+推送 `v*` 格式的 Git Tag 会触发 GitHub Actions：同步项目版本号，并行构建 Windows x64、macOS Intel 和 macOS Apple Silicon 安装包，合并三个平台的更新签名与 `latest.json`，最后创建 GitHub Release。
+
+macOS Release 默认使用 ad-hoc 签名，适合私人分发，首次打开需要用户手动允许。以后配置 Apple Developer 证书后，可用正式签名和公证替换，无需修改应用功能代码。
 
 自动更新签名的密钥配置和常见问题见 [Tauri 自动签名与 GitHub Actions 发布手册](src-tauri/docs/自动签名.md)。
