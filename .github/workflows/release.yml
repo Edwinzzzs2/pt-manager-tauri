@@ -68,6 +68,31 @@ jobs:
           VITE_RELEASE_TAG: ${{ github.ref_name }}
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
 
+      - name: Verify macOS updater artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bundle_root="src-tauri/target/${{ matrix.rust_target }}/release/bundle"
+          find "$bundle_root" -maxdepth 3 -type f -print
+
+          shopt -s nullglob
+          dmg_files=("$bundle_root"/dmg/*.dmg)
+          updater_files=("$bundle_root"/macos/*.app.tar.gz)
+          signature_files=("$bundle_root"/macos/*.app.tar.gz.sig)
+
+          if (( ${#dmg_files[@]} == 0 )); then
+            echo "Missing macOS DMG in $bundle_root/dmg" >&2
+            exit 1
+          fi
+          if (( ${#updater_files[@]} == 0 )); then
+            echo "Missing macOS updater archive in $bundle_root/macos; ensure bundle.targets includes app" >&2
+            exit 1
+          fi
+          if (( ${#signature_files[@]} == 0 )); then
+            echo "Missing macOS updater signature in $bundle_root/macos" >&2
+            exit 1
+          fi
+
       - name: Upload Windows artifacts
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4

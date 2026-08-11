@@ -92,7 +92,8 @@ async function listFiles(root) {
 function pickFile(files, predicate, description) {
   const file = files.find(predicate);
   if (!file) {
-    throw new Error(`未找到${description}`);
+    const foundFiles = files.map((item) => path.basename(item)).join(", ") || "无";
+    throw new Error(`未找到${description}；当前产物：${foundFiles}`);
   }
   return file;
 }
