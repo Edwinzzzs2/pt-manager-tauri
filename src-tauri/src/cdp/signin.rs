@@ -84,6 +84,7 @@ enum SigninAdapter {
     Yema,
     Hares,
     Rousi,
+    Pting,
     Generic,
 }
 
@@ -93,6 +94,7 @@ enum ApiSigninKind {
     Yema,
     Hares,
     Rousi,
+    Pting,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +122,8 @@ impl SigninAdapter {
             Self::Hares
         } else if url.to_ascii_lowercase().contains("rousi.pro") {
             Self::Rousi
+        } else if url.to_ascii_lowercase().contains("pting.club") {
+            Self::Pting
         } else {
             Self::Generic
         }
@@ -133,6 +137,7 @@ impl SigninAdapter {
             Self::Yema => "野马站点适配",
             Self::Hares => "白兔站点适配",
             Self::Rousi => "Rousi 站点适配",
+            Self::Pting => "PTing 论坛适配",
             Self::Generic => "通用规则",
         }
     }
@@ -143,6 +148,7 @@ impl SigninAdapter {
             Self::Yema => Some(ApiSigninKind::Yema),
             Self::Hares => Some(ApiSigninKind::Hares),
             Self::Rousi => Some(ApiSigninKind::Rousi),
+            Self::Pting => Some(ApiSigninKind::Pting),
             _ => None,
         }
     }
@@ -188,6 +194,19 @@ impl CdpClient {
         site_url: &str,
         progress: Option<&CdpProgress>,
     ) -> Result<SigninResult, String> {
+        let adapter = SigninAdapter::from_url(site_url);
+        if adapter == SigninAdapter::Pting {
+            if let Some(progress) = progress {
+                progress
+                    .info(format!("{site_name} 开始自动签到（{}）", adapter.label()))
+                    .await;
+            }
+            return match self.signin_site_by_api(tab_id, ApiSigninKind::Pting).await {
+                Ok(result) => Ok(result),
+                Err(err) => Ok(SigninResult::failure(err)),
+            };
+        }
+
         let page_result = self
             .signin_site_by_page(tab_id, site_name, site_url, progress)
             .await?;
@@ -195,7 +214,6 @@ impl CdpClient {
             return Ok(page_result);
         }
 
-        let adapter = SigninAdapter::from_url(site_url);
         let Some(api_kind) = adapter.api_fallback() else {
             return Ok(page_result);
         };
@@ -359,6 +377,7 @@ impl CdpClient {
             ApiSigninKind::Yema => ("/api/consumer/checkIn", "yema"),
             ApiSigninKind::Hares => ("/attendance.php?action=sign", "hares"),
             ApiSigninKind::Rousi => ("/api/points/attendance", "rousi"),
+            ApiSigninKind::Pting => ("/api/check-in", "pting"),
         };
         let config = serde_json::to_string(&serde_json::json!({
             "path": path,
@@ -627,7 +646,7 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
     try {
         const headers = { Accept: 'application/json, text/plain, */*' };
         const request = {
-            method: config.kind === 'rousi' ? 'POST' : 'GET',
+            method: ['rousi', 'pting'].includes(config.kind) ? 'POST' : 'GET',
             credentials: 'include',
             headers
         };
@@ -646,6 +665,10 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
             headers.Authorization = token.startsWith('Bearer ') ? token : `Bearer ${token}`;
             headers['Content-Type'] = 'application/json';
             request.body = JSON.stringify({ mode: 'fixed' });
+        }
+        if (config.kind === 'pting') {
+            headers['Content-Type'] = 'application/json';
+            request.body = JSON.stringify({ action: 'check-in' });
         }
         const response = await fetch(new URL(config.path, location.origin), request);
         const raw = await response.text();
@@ -674,6 +697,9 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
             success = response.status === 200 && Number(payload.code) === 0;
             already ||= response.status === 400 && Number(payload.code) === 1;
         }
+        if (config.kind === 'pting') {
+            success = response.ok && !already;
+        }
         let stats = {};
         if (config.kind === 'rousi' && (success || already)) {
             try {
@@ -696,6 +722,9 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
         const rousiReward = config.kind === 'rousi' && Number.isFinite(rousiBonus)
             ? `${rousiBonus}${Number.isFinite(rousiStreakBonus) && rousiStreakBonus > 0 ? `（含连续奖励 ${rousiStreakBonus}）` : ''} 魔力值`
             : null;
+        const ptingRewardMatch = config.kind === 'pting'
+            ? text.match(/(?:获得|奖励|增加)\s*([+\-]?\d[\d,.]*)\s*(积分|花粉|金币)?/i)
+            : null;
         const firstNumber = (...values) => {
             for (const value of values) {
                 if (value === null || value === undefined || value === '') continue;
@@ -708,9 +737,15 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
             success,
             alreadySigned: !success && already,
             message: success
-                ? '接口签到成功'
-                : (already ? '今日已签到' : (response.status === 401 ? 'Authorization 已失效' : (text || `HTTP ${response.status}`))),
-            reward: rousiReward || (rewardMatch?.[1]
+                ? (config.kind === 'pting'
+                    ? (clean(payload.message || payload.msg) || '签到成功')
+                    : '接口签到成功')
+                : (already ? '今日已签到' : (response.status === 401
+                    ? (config.kind === 'pting' ? '登录状态已失效' : 'Authorization 已失效')
+                    : (text || `HTTP ${response.status}`))),
+            reward: rousiReward || (ptingRewardMatch?.[1]
+                ? [ptingRewardMatch[1], ptingRewardMatch[2]].filter(Boolean).join(' ')
+                : null) || (rewardMatch?.[1]
                 ? [rewardMatch[1], rewardMatch[2]].filter(Boolean).join(' ')
                 : null),
             totalDays: firstNumber(
@@ -747,6 +782,13 @@ mod tests {
         let adapter = SigninAdapter::from_url("https://rousi.pro/");
         assert_eq!(adapter, SigninAdapter::Rousi);
         assert!(matches!(adapter.api_fallback(), Some(ApiSigninKind::Rousi)));
+    }
+
+    #[test]
+    fn selects_pting_forum_api() {
+        let adapter = SigninAdapter::from_url("https://pting.club/");
+        assert_eq!(adapter, SigninAdapter::Pting);
+        assert!(matches!(adapter.api_fallback(), Some(ApiSigninKind::Pting)));
     }
 
     #[test]

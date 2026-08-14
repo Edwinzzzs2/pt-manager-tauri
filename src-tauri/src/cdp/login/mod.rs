@@ -2,6 +2,7 @@ mod common;
 mod hdkylin;
 mod mteam;
 mod nexusphp;
+mod pting;
 
 use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress};
@@ -10,6 +11,7 @@ use crate::cdp::{CdpClient, CdpProgress};
 pub enum SiteAdapter {
     MTeam,
     Hdkylin,
+    Pting,
     NexusPhp,
 }
 
@@ -21,6 +23,8 @@ impl SiteAdapter {
             Self::MTeam
         } else if normalized.contains("hdkyl.in") {
             Self::Hdkylin
+        } else if normalized.contains("pting.club") {
+            Self::Pting
         } else {
             Self::NexusPhp
         }
@@ -112,6 +116,27 @@ impl CdpClient {
                     message,
                     remaining_attempts: None,
                 }),
+            SiteAdapter::Pting => self
+                .login_pting(
+                    tab_id,
+                    request.username,
+                    request.password,
+                    request.totp_secret,
+                    progress,
+                )
+                .await
+                .map(|logged_in| LoginOutcome {
+                    state: if logged_in {
+                        LoginState::LoggedIn
+                    } else {
+                        LoginState::AlreadyLoggedIn
+                    },
+                    remaining_attempts: None,
+                })
+                .map_err(|message| LoginError {
+                    message,
+                    remaining_attempts: None,
+                }),
             SiteAdapter::NexusPhp => self
                 .login_nexusphp(
                     tab_id,
@@ -157,6 +182,10 @@ mod tests {
         assert_eq!(
             SiteAdapter::from_url("https://pt.example.com/login.php"),
             SiteAdapter::NexusPhp
+        );
+        assert_eq!(
+            SiteAdapter::from_url("https://pting.club/"),
+            SiteAdapter::Pting
         );
     }
 }
