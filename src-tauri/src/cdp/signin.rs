@@ -69,6 +69,8 @@ struct PageState {
     challenge_ready: bool,
     has_interactive_question: bool,
     has_action: bool,
+    action_label: String,
+    action_key: String,
     explicit_failure: bool,
     message: String,
     reward: Option<String>,
@@ -164,6 +166,18 @@ impl SigninAdapter {
             return cleaned.to_string();
         }
 
+        if self == Self::Rousi {
+            let authority_start = cleaned
+                .find("://")
+                .map(|index| index + 3)
+                .unwrap_or(0);
+            let origin_end = cleaned[authority_start..]
+                .find('/')
+                .map(|index| authority_start + index)
+                .unwrap_or(cleaned.len());
+            return format!("{}/account/economy", &cleaned[..origin_end]);
+        }
+
         let authority_start = cleaned.find("://").map(|index| index + 3).unwrap_or(0);
         let path_start = cleaned[authority_start..]
             .find('/')
@@ -214,6 +228,11 @@ impl CdpClient {
             return Ok(page_result);
         }
 
+        // Rousi 新版签到由页面流程维护授权状态，不再请求已经废弃的旧签到接口。
+        if adapter == SigninAdapter::Rousi {
+            return Ok(page_result);
+        }
+
         let Some(api_kind) = adapter.api_fallback() else {
             return Ok(page_result);
         };
@@ -256,14 +275,17 @@ impl CdpClient {
         if initial.success {
             return Ok(result_from_state(SigninStatus::Success, initial));
         }
-        if initial.already_signed {
+        // Rousi 首页只显示连续天数，进入经济页后才能同时读取新版累计签到统计。
+        if initial.already_signed && adapter != SigninAdapter::Rousi {
             return Ok(result_from_state(SigninStatus::AlreadySigned, initial));
         }
         let initially_already_signed = initial.home_already_signed;
 
         let target_url = match initial.entry_url.filter(|url| same_site(url, site_url)) {
             Some(url) => url,
-            None if initial.nexusphp_like => adapter.fallback_url(site_url),
+            None if initial.nexusphp_like || adapter == SigninAdapter::Rousi => {
+                adapter.fallback_url(site_url)
+            }
             None => {
                 return Ok(SigninResult::failure(
                     "页面中未找到站内签到入口，且当前站点不是通用 NexusPHP 签到结构，需要添加站点专用适配",
@@ -283,7 +305,7 @@ impl CdpClient {
         websocket.call("Page.navigate", serde_json::json!({ "url": target_url }))?;
 
         let mut challenge_logged = false;
-        let mut action_clicked = false;
+        let mut clicked_action_key = String::new();
         let mut ready_steps = 0usize;
         for _ in 0..SIGNIN_WAIT_STEPS {
             check_cancel(progress)?;
@@ -338,11 +360,21 @@ impl CdpClient {
                     "签到页包含答题或选项，需要添加站点专用适配",
                 ));
             }
-            if !action_clicked && ready_steps >= 3 && state.has_action {
-                action_clicked = click_signin_action(&mut websocket);
-                if action_clicked {
+            if ready_steps >= 3
+                && state.has_action
+                && state.action_key != clicked_action_key
+            {
+                // Rousi 新版需要先切到“签到”页签，再点击“立即签到”，按控件去重可兼容这种多阶段操作。
+                let clicked = click_signin_action(&mut websocket);
+                if clicked {
+                    clicked_action_key = state.action_key.clone();
                     if let Some(progress) = progress {
-                        progress.info(format!("{site_name} 已点击签到按钮")).await;
+                        progress
+                            .info(format!(
+                                "{site_name} 已点击签到操作：{}",
+                                state.action_label
+                            ))
+                            .await;
                     }
                     ready_steps = 0;
                     continue;
@@ -553,11 +585,19 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
     }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
 
     const homeSigned = elements.some((el) => visible(el) && signedPattern.test(textOf(el)));
-    const action = elements.find((el) => {
+    const actionCandidates = elements.map((el, index) => ({ el, index, text: textOf(el) })).filter(({ el, text }) => {
         if (!visible(el) || el.tagName === 'A') return false;
-        const text = textOf(el);
-        return exactActionPattern.test(text) && !/(登录|登入|login)/i.test(text);
-    });
+        const selectedNavigation = el.getAttribute('aria-pressed') === 'true'
+            || el.getAttribute('aria-selected') === 'true'
+            || el.dataset?.state === 'active';
+        return exactActionPattern.test(text)
+            && !/(登录|登入|login)/i.test(text)
+            && !selectedNavigation;
+    }).sort((left, right) => Number(/^立即/i.test(right.text)) - Number(/^立即/i.test(left.text)));
+    const action = actionCandidates[0]?.el || null;
+    const actionKey = actionCandidates[0]
+        ? `${actionCandidates[0].text}|${actionCandidates[0].index}`
+        : '';
     document.querySelectorAll('[data-pt-manager-signin-action]').forEach((el) => el.removeAttribute('data-pt-manager-signin-action'));
     if (action) action.setAttribute('data-pt-manager-signin-action', 'true');
 
@@ -624,12 +664,15 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         challengeReady,
         hasInteractiveQuestion,
         hasAction: Boolean(action),
+        actionLabel: action ? textOf(action) : '',
+        actionKey,
         explicitFailure,
         message: resultMessage,
         reward: textReward() || statValue(/本次.{0,8}(获得|獲得|奖励|獎勵|魔力|爆米花)/i),
         totalDays: textNumber(/第\s*(\d+)\s*次(?:签到|簽到)/i)
+            ?? textNumber(/(?:累计|累計)\s*(\d+)\s*(?:天|日|次)/i)
             ?? numberStat(/(累计|累計).{0,8}(签到|簽到).{0,4}(次数|次數)?/i),
-        consecutiveDays: textNumber(/(?:已)?(?:连续|連續)(?:签到|簽到)\s*(\d+)\s*(?:天|日)/i)
+        consecutiveDays: textNumber(/(?:已)?(?:连续|連續)(?:签到|簽到)?\s*(\d+)\s*(?:天|日)/i)
             ?? numberStat(/(连续|連續).{0,8}(签到|簽到).{0,4}(天数|天數|日数|日數)?/i)
     };
 })()"#;
@@ -778,10 +821,13 @@ mod tests {
     use super::{ApiSigninKind, SigninAdapter};
 
     #[test]
-    fn selects_rousi_api_fallback() {
+    fn selects_rousi_page_adapter() {
         let adapter = SigninAdapter::from_url("https://rousi.pro/");
         assert_eq!(adapter, SigninAdapter::Rousi);
-        assert!(matches!(adapter.api_fallback(), Some(ApiSigninKind::Rousi)));
+        assert_eq!(
+            adapter.fallback_url("https://rousi.pro/"),
+            "https://rousi.pro/account/economy"
+        );
     }
 
     #[test]
