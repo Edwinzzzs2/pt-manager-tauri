@@ -33,6 +33,7 @@ PT Manager 是一个面向 PT 站点的桌面保活工具。应用通过 Chrome 
 | --- | --- | --- | --- | --- |
 | M-Team | URL 包含 `kp.m-team.cc` | 支持 | 支持 | 不使用 |
 | HDKylin | URL 包含 `hdkyl.in` | 支持 | 支持 | 不使用 |
+| 六六云 | 域名为 `666clouds.com` | 支持 | 不使用 | 不使用 |
 | 通用 NexusPHP | 除上述两类外按 NexusPHP 流程处理 | 支持 | 支持 | 支持 |
 
 补充说明：
@@ -42,6 +43,7 @@ PT Manager 是一个面向 PT 站点的桌面保活工具。应用通过 Chrome 
 - 当剩余次数小于或等于安全阈值时，应用会停止自动填写、OCR 和登录重试，避免继续消耗次数。
 - 站点列表中的“测试”可单独验证自动登录；通用 NexusPHP 站点还可以使用“识别码”识别当前页面验证码。
 - 通用流程依赖页面结构，非 NexusPHP 站点不保证能够自动登录，但仍可用于普通页面保活。
+- 六六云请把站点 URL 配置为具体产品详情页（例如 `clientarea.php?action=productdetails&id=...`）；应用会复用专用 Chrome 登录态读取累计上行、下行流量，并随 Gotify 结构化报告上报。
 
 ### CookieCloud 同步
 

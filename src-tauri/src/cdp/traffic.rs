@@ -62,9 +62,11 @@ impl CdpClient {
 const TRAFFIC_EXPRESSION: &str = r#"(() => {
     const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
     const bodyText = clean(document.body?.innerText || '');
+    // 云服务商页面把累计出入流量放在这两个固定节点中；它们不是 PT 分享率。
+    const isProviderTraffic = Boolean(document.querySelector('#trafficout, #trafficin'));
     const sizeSource = '([\\d,.]+\\s*(?:[KMGTPE]i?B))';
-    const uploadLabel = new RegExp('(?:^|\\s)(?:(?:上传|上傳)(?:量)?|upload(?:ed)?)\\s*[:：]?\\s*' + sizeSource, 'i');
-    const downloadLabel = new RegExp('(?:^|\\s)(?:(?:下载|下載)(?:量)?|download(?:ed)?)\\s*[:：]?\\s*' + sizeSource, 'i');
+    const uploadLabel = new RegExp('(?:^|\\s)(?:(?:上传|上傳)(?:量)?|上行(?:流量)?|upload(?:ed)?)\\s*[:：]?\\s*' + sizeSource, 'i');
+    const downloadLabel = new RegExp('(?:^|\\s)(?:(?:下载|下載)(?:量)?|下行(?:流量)?|download(?:ed)?)\\s*[:：]?\\s*' + sizeSource, 'i');
     const uploadArrow = new RegExp('[↑⬆]\\s*' + sizeSource, 'i');
     const downloadArrow = new RegExp('[↓⬇]\\s*' + sizeSource, 'i');
     const ratioLabel = /(?:分享率|分享比率|传输比率|傳輸比率|ratio)\s*[:：]?\s*(∞|inf(?:inity)?|---|[\d,.]+)/i;
@@ -86,11 +88,11 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
     // NexusPHP 主题常把账号数据放在默认隐藏的控制面板中。优先读取语义 class，
     // 避免把首页“站点数据”里的总上传量、总下载量误当成当前账号数据。
     const accountUpload = markerValue(
-        '.color_uploaded, .top-nav__stats-up, .ratio-bar__uploaded, [title="上传量"], [title="上傳量"]',
+        '#trafficout, .color_uploaded, .top-nav__stats-up, .ratio-bar__uploaded, [title="上传量"], [title="上傳量"]',
         new RegExp(sizeSource, 'i')
     );
     const accountDownload = markerValue(
-        '.color_downloaded, .top-nav__stats-down, .ratio-bar__downloaded, [title="下载量"], [title="下載量"]',
+        '#trafficin, .color_downloaded, .top-nav__stats-down, .ratio-bar__downloaded, [title="下载量"], [title="下載量"]',
         new RegExp(sizeSource, 'i')
     );
     const accountRatio = markerValue(
@@ -125,8 +127,8 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
             .join(' ');
         return clean([attributes(scope), descendants].join(' ')).toLowerCase();
     };
-    const uploadHint = /(upload|uploaded|arrow.?up|fa.?up|icon.?up|上传|上傳)/i;
-    const downloadHint = /(download|downloaded|arrow.?down|fa.?down|icon.?down|下载|下載)/i;
+    const uploadHint = /(upload|uploaded|traffic.?out|arrow.?up|fa.?up|icon.?up|上传|上傳|上行)/i;
+    const downloadHint = /(download|downloaded|traffic.?in|arrow.?down|fa.?down|icon.?down|下载|下載|下行)/i;
     const ratioHint = /(share.?ratio|ratio|icon.?chart|fa.?chart|分享率|分享比率|传输比率|傳輸比率)/i;
     const candidates = [];
     for (const element of document.querySelectorAll('span, strong, b, div, td, a')) {
@@ -182,9 +184,10 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
         || ratioCandidates.sort((left, right) => right.score - left.score)[0]?.value
     ) || null;
     const detectedRatioNumber = Number(clean(detectedRatio).replace(/,/g, ''));
-    const ratio = detectedRatioNumber === 0 && calculatedRatio && calculatedRatio !== '0'
-        ? calculatedRatio
-        : detectedRatio || calculatedRatio;
+    const fallbackRatio = isProviderTraffic ? null : calculatedRatio;
+    const ratio = detectedRatioNumber === 0 && fallbackRatio && fallbackRatio !== '0'
+        ? fallbackRatio
+        : detectedRatio || fallbackRatio;
     return {
         upload,
         download,

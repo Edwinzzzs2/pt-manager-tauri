@@ -3,6 +3,7 @@ mod hdkylin;
 mod mteam;
 mod nexusphp;
 mod pting;
+mod sixcloud;
 
 use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress};
@@ -12,6 +13,7 @@ pub enum SiteAdapter {
     MTeam,
     Hdkylin,
     Pting,
+    SixCloud,
     NexusPhp,
 }
 
@@ -19,7 +21,23 @@ impl SiteAdapter {
     /// 特殊站点优先按域名匹配，其余站点统一走 NexusPHP 兼容流程。
     pub fn from_url(url: &str) -> Self {
         let normalized = url.to_ascii_lowercase();
-        if normalized.contains("kp.m-team.cc") {
+        let host = normalized
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(normalized.as_str())
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .rsplit('@')
+            .next()
+            .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches("www.");
+        if host == "666clouds.com" {
+            Self::SixCloud
+        } else if normalized.contains("kp.m-team.cc") {
             Self::MTeam
         } else if normalized.contains("hdkyl.in") {
             Self::Hdkylin
@@ -137,6 +155,27 @@ impl CdpClient {
                     message,
                     remaining_attempts: None,
                 }),
+            SiteAdapter::SixCloud => self
+                .login_sixcloud(
+                    tab_id,
+                    request.site_url,
+                    request.username,
+                    request.password,
+                    progress,
+                )
+                .await
+                .map(|logged_in| LoginOutcome {
+                    state: if logged_in {
+                        LoginState::LoggedIn
+                    } else {
+                        LoginState::AlreadyLoggedIn
+                    },
+                    remaining_attempts: None,
+                })
+                .map_err(|message| LoginError {
+                    message,
+                    remaining_attempts: None,
+                }),
             SiteAdapter::NexusPhp => self
                 .login_nexusphp(
                     tab_id,
@@ -186,6 +225,16 @@ mod tests {
         assert_eq!(
             SiteAdapter::from_url("https://pting.club/"),
             SiteAdapter::Pting
+        );
+        assert_eq!(
+            SiteAdapter::from_url(
+                "https://www.666clouds.com/clientarea.php?action=productdetails&id=179433"
+            ),
+            SiteAdapter::SixCloud
+        );
+        assert_eq!(
+            SiteAdapter::from_url("https://666clouds.com.evil.example/clientarea.php"),
+            SiteAdapter::NexusPhp
         );
     }
 }
