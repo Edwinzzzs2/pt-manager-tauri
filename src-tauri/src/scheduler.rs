@@ -103,7 +103,7 @@ pub async fn run_with_flag(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     task_running: &Arc<Mutex<bool>>,
     task_cancel_requested: &Arc<AtomicBool>,
-    allow_random_delay: bool,
+    apply_random_delay: bool,
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) {
@@ -122,7 +122,7 @@ pub async fn run_with_flag(
         config,
         logs,
         task_cancel_requested,
-        allow_random_delay,
+        apply_random_delay,
         app_handle,
         config_state,
     )
@@ -145,10 +145,39 @@ async fn run_keepalive_inner(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     task_cancel_requested: &Arc<AtomicBool>,
-    allow_random_delay: bool,
+    apply_random_delay: bool,
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
+    if config.sites.is_empty() {
+        push_log(logs, LogEntry::info("暂无站点配置，保活任务结束")).await;
+        return false;
+    }
+
+    let random_delay_minutes = config.cron_offset_minutes.max(0) as u64;
+    if apply_random_delay && random_delay_minutes > 0 {
+        let delay_secs: u64 = rand::thread_rng().gen_range(0..=random_delay_minutes * 60);
+        push_log(
+            logs,
+            LogEntry::info(format!(
+                "随机延迟 {} 秒，等待结束后再准备浏览器并执行保活",
+                delay_secs
+            )),
+        )
+        .await;
+        // 定时随机延迟必须早于 CookieCloud 同步和 CDP 初始化，避免等待期间提前打开浏览器。
+        if sleep_with_cancel(
+            logs,
+            task_cancel_requested,
+            Duration::from_secs(delay_secs),
+            "随机延迟",
+        )
+        .await
+        {
+            return true;
+        }
+    }
+
     let mut cdp = CdpClient::new(config.cdp_port);
     let mut launched_browser = false;
     let had_cdp_before_sync = cdp.available_port().await.is_some();
@@ -173,11 +202,6 @@ async fn run_keepalive_inner(
                 .await;
             }
         }
-    }
-
-    if config.sites.is_empty() {
-        push_log(logs, LogEntry::info("暂无站点配置，保活任务结束")).await;
-        return false;
     }
 
     if config.auto_sync_cookie {
@@ -208,17 +232,13 @@ async fn run_keepalive_inner(
         }
     }
 
-    // 手动保活会在启动 Chrome 时带上全部站点；定时任务保持顺序访问，避免随机延迟前先打开页面。
-    let initial_urls = if allow_random_delay {
-        Vec::new()
-    } else {
-        config
-            .sites
-            .iter()
-            .filter(|site| site.auto_keepalive)
-            .map(|site| site.url.clone())
-            .collect::<Vec<_>>()
-    };
+    // 手动和定时入口共用批量打开策略，确保两种触发方式的实际保活行为一致。
+    let initial_urls = config
+        .sites
+        .iter()
+        .filter(|site| site.auto_keepalive)
+        .map(|site| site.url.clone())
+        .collect::<Vec<_>>();
     let mut launched_with_initial_sites = false;
     if let Some(active_port) = cdp.available_port().await {
         // CookieCloud 保活前同步可能在没有现成 CDP 时自动启动 Chrome；这种实例也属于本次任务。
@@ -275,216 +295,17 @@ async fn run_keepalive_inner(
         .await;
     }
 
-    let random_delay_minutes = config.cron_offset_minutes.max(0) as u64;
-    if allow_random_delay && random_delay_minutes > 0 {
-        let delay_secs: u64 = rand::thread_rng().gen_range(0..=random_delay_minutes * 60);
-        {
-            let entry = LogEntry::info(format!("随机延迟 {} 秒", delay_secs));
-            push_log(logs, entry).await;
-        }
-        if sleep_with_cancel(
-            logs,
-            task_cancel_requested,
-            Duration::from_secs(delay_secs),
-            "随机延迟",
-        )
-        .await
-        {
-            close_browser_instance(&cdp, logs, launched_browser).await;
-            return true;
-        }
-    }
-
-    // 手动点击“立即保活”时批量打开所有站点，避免用户误以为只执行了第一个站点。
-    if !allow_random_delay {
-        return run_keepalive_batch(
-            config,
-            logs,
-            &cdp,
-            task_cancel_requested,
-            launched_with_initial_sites,
-            launched_browser,
-            app_handle,
-            config_state,
-        )
-        .await;
-    }
-
-    let mut successful_logins = Vec::new();
-    let mut failed_logins = Vec::new();
-    let mut signin_results = Vec::new();
-    let mut traffic_results = Vec::new();
-
-    for site in config.sites.iter() {
-        if task_cancel_requested.load(Ordering::SeqCst) {
-            close_browser_instance(&cdp, logs, launched_browser).await;
-            return true;
-        }
-
-        if !site.auto_keepalive {
-            push_log(
-                logs,
-                LogEntry::info(format!("{} 已关闭自动保活，跳过", site.name)),
-            )
-            .await;
-            continue;
-        }
-
-        {
-            let entry = LogEntry::info(format!("正在访问: {} ({})", site.name, site.url));
-            push_log(logs, entry).await;
-        }
-
-        let opened_tab = if launched_with_initial_sites {
-            match cdp.find_tab_for_url(&site.url).await {
-                Some(tab_id) => Ok(tab_id),
-                None => cdp.open_tab(&site.url).await,
-            }
-        } else {
-            cdp.open_tab(&site.url).await
-        };
-
-        match opened_tab {
-            Ok(tab_id) => {
-                let login_outcome = try_auto_login_site(
-                    site,
-                    &cdp,
-                    &tab_id,
-                    logs,
-                    config.min_login_attempts_remaining as u32,
-                    Some((config.ocr_server_url.clone(), config.ocr_retry_count)),
-                    Some(Arc::clone(task_cancel_requested)),
-                    app_handle,
-                    config_state,
-                )
-                .await;
-                let login_failed = matches!(&login_outcome, Some(LoginOutcome::Failed(_)));
-                match login_outcome {
-                    Some(LoginOutcome::Success) => successful_logins.push(site.name.clone()),
-                    Some(LoginOutcome::Failed(reason)) => {
-                        failed_logins.push((site.name.clone(), reason));
-                    }
-                    None => {}
-                }
-                if !login_failed {
-                    if let Some(traffic) = try_read_site_traffic(site, &cdp, &tab_id, logs).await {
-                        traffic_results.push((site.name.clone(), traffic));
-                    }
-                }
-                if site.auto_signin {
-                    let result = if login_failed {
-                        let result = SigninResult::failure("自动登录失败，未执行签到");
-                        push_log(
-                            logs,
-                            LogEntry::error(format!("{} 签到：{}", site.name, result.summary())),
-                        )
-                        .await;
-                        result
-                    } else {
-                        try_auto_signin_site(
-                            site,
-                            &cdp,
-                            &tab_id,
-                            logs,
-                            Arc::clone(task_cancel_requested),
-                        )
-                        .await
-                    };
-                    signin_results.push((site.name.clone(), result));
-                }
-                // 等待页面加载 + 随机抖动
-                let jitter: u64 = rand::thread_rng().gen_range(0..10);
-                let wait = config.visit_duration + jitter;
-                push_log(
-                    logs,
-                    LogEntry::info(format!("{} 停留 {} 秒，保持登录态", site.name, wait)),
-                )
-                .await;
-                if sleep_with_cancel(
-                    logs,
-                    task_cancel_requested,
-                    Duration::from_secs(wait),
-                    &format!("{} 的停留等待", site.name),
-                )
-                .await
-                {
-                    if launched_browser {
-                        close_browser_instance(&cdp, logs, true).await;
-                    } else if let Err(e) = cdp.close_tab(&tab_id).await {
-                        push_log(
-                            logs,
-                            LogEntry::error(format!("终止时关闭标签页失败: {}", e)),
-                        )
-                        .await;
-                    }
-                    return true;
-                }
-
-                // 关闭标签页
-                if !launched_browser {
-                    if let Err(e) = cdp.close_tab(&tab_id).await {
-                        let entry = LogEntry::error(format!("关闭标签页失败: {}", e));
-                        push_log(logs, entry).await;
-                    }
-                }
-
-                let entry = LogEntry::success(format!("{} 保活完成", site.name));
-                push_log(logs, entry).await;
-            }
-            Err(e) => {
-                if site.auto_login {
-                    failed_logins.push((site.name.clone(), format!("站点打开失败：{}", e)));
-                }
-                let entry = LogEntry::error(format!("{} 访问失败: {}", site.name, e));
-                push_log(logs, entry).await;
-                if site.auto_signin {
-                    let result = SigninResult::failure(format!("站点打开失败：{e}"));
-                    push_log(
-                        logs,
-                        LogEntry::error(format!("{} 签到：{}", site.name, result.summary())),
-                    )
-                    .await;
-                    signin_results.push((site.name.clone(), result));
-                }
-            }
-        }
-
-        // 站点间隔 5~15 秒
-        let interval: u64 = rand::thread_rng().gen_range(5..15);
-        push_log(
-            logs,
-            LogEntry::info(format!("站点间隔等待 {} 秒", interval)),
-        )
-        .await;
-        if sleep_with_cancel(
-            logs,
-            task_cancel_requested,
-            Duration::from_secs(interval),
-            "站点间隔等待",
-        )
-        .await
-        {
-            return true;
-        }
-    }
-
-    sync_cookiecloud_after_keepalive(config, logs, &cdp).await;
-    close_browser_instance(&cdp, logs, launched_browser).await;
-
-    {
-        let entry = LogEntry::success("保活任务全部完成".to_string());
-        push_log(logs, entry).await;
-    }
-    send_gotify_login_summary(
+    run_keepalive_batch(
         config,
         logs,
-        &successful_logins,
-        &failed_logins,
-        &signin_results,
-        &traffic_results,
+        &cdp,
+        task_cancel_requested,
+        launched_with_initial_sites,
+        launched_browser,
+        app_handle,
+        config_state,
     )
-    .await;
-    false
+    .await
 }
 
 async fn sync_cookiecloud_before_keepalive(
