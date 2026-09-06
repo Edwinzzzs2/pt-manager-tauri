@@ -179,7 +179,6 @@ async fn run_keepalive_inner(
     }
 
     let mut cdp = CdpClient::new(config.cdp_port);
-    let mut launched_browser = false;
     let had_cdp_before_sync = cdp.available_port().await.is_some();
 
     if !config.ocr_server_url.is_empty() {
@@ -240,6 +239,7 @@ async fn run_keepalive_inner(
         .map(|site| site.url.clone())
         .collect::<Vec<_>>();
     let mut launched_with_initial_sites = false;
+    let launched_browser;
     if let Some(active_port) = cdp.available_port().await {
         // CookieCloud 保活前同步可能在没有现成 CDP 时自动启动 Chrome；这种实例也属于本次任务。
         launched_browser = !had_cdp_before_sync;

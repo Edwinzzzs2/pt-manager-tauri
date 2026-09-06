@@ -130,10 +130,10 @@ mod tests {
     #[test]
     fn prepends_proxy_to_github_url() {
         let target = Url::parse(UPDATE_ENDPOINT).unwrap();
-        let result = prepend_proxy_url("https://vercel-proxy.decoffee.top/", &target).unwrap();
+        let result = prepend_proxy_url("https://proxy.example.com/", &target).unwrap();
         assert_eq!(
             result.as_str(),
-            "https://vercel-proxy.decoffee.top/https://github.com/Edwinzzzs2/pt-manager-tauri/releases/latest/download/latest.json"
+            "https://proxy.example.com/https://github.com/Edwinzzzs2/pt-manager-tauri/releases/latest/download/latest.json"
         );
     }
 }

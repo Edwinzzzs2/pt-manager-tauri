@@ -138,11 +138,11 @@ const defaultConfig: AppConfig = {
   cdp_port: 9222,
   visit_duration: 30,
   random_delay: true,
-  auto_launch: false,
+  auto_launch: true,
   log_retention: 500,
   auto_sync_cookie: false,
   auto_sync_cookie_after_keepalive: false,
-  ocr_server_url: "http://192.168.31.80:8060",
+  ocr_server_url: "https://ocr-read.decoffee.top",
   ocr_retry_count: 2,
   min_login_attempts_remaining: 5,
   update_proxy_url: "",
@@ -1043,7 +1043,7 @@ async function fetchCookieCloudData(config: CookieCloudConfig) {
   throw new Error(
     [
       "CookieCloud 无法连接，请确认服务地址和协议是否与浏览器插件一致。",
-      "常见格式：https://ccc.ft07.com 或 http://127.0.0.1:8088",
+      "常见格式：https://cookiecloud.example.com 或 http://127.0.0.1:8088",
       errors[0] ? `最近一次错误：${errors[0]}` : "",
     ]
       .filter(Boolean)
@@ -1789,10 +1789,20 @@ function SettingsPanel({
           </div>
           <div className="settings-form">
             <label>
-              <span>更新代理地址</span>
+              <span className="label-with-help">
+                更新代理地址
+                <span
+                  className="help-tip"
+                  aria-label="更新代理部署说明"
+                  title="默认留空，直接连接 GitHub。如需代理下载，请自行部署 https://github.com/Edwinzzzs2/vercel-proxy 项目，再将部署后的服务地址填入此处。"
+                  tabIndex={0}
+                >
+                  <HelpCircle size={14} />
+                </span>
+              </span>
               <input
                 onChange={(event) => onChange({ ...draft, update_proxy_url: event.target.value })}
-                placeholder="https://vercel-proxy.decoffee.top"
+                placeholder="https://proxy.example.com"
                 type="url"
                 value={draft.update_proxy_url}
               />
@@ -1951,7 +1961,7 @@ function SettingsPanel({
                   cookiecloud: { ...draft.cookiecloud, server_url: event.target.value },
                 })
               }
-              placeholder="https://ccc.ft07.com"
+              placeholder="https://cookiecloud.example.com"
               value={draft.cookiecloud.server_url}
             />
           </label>
@@ -2044,7 +2054,7 @@ function SettingsPanel({
               <span>OCR 服务地址</span>
               <input
                 onChange={(event) => onChange({ ...draft, ocr_server_url: event.target.value })}
-                placeholder="http://192.168.31.80:8060"
+                placeholder="https://ocr-read.decoffee.top"
                 type="url"
                 value={draft.ocr_server_url}
               />
@@ -2180,6 +2190,43 @@ function SettingsPanel({
               每次保活任务结束后发送一条通知；开启自动登录时会同时汇总登录结果。
             </p>
           </div>
+        </section>
+
+        <section className="panel settings-card" aria-labelledby="site-support-title">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Compatibility</p>
+              <h2 id="site-support-title">站点支持说明</h2>
+            </div>
+          </div>
+          <p className="field-hint">
+            可添加站点进行定时访问保活；自动登录、签到和流量读取的支持范围各不相同。
+          </p>
+          <details className="site-support-details">
+            <summary>查看当前适配清单与支持范围</summary>
+            {/* Keep this list aligned with the login, signin and traffic modules in src-tauri/src/cdp. */}
+            <dl className="site-support-list">
+              <div>
+                <dt>专门适配的自动登录</dt>
+                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing（pting.club）、SixCloud（666clouds.com）。</dd>
+              </div>
+              <div>
+                <dt>专门适配的自动签到</dt>
+                <dd>Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing（pting.club）。</dd>
+              </div>
+              <div>
+                <dt>通用站点支持</dt>
+                <dd>其他站点尝试使用 NexusPHP 兼容登录流程及通用签到入口识别。未列出的站点也可添加，但能否自动登录、签到取决于页面结构；需要先在站点配置中启用对应功能。</dd>
+              </div>
+              <div>
+                <dt>流量信息读取</dt>
+                <dd>支持识别常见 PT 页面中的上传量、下载量和分享率，并适配 SixCloud 的出入流量显示；云服务流量不代表 PT 分享率。</dd>
+              </div>
+            </dl>
+            <p className="field-hint">
+              适配不保证每次执行成功。站点改版、登录状态及验证码可能影响结果，请以任务日志为准；需要 OCR 的登录流程请先配置 OCR 服务。
+            </p>
+          </details>
         </section>
 
         <section className="panel settings-card config-backup-panel">

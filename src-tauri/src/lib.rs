@@ -111,8 +111,13 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &run, &quit]).build()?;
 
-    TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+    #[cfg(target_os = "windows")]
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
+    #[cfg(not(target_os = "windows"))]
+    let icon = app.default_window_icon().unwrap().clone();
+
+    let _tray = TrayIconBuilder::with_id("main-tray")
+        .icon(icon)
         .menu(&menu)
         .tooltip("PT Manager — 保活运行中")
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -145,6 +150,11 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            #[cfg(target_os = "windows")]
+            if matches!(&event, TrayIconEvent::Enter { .. }) {
+                refresh_windows_tray(tray);
+            }
+
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -160,7 +170,33 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
 
+    #[cfg(target_os = "windows")]
+    {
+        let app = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                // Sleep after each refresh to avoid catch-up bursts after suspend.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let Some(tray) = app.tray_by_id("main-tray") else {
+                    break;
+                };
+                refresh_windows_tray(&tray);
+            }
+        });
+    }
+
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_windows_tray(tray: &tauri::tray::TrayIcon) {
+    // Recreate the native icon from embedded pixels and ask Explorer to repaint.
+    // This is a recovery measure for stale tray rendering, not a task status update.
+    let result = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+        .and_then(|icon| tray.set_icon(Some(icon)));
+    if let Err(error) = result {
+        eprintln!("Failed to refresh tray icon: {error}");
+    }
 }
 
 fn setup_window_close_behavior(app: &tauri::App) {

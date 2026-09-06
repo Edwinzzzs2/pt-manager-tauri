@@ -16,6 +16,13 @@ release-assets
 package-lock.json
 yarn.lock
 .env
+.env.*
+!.env.example
+!.env.*.example
+tauri-signing.key
+*.pem
+*.p12
+*.pfx
 
 # Editor directories and files
 .vscode/*

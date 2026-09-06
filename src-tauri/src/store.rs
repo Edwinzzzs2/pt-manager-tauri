@@ -49,6 +49,7 @@ pub struct AppConfig {
     pub cdp_port: u16,
     pub visit_duration: u64,
     pub random_delay: bool,
+    #[serde(default = "default_auto_launch")]
     pub auto_launch: bool,
     #[serde(default = "default_log_retention")]
     pub log_retention: usize,
@@ -112,7 +113,7 @@ impl Default for AppConfig {
             cdp_port: 9222,
             visit_duration: 30,
             random_delay: true,
-            auto_launch: false,
+            auto_launch: default_auto_launch(),
             log_retention: DEFAULT_LOG_RETENTION,
             auto_sync_cookie: false,
             auto_sync_cookie_after_keepalive: false,
@@ -127,8 +128,12 @@ impl Default for AppConfig {
     }
 }
 
+fn default_auto_launch() -> bool {
+    true
+}
+
 fn default_ocr_server_url() -> String {
-    "http://192.168.31.80:8060".to_string()
+    "https://ocr-read.decoffee.top".to_string()
 }
 
 fn default_ocr_retry_count() -> u8 {

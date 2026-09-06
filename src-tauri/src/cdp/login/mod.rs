@@ -228,7 +228,7 @@ mod tests {
         );
         assert_eq!(
             SiteAdapter::from_url(
-                "https://www.666clouds.com/clientarea.php?action=productdetails&id=179433"
+                "https://www.666clouds.com/clientarea.php?action=productdetails&id=123"
             ),
             SiteAdapter::SixCloud
         );

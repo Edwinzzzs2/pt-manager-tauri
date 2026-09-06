@@ -162,7 +162,7 @@ impl CdpClient {
             }
 
             if current.has_captcha {
-                if let Some((ocr_server_url, ocr_retry_count)) = ocr_cfg.clone() {
+                if let Some((ocr_server_url, _)) = ocr_cfg.clone() {
                     if let Some(p) = progress {
                         p.info("检测到图片验证码，正在获取图片数据并进行自动 OCR 识别...")
                             .await;
