@@ -238,8 +238,9 @@ h2 {
 .help-tip {
   position: relative;
   display: inline-flex;
-  width: 24px;
-  height: 24px;
+  width: 34px;
+  height: 34px;
+  margin: -5px;
   align-items: center;
   justify-content: center;
   border-radius: 999px;
@@ -247,11 +248,52 @@ h2 {
   cursor: help;
 }
 
+.help-tip::after {
+  position: absolute;
+  z-index: 1000;
+  top: calc(100% + 8px);
+  left: 0;
+  width: max-content;
+  max-width: min(360px, calc(100vw - 24px));
+  padding: 9px 11px;
+  border: 1px solid var(--color-border-light);
+  border-radius: 7px;
+  background: var(--color-bg-card);
+  box-shadow: 0 10px 28px var(--panel-shadow);
+  color: var(--color-fg);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.55;
+  opacity: 0;
+  pointer-events: none;
+  text-align: left;
+  transform: translateY(-4px);
+  visibility: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  transition: opacity 0.14s ease, transform 0.14s ease, visibility 0.14s ease;
+}
+
+.help-tip:hover::after,
+.help-tip:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+}
+
 .help-tip:hover,
 .help-tip:focus-visible {
   background: var(--ghost-button-bg-hover);
   color: var(--color-fg);
   outline: none;
+}
+
+@media (min-width: 721px) {
+  .settings-form > label:nth-of-type(even) .help-tip::after {
+    right: 0;
+    left: auto;
+  }
 }
 
 .primary-action,
@@ -804,7 +846,8 @@ input:focus {
 
 .site-auto-login,
 .site-auto-keepalive,
-.site-auto-signin {
+.site-auto-signin,
+.site-cookiecloud-upload {
   min-height: 44px;
   padding: 6px 12px;
   border-radius: 6px;
@@ -844,6 +887,13 @@ input:focus {
 .site-login-badge.active {
   background: var(--accent-soft-bg);
   color: var(--color-accent);
+}
+
+.cookiecloud-upload-summary {
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--subtle-surface-soft);
 }
 
 .site-main span {
@@ -1196,6 +1246,43 @@ label {
   box-shadow: none;
 }
 
+.log-level-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-input);
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
+.log-level-filter select {
+  height: 30px;
+  padding: 0 2px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--color-fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.log-level-filter select option {
+  background: var(--color-bg-input);
+  color: var(--color-fg);
+}
+
+html[data-theme="dark"] .log-level-filter select {
+  color-scheme: dark;
+}
+
+html[data-theme="light"] .log-level-filter select {
+  color-scheme: light;
+}
+
 .log-list {
   display: grid;
   flex: 1 1 0;
@@ -1273,6 +1360,10 @@ label {
   .site-main {
     grid-template-columns: 1fr;
     gap: 4px;
+  }
+
+  .site-row.editing {
+    grid-column: 1 / -1;
   }
 }
 
@@ -1359,7 +1450,8 @@ label {
   .site-secret-field,
   .site-auto-login,
   .site-auto-keepalive,
-  .site-auto-signin {
+  .site-auto-signin,
+  .site-cookiecloud-upload {
     grid-column: auto;
   }
 
@@ -1430,21 +1522,264 @@ label {
   opacity: 0.6;
 }
 
-.site-selection-bar .batch-keepalive-enable {
+.site-selection-bar .batch-settings-button {
   margin-left: auto;
-  margin-right: 8px;
-  min-height: 34px;
-  padding: 0 11px;
-}
-
-.site-selection-bar .batch-keepalive-disable {
-  margin-right: 8px;
   min-height: 34px;
   padding: 0 11px;
 }
 
 .site-selection-bar .batch-delete-btn {
   margin-left: 0 !important;
+}
+
+.batch-settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(6px);
+}
+
+.batch-settings-modal {
+  display: flex;
+  width: min(980px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--color-border-light);
+  border-radius: 12px;
+  background: var(--panel-surface);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+}
+
+.batch-settings-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.batch-settings-heading > div:first-child {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.batch-settings-heading h2 {
+  font-size: 21px;
+}
+
+.batch-settings-heading p,
+.batch-settings-footer > span {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.batch-settings-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 22px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-fg-muted);
+  font-size: 13px;
+}
+
+.batch-settings-quick-actions,
+.batch-settings-footer .row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.batch-settings-quick-actions button {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.batch-settings-list {
+  display: grid;
+  min-height: 0;
+  gap: 10px;
+  overflow: auto;
+  padding: 14px 22px 18px;
+}
+
+.batch-site-row {
+  display: grid;
+  grid-template-columns: 20px minmax(180px, 0.6fr) minmax(0, 1.4fr);
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--subtle-surface-soft);
+}
+
+.batch-site-row.dragging {
+  opacity: 0.5;
+}
+
+.batch-site-row.drag-over {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--accent-soft-bg);
+}
+
+.batch-site-drag-handle {
+  display: inline-flex;
+  width: 20px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--color-fg-muted);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.batch-site-drag-handle:hover {
+  background: var(--ghost-button-bg);
+  color: var(--color-fg);
+}
+
+.batch-site-drag-handle:active {
+  cursor: grabbing;
+}
+
+.batch-site-drag-handle[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.batch-site-meta {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.batch-site-meta strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-site-meta span {
+  overflow: hidden;
+  color: var(--color-fg-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-site-switches {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.batch-switch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 7px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--subtle-surface);
+  cursor: pointer;
+}
+
+.batch-switch:hover {
+  border-color: var(--accent-soft-border);
+  background: var(--subtle-surface-strong);
+}
+
+.batch-switch span {
+  overflow: hidden;
+  color: var(--color-fg-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-switch input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+.batch-settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--color-border);
+}
+
+@media (max-width: 720px) {
+  .batch-settings-overlay {
+    padding: 10px;
+  }
+
+  .batch-settings-modal {
+    max-height: calc(100vh - 20px);
+  }
+
+  .batch-settings-heading,
+  .batch-settings-toolbar,
+  .batch-settings-footer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .batch-settings-toolbar,
+  .batch-settings-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-settings-quick-actions,
+  .batch-settings-footer .row-actions {
+    width: 100%;
+  }
+
+  .batch-settings-quick-actions button,
+  .batch-settings-footer .row-actions button {
+    flex: 1;
+  }
+
+  .batch-settings-list {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .batch-site-row {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+
+  .batch-site-switches {
+    grid-column: 2;
+  }
+
+  .batch-site-switches {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .compact-log-row.copied,

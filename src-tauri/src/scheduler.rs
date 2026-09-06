@@ -411,6 +411,17 @@ async fn sync_cookiecloud_after_keepalive(
         return;
     }
 
+    let upload_sites = config
+        .sites
+        .iter()
+        .filter(|site| site.cookiecloud_upload)
+        .cloned()
+        .collect::<Vec<_>>();
+    if upload_sites.is_empty() {
+        push_log(logs, LogEntry::info("未选择需要上传 CookieCloud 的站点，跳过上传")).await;
+        return;
+    }
+
     push_log(
         logs,
         LogEntry::info("保活完成，正在上传最新 Cookie 到 CookieCloud"),
@@ -427,7 +438,7 @@ async fn sync_cookiecloud_after_keepalive(
             return;
         }
     };
-    match cookiecloud::upload_current_cookies(&config.cookiecloud, &config.sites, cookies).await {
+    match cookiecloud::upload_current_cookies(&config.cookiecloud, &upload_sites, cookies).await {
         Ok(count) => {
             push_log(
                 logs,

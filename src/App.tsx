@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { getVersion, setTheme as setTauriTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -8,10 +14,12 @@ import {
   Activity,
   CheckCircle2,
   Clock3,
+  Cookie,
   Download,
   Eye,
   EyeOff,
   FileUp,
+  GripVertical,
   HelpCircle,
   ListChecks,
   Moon,
@@ -23,6 +31,7 @@ import {
   Send,
   Search,
   Settings,
+  Settings2,
   ShieldCheck,
   Square,
   Sun,
@@ -45,6 +54,7 @@ type Site = {
   login_success_recorded_at: number | null;
   auto_keepalive: boolean;
   auto_signin: boolean;
+  cookiecloud_upload: boolean;
 };
 
 type SiteDraft = Pick<
@@ -57,7 +67,42 @@ type SiteDraft = Pick<
   | "auto_login"
   | "auto_keepalive"
   | "auto_signin"
+  | "cookiecloud_upload"
 >;
+
+type SiteAutomationSettings = Pick<
+  Site,
+  "auto_login" | "auto_keepalive" | "auto_signin" | "cookiecloud_upload"
+>;
+
+type AutomationSettingKey = keyof SiteAutomationSettings;
+
+const automationFields: Array<{
+  key: AutomationSettingKey;
+  label: string;
+  description: string;
+}> = [
+  {
+    key: "auto_login",
+    label: "自动登录",
+    description: "保活时未登录才自动登录，需要已配置账号、密码、2FA 和 OCR。",
+  },
+  {
+    key: "auto_keepalive",
+    label: "自动保活",
+    description: "纳入立即保活和定时保活任务；关闭后会跳过本站。",
+  },
+  {
+    key: "auto_signin",
+    label: "自动签到",
+    description: "登录成功后自动查找并尝试签到入口。",
+  },
+  {
+    key: "cookiecloud_upload",
+    label: "自动上传 Cookie",
+    description: "本站纳入自动上传范围，还需开启设置页的总开关。",
+  },
+];
 
 type AppConfig = {
   sites: Site[];
@@ -223,9 +268,10 @@ function App() {
     username: "",
     password: "",
     totp_secret: "",
-    auto_login: false,
+    auto_login: true,
     auto_keepalive: true,
     auto_signin: false,
+    cookiecloud_upload: true,
   });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
   const [editingSite, setEditingSite] = useState<SiteDraft>({
@@ -234,13 +280,15 @@ function App() {
     username: "",
     password: "",
     totp_secret: "",
-    auto_login: false,
+    auto_login: true,
     auto_keepalive: true,
     auto_signin: false,
+    cookiecloud_upload: true,
   });
   const [busy, setBusy] = useState(false);
   const [cdpBusy, setCdpBusy] = useState(false);
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
+  const [cookieCloudClearBusy, setCookieCloudClearBusy] = useState(false);
   const [gotifyTestBusy, setGotifyTestBusy] = useState(false);
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
@@ -432,6 +480,40 @@ function App() {
     }
   }
 
+  async function clearCookieCloudData() {
+    const serverUrl = settingsDraft.cookiecloud.server_url.trim();
+    if (
+      !serverUrl ||
+      !settingsDraft.cookiecloud.uuid.trim() ||
+      !settingsDraft.cookiecloud.password
+    ) {
+      setError("请先填写 CookieCloud 地址、UUID 和密码");
+      return;
+    }
+    const confirmed = await ask(
+      `将永久清空 ${serverUrl || "当前 CookieCloud 服务器"} 上保存的全部 Cookie 和 Local Storage 数据，确定继续？`,
+      {
+        kind: "warning",
+        okLabel: "清空云端数据",
+        cancelLabel: "取消",
+        title: "清空 CookieCloud 数据",
+      },
+    );
+    if (!confirmed) return;
+
+    setCookieCloudClearBusy(true);
+    setError(null);
+    try {
+      await invoke("clear_cookiecloud_data", { config: settingsDraft.cookiecloud });
+      await refreshLogs();
+      setNotice("CookieCloud 服务器上的 Cookie 和 Local Storage 数据已清空");
+    } catch (err) {
+      showError(err);
+    } finally {
+      setCookieCloudClearBusy(false);
+    }
+  }
+
   async function addSite() {
     const name = newSite.name.trim();
     const url = newSite.url.trim();
@@ -451,6 +533,7 @@ function App() {
         totpSecret: newSite.totp_secret.trim(),
         autoLogin: newSite.auto_login,
         autoSignin: newSite.auto_signin,
+        cookiecloudUpload: newSite.cookiecloud_upload,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -460,9 +543,10 @@ function App() {
         username: "",
         password: "",
         totp_secret: "",
-        auto_login: false,
+        auto_login: true,
         auto_keepalive: true,
         auto_signin: false,
+        cookiecloud_upload: true,
       });
       await refreshStatus();
     } catch (err) {
@@ -573,6 +657,7 @@ function App() {
       auto_login: site.auto_login,
       auto_keepalive: site.auto_keepalive,
       auto_signin: site.auto_signin,
+      cookiecloud_upload: site.cookiecloud_upload,
     });
   }
 
@@ -597,6 +682,7 @@ function App() {
         autoLogin: editingSite.auto_login,
         autoKeepalive: editingSite.auto_keepalive,
         autoSignin: editingSite.auto_signin,
+        cookiecloudUpload: editingSite.cookiecloud_upload,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -656,6 +742,7 @@ function App() {
         autoLogin: site.auto_login,
         autoKeepalive: !site.auto_keepalive,
         autoSignin: site.auto_signin,
+        cookiecloudUpload: site.cookiecloud_upload,
       });
       setConfig(next);
       setSettingsDraft(next);
@@ -667,13 +754,38 @@ function App() {
     }
   }
 
-  async function batchToggleKeepalive(ids: string[], enabled: boolean) {
-    if (ids.length === 0) return false;
+  async function batchUpdateSiteAutomation(
+    updates: Record<string, SiteAutomationSettings>,
+  ) {
+    if (Object.keys(updates).length === 0) return false;
     setBusy(true);
     setError(null);
     try {
       const nextSites = config.sites.map((site) =>
-        ids.includes(site.id) ? { ...site, auto_keepalive: enabled } : site
+        updates[site.id] ? { ...site, ...updates[site.id] } : site,
+      );
+      const nextConfig = { ...config, sites: nextSites };
+      await invoke("save_config", { config: nextConfig });
+      setConfig(nextConfig);
+      setSettingsDraft(nextConfig);
+      await refreshStatus();
+      return true;
+    } catch (err) {
+      showError(err);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reorderSites(siteIds: string[]) {
+    if (siteIds.length < 2) return false;
+    setBusy(true);
+    setError(null);
+    try {
+      const order = new Map(siteIds.map((id, index) => [id, index]));
+      const nextSites = [...config.sites].sort(
+        (left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0),
       );
       const nextConfig = { ...config, sites: nextSites };
       await invoke("save_config", { config: nextConfig });
@@ -983,7 +1095,8 @@ function App() {
               testingSiteId={testingSiteId}
               recognizingSiteId={recognizingSiteId}
               onToggleKeepalive={toggleSiteKeepalive}
-              onBatchToggleKeepalive={batchToggleKeepalive}
+              onBatchUpdateAutomation={batchUpdateSiteAutomation}
+              onReorderSites={reorderSites}
             />
           ) : null}
 
@@ -991,11 +1104,13 @@ function App() {
             <SettingsPanel
               busy={busy}
               browserDataClearBusy={browserDataClearBusy}
+              cookieCloudClearBusy={cookieCloudClearBusy}
               cookieSyncBusy={cookieSyncBusy}
               gotifyTestBusy={gotifyTestBusy}
               draft={settingsDraft}
               onChange={setSettingsDraft}
               onClearBrowserData={clearBrowserData}
+              onClearCookieCloudData={clearCookieCloudData}
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               onTestGotify={testGotify}
@@ -1333,7 +1448,8 @@ function SitesPanel({
   recognizingSiteId,
   testingSiteId,
   onToggleKeepalive,
-  onBatchToggleKeepalive,
+  onBatchUpdateAutomation,
+  onReorderSites,
 }: {
   busy: boolean;
   config: AppConfig;
@@ -1355,11 +1471,23 @@ function SitesPanel({
   recognizingSiteId: string | null;
   testingSiteId: string | null;
   onToggleKeepalive: (site: Site) => void;
-  onBatchToggleKeepalive: (ids: string[], enabled: boolean) => Promise<boolean>;
+  onBatchUpdateAutomation: (
+    updates: Record<string, SiteAutomationSettings>,
+  ) => Promise<boolean>;
+  onReorderSites: (siteIds: string[]) => Promise<boolean>;
 }) {
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
   const [showSitePassword, setShowSitePassword] = useState(false);
   const [showTotpSecret, setShowTotpSecret] = useState(false);
+  const [batchSettingsOpen, setBatchSettingsOpen] = useState(false);
+  const [batchSettings, setBatchSettings] = useState<
+    Record<string, SiteAutomationSettings>
+  >({});
+  const [batchDraggingSiteId, setBatchDraggingSiteId] = useState<string | null>(null);
+  const [batchDragOverSiteId, setBatchDragOverSiteId] = useState<string | null>(null);
+  const batchDragOverSiteRef = useRef<string | null>(null);
+  const batchSettingsListRef = useRef<HTMLDivElement | null>(null);
+  const batchPointerPositionRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const allSelected = config.sites.length > 0 && selectedSiteIds.size === config.sites.length;
 
   useEffect(() => {
@@ -1403,14 +1531,156 @@ function SitesPanel({
     }
   }
 
-  async function handleBatchToggleKeepalive(enabled: boolean) {
-    const ids = Array.from(selectedSiteIds);
-    if (ids.length === 0) return;
-    const success = await onBatchToggleKeepalive(ids, enabled);
+  function openBatchSettings() {
+    if (selectedSiteIds.size === 0) return;
+    const next: Record<string, SiteAutomationSettings> = {};
+    config.sites.forEach((site) => {
+      if (!selectedSiteIds.has(site.id)) return;
+      next[site.id] = {
+        auto_login: site.auto_login,
+        auto_keepalive: site.auto_keepalive,
+        auto_signin: site.auto_signin,
+        cookiecloud_upload: site.cookiecloud_upload,
+      };
+    });
+    setBatchSettings(next);
+    setBatchSettingsOpen(true);
+  }
+
+  function updateBatchSetting(
+    siteId: string,
+    key: AutomationSettingKey,
+    value: boolean,
+  ) {
+    setBatchSettings((current) => ({
+      ...current,
+      [siteId]: {
+        ...current[siteId],
+        [key]: value,
+      },
+    }));
+  }
+
+  function setAllBatchSettings(value: boolean) {
+    setBatchSettings((current) =>
+      Object.fromEntries(
+        Object.entries(current).map(([siteId, settings]) => [
+          siteId,
+          {
+            ...settings,
+            auto_login: value,
+            auto_keepalive: value,
+            auto_signin: value,
+            cookiecloud_upload: value,
+          },
+        ]),
+      ) as Record<string, SiteAutomationSettings>,
+    );
+  }
+
+  async function saveBatchSettings() {
+    const success = await onBatchUpdateAutomation(batchSettings);
     if (success) {
-      setSelectedSiteIds(new Set());
+      setBatchSettingsOpen(false);
     }
   }
+
+  async function reorderBatchSites(sourceSiteId: string, targetSiteId: string) {
+    if (sourceSiteId === targetSiteId) return;
+    const selectedIds = config.sites
+      .filter((site) => batchSettings[site.id])
+      .map((site) => site.id);
+    const sourceIndex = selectedIds.indexOf(sourceSiteId);
+    const targetIndex = selectedIds.indexOf(targetSiteId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
+    selectedIds.splice(sourceIndex, 1);
+    const insertIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex;
+    selectedIds.splice(insertIndex, 0, sourceSiteId);
+
+    const selectedSet = new Set(selectedIds);
+    let selectedIndex = 0;
+    const nextIds = config.sites.map((site) =>
+      selectedSet.has(site.id) ? selectedIds[selectedIndex++] : site.id,
+    );
+    await onReorderSites(nextIds);
+  }
+
+  function handleBatchPointerDown(event: ReactPointerEvent<HTMLElement>, siteId: string) {
+    if (busy) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    batchPointerPositionRef.current = {
+      clientX: event.clientX,
+      clientY: event.clientY,
+    };
+    batchDragOverSiteRef.current = siteId;
+    setBatchDraggingSiteId(siteId);
+    setBatchDragOverSiteId(siteId);
+  }
+
+  useEffect(() => {
+    if (!batchDraggingSiteId) return;
+
+    const updateDragTarget = (clientX: number, clientY: number) => {
+      const element = document.elementFromPoint(clientX, clientY);
+      const row = element?.closest<HTMLElement>("[data-batch-site-id]");
+      const targetSiteId = row?.dataset.batchSiteId;
+      if (targetSiteId && targetSiteId !== batchDraggingSiteId) {
+        batchDragOverSiteRef.current = targetSiteId;
+        setBatchDragOverSiteId(targetSiteId);
+      }
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      batchPointerPositionRef.current = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      };
+      updateDragTarget(event.clientX, event.clientY);
+    };
+
+    let autoScrollFrame = 0;
+    const autoScroll = () => {
+      const pointer = batchPointerPositionRef.current;
+      const list = batchSettingsListRef.current;
+      if (pointer && list) {
+        const rect = list.getBoundingClientRect();
+        const edge = 72;
+        let scrollDelta = 0;
+        if (pointer.clientY < rect.top + edge) {
+          scrollDelta = -Math.max(3, Math.round((rect.top + edge - pointer.clientY) / 8));
+        } else if (pointer.clientY > rect.bottom - edge) {
+          scrollDelta = Math.max(3, Math.round((pointer.clientY - (rect.bottom - edge)) / 8));
+        }
+        if (scrollDelta !== 0) list.scrollTop += scrollDelta;
+        updateDragTarget(pointer.clientX, pointer.clientY);
+      }
+      autoScrollFrame = window.requestAnimationFrame(autoScroll);
+    };
+    autoScrollFrame = window.requestAnimationFrame(autoScroll);
+
+    const handlePointerUp = () => {
+      const sourceSiteId = batchDraggingSiteId;
+      const targetSiteId = batchDragOverSiteRef.current;
+      batchDragOverSiteRef.current = null;
+      batchPointerPositionRef.current = null;
+      setBatchDraggingSiteId(null);
+      setBatchDragOverSiteId(null);
+      if (targetSiteId && targetSiteId !== sourceSiteId) {
+        reorderBatchSites(sourceSiteId, targetSiteId).catch(() => undefined);
+      }
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp, { once: true });
+    window.addEventListener("pointercancel", handlePointerUp, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+      window.cancelAnimationFrame(autoScrollFrame);
+    };
+  }, [batchDraggingSiteId, config.sites, batchSettings, onReorderSites]);
 
   async function removeSingleSite(site: Site) {
     const confirmed = await ask(`确定删除站点“${site.name}”吗？此操作无法撤销。`, {
@@ -1467,22 +1737,13 @@ function SitesPanel({
           </label>
           <span>已选 {selectedSiteIds.size} 项</span>
           <button
-            className="ghost batch-keepalive-enable"
+            className="ghost batch-settings-button"
             disabled={busy || selectedSiteIds.size === 0}
-            onClick={() => handleBatchToggleKeepalive(true)}
+            onClick={openBatchSettings}
             type="button"
           >
-            <Play size={16} />
-            <span>批量开启保活</span>
-          </button>
-          <button
-            className="ghost batch-keepalive-disable"
-            disabled={busy || selectedSiteIds.size === 0}
-            onClick={() => handleBatchToggleKeepalive(false)}
-            type="button"
-          >
-            <PauseCircle size={16} />
-            <span>批量关闭保活</span>
+            <Settings2 size={16} />
+            <span>批量操作</span>
           </button>
           <button
             className="danger-action batch-delete-btn"
@@ -1503,7 +1764,10 @@ function SitesPanel({
           config.sites.map((site) => {
             const editing = editingSiteId === site.id;
             return (
-              <article className={editing ? "site-row editing" : "site-row"} key={site.id}>
+              <article
+                className={`site-row${editing ? " editing" : ""}`}
+                key={site.id}
+              >
                 <input
                   aria-label={`选择 ${site.name}`}
                   checked={selectedSiteIds.has(site.id)}
@@ -1572,7 +1836,16 @@ function SitesPanel({
                       </button>
                     </div>
                     <label className="switch-row site-auto-login">
-                      <span>需要自动登录</span>
+                      <span className="label-with-help">
+                        自动登录
+                        <span
+                          className="help-tip"
+                          data-tooltip="执行保活时，只有未登录才会自动登录；需要已填写账号、密码、2FA 和 OCR 配置。"
+                          tabIndex={0}
+                        >
+                          <HelpCircle size={14} />
+                        </span>
+                      </span>
                       <input
                         checked={editingSite.auto_login}
                         onChange={(event) =>
@@ -1582,7 +1855,16 @@ function SitesPanel({
                       />
                     </label>
                     <label className="switch-row site-auto-keepalive">
-                      <span>开启自动保活</span>
+                      <span className="label-with-help">
+                        自动保活
+                        <span
+                          className="help-tip"
+                          data-tooltip="参加“立即保活”和定时保活；关闭后跳过本站，但仍可单独测试登录。"
+                          tabIndex={0}
+                        >
+                          <HelpCircle size={14} />
+                        </span>
+                      </span>
                       <input
                         checked={editingSite.auto_keepalive}
                         onChange={(event) =>
@@ -1593,13 +1875,45 @@ function SitesPanel({
                     </label>
                     <label
                       className="switch-row site-auto-signin"
-                      title="登录状态确认后查找站点签到入口；通用规则无法处理时会记录需要专用适配"
                     >
-                      <span>登录后自动签到</span>
+                      <span className="label-with-help">
+                        自动签到
+                        <span
+                          className="help-tip"
+                          data-tooltip="登录成功后自动查找签到入口；找不到或暂不适配时只记日志，不影响保活。"
+                          tabIndex={0}
+                        >
+                          <HelpCircle size={14} />
+                        </span>
+                      </span>
                       <input
                         checked={editingSite.auto_signin}
                         onChange={(event) =>
                           onEditChange({ ...editingSite, auto_signin: event.target.checked })
+                        }
+                        type="checkbox"
+                      />
+                    </label>
+                    <label
+                      className="switch-row site-cookiecloud-upload"
+                    >
+                      <span className="label-with-help">
+                        自动上传 Cookie
+                        <span
+                          className="help-tip"
+                          data-tooltip="本站是否纳入自动上传范围；还需开启设置页的自动上传总开关。关闭不影响手动同步和云端导入。"
+                          tabIndex={0}
+                        >
+                          <HelpCircle size={14} />
+                        </span>
+                      </span>
+                      <input
+                        checked={editingSite.cookiecloud_upload}
+                        onChange={(event) =>
+                          onEditChange({
+                            ...editingSite,
+                            cookiecloud_upload: event.target.checked,
+                          })
                         }
                         type="checkbox"
                       />
@@ -1731,6 +2045,116 @@ function SitesPanel({
           })
         )}
       </section>
+
+      {batchSettingsOpen ? (
+        <div
+          className="batch-settings-overlay"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setBatchSettingsOpen(false);
+          }}
+          role="presentation"
+        >
+          <div
+            aria-labelledby="batch-settings-title"
+            aria-modal="true"
+            className="batch-settings-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="batch-settings-heading">
+              <div>
+                <span className="eyebrow">批量设置</span>
+                <h2 id="batch-settings-title">批量操作站点</h2>
+                <p>已选择 {Object.keys(batchSettings).length} 个站点，可逐站调整四项自动化开关。</p>
+              </div>
+              <button
+                aria-label="关闭批量设置"
+                className="icon-button"
+                onClick={() => setBatchSettingsOpen(false)}
+                type="button"
+              >
+                <XCircle size={18} />
+              </button>
+            </div>
+
+            <div className="batch-settings-toolbar">
+              <span>快速设置所选站点</span>
+              <div className="batch-settings-quick-actions">
+                <button className="ghost" onClick={() => setAllBatchSettings(true)} type="button">
+                  <CheckCircle2 size={15} />
+                  <span>全部开启</span>
+                </button>
+                <button className="ghost" onClick={() => setAllBatchSettings(false)} type="button">
+                  <PauseCircle size={15} />
+                  <span>全部关闭</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="batch-settings-list" ref={batchSettingsListRef}>
+              {config.sites
+                .filter((site) => batchSettings[site.id])
+                .map((site) => {
+                  const settings = batchSettings[site.id];
+                  return (
+                    <div
+                      className={`batch-site-row${batchDraggingSiteId === site.id ? " dragging" : ""}${batchDragOverSiteId === site.id ? " drag-over" : ""}`}
+                      data-batch-site-id={site.id}
+                      key={site.id}
+                    >
+                      <div
+                        aria-label={`拖动调整 ${site.name} 顺序`}
+                        aria-disabled={busy}
+                        className="batch-site-drag-handle"
+                        onPointerDown={(event) => handleBatchPointerDown(event, site.id)}
+                        title="拖动调整站点顺序"
+                        role="button"
+                        tabIndex={0}
+                      >
+                        <GripVertical size={17} />
+                      </div>
+                      <div className="batch-site-meta">
+                        <strong>{site.name}</strong>
+                        <span>{site.url}</span>
+                      </div>
+                      <div className="batch-site-switches">
+                        {automationFields.map((field) => (
+                          <label
+                            className="batch-switch"
+                            key={field.key}
+                            title={field.description}
+                          >
+                            <span>{field.label}</span>
+                            <input
+                              checked={settings[field.key]}
+                              onChange={(event) =>
+                                updateBatchSetting(site.id, field.key, event.target.checked)
+                              }
+                              type="checkbox"
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+
+            <div className="batch-settings-footer">
+              <span>保存后立即应用到这些站点。</span>
+              <div className="row-actions">
+                <button className="ghost" onClick={() => setBatchSettingsOpen(false)} type="button">
+                  取消
+                </button>
+                <button disabled={busy} onClick={saveBatchSettings} type="button">
+                  <Save size={16} />
+                  <span>保存设置</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1738,11 +2162,13 @@ function SitesPanel({
 function SettingsPanel({
   browserDataClearBusy,
   busy,
+  cookieCloudClearBusy,
   cookieSyncBusy,
   gotifyTestBusy,
   draft,
   onChange,
   onClearBrowserData,
+  onClearCookieCloudData,
   onSave,
   onSyncCookieCloud,
   onTestGotify,
@@ -1752,11 +2178,13 @@ function SettingsPanel({
 }: {
   browserDataClearBusy: boolean;
   busy: boolean;
+  cookieCloudClearBusy: boolean;
   cookieSyncBusy: boolean;
   gotifyTestBusy: boolean;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
   onClearBrowserData: () => void;
+  onClearCookieCloudData: () => void;
   onSave: () => void;
   onSyncCookieCloud: () => void;
   onTestGotify: () => void;
@@ -1779,7 +2207,7 @@ function SettingsPanel({
                 <h2>应用更新</h2>
                 <span
                   className="help-tip"
-                  title="检查清单和下载安装包都会通过该地址转发；留空时直接连接 GitHub。"
+                  data-tooltip="检查清单和下载安装包都会通过该地址转发；留空时直接连接 GitHub。"
                   tabIndex={0}
                 >
                   <HelpCircle size={16} />
@@ -1794,7 +2222,7 @@ function SettingsPanel({
                 <span
                   className="help-tip"
                   aria-label="更新代理部署说明"
-                  title="默认留空，直接连接 GitHub。如需代理下载，请自行部署 https://github.com/Edwinzzzs2/vercel-proxy 项目，再将部署后的服务地址填入此处。"
+                  data-tooltip="默认留空，直接连接 GitHub。如需代理下载，请自行部署 https://github.com/Edwinzzzs2/vercel-proxy 项目，再将部署后的服务地址填入此处。"
                   tabIndex={0}
                 >
                   <HelpCircle size={14} />
@@ -1858,7 +2286,7 @@ function SettingsPanel({
               随机延迟上限（分钟）
               <span
                 className="help-tip"
-                title="计划触发后随机等待 0 到该数值分钟；填 0 表示按 Cron 准点执行。"
+                data-tooltip="计划触发后随机等待 0 到该数值分钟；填 0 表示按 Cron 准点执行。"
                 tabIndex={0}
               >
                 <HelpCircle size={14} />
@@ -1932,7 +2360,7 @@ function SettingsPanel({
               <h2>Cookie 同步</h2>
               <span
                 className="help-tip"
-                title="浏览器安装插件CookieCloud配合，本软件填写同一CookieCloud 地址、UUID、密码。先在插件保存同步域名关键词并点手动同步，再回到本软件点同步 Cookie；本软件会导入 Cookie 和 Local Storage。"
+                data-tooltip="填写与 CookieCloud 插件相同的服务地址、UUID 和密码；“同步 Cookie”会把云端 Cookie 与 Local Storage 导入专用 Chrome。"
                 tabIndex={0}
               >
                 <HelpCircle size={16} />
@@ -1941,8 +2369,20 @@ function SettingsPanel({
           </div>
           <div className="row-actions">
             <button
+              className="danger-action cookie-clear-action"
+              disabled={cookieCloudClearBusy || cookieSyncBusy || taskRunning}
+              onClick={onClearCookieCloudData}
+              title="永久清空当前配置的 CookieCloud 服务器上的 Cookie 和 Local Storage；不会删除本地浏览器数据"
+              type="button"
+            >
+              {cookieCloudClearBusy ? <RefreshCw size={16} /> : <Cookie size={16} />}
+              <span>
+                {taskRunning ? "任务执行中" : cookieCloudClearBusy ? "清空中" : "清空云端数据"}
+              </span>
+            </button>
+            <button
               className="ghost"
-              disabled={cookieSyncBusy || taskRunning}
+              disabled={cookieCloudClearBusy || cookieSyncBusy || taskRunning}
               onClick={onSyncCookieCloud}
               type="button"
             >
@@ -2001,7 +2441,16 @@ function SettingsPanel({
             </div>
           </label>
           <label className="switch-row">
-            <span>保活前自动同步</span>
+            <span className="label-with-help">
+              保活前自动同步
+              <span
+                className="help-tip"
+                data-tooltip="每次保活开始前，从 CookieCloud 下载 Cookie 和 Local Storage 到专用 Chrome；不会上传本地数据。"
+                tabIndex={0}
+              >
+                <HelpCircle size={14} />
+              </span>
+            </span>
             <input
               checked={draft.auto_sync_cookie}
               onChange={(event) => onChange({ ...draft, auto_sync_cookie: event.target.checked })}
@@ -2013,7 +2462,7 @@ function SettingsPanel({
               保活/测试后自动上传
               <span
                 className="help-tip"
-                title="保活任务完成后上传全部配置站点；单站点测试完成后只上传该站点的最新 Cookie。"
+                data-tooltip="自动上传总开关；开启后，保活任务和单站点测试只上传站点页中已开启“自动上传 Cookie”的站点。"
                 tabIndex={0}
               >
                 <HelpCircle size={14} />
@@ -2030,6 +2479,9 @@ function SettingsPanel({
               type="checkbox"
             />
           </label>
+          <p className="field-hint cookiecloud-upload-summary">
+            自动上传范围：已选择 {draft.sites.filter((site) => site.cookiecloud_upload).length} / {draft.sites.length} 个站点。可在“站点”页编辑每个站点的上传开关。
+          </p>
         </div>
         </section>
 
@@ -2041,7 +2493,7 @@ function SettingsPanel({
                 <h2>验证码识别</h2>
                 <span
                   className="help-tip"
-                  title="保存设置时会检查 /status；OCR 未加载时自动调用 /initialize。服务重启后，下次识别也会自动重新检查。"
+                  data-tooltip="当前兼容 Edwinzzzs2/ocrRead（基于 ddddocr）的 HTTP API，主要识别常见单行图片验证码中的中文、英文、数字及部分特殊字符，并支持颜色过滤。本应用会调用 /status、/initialize 和 /ocr；目标检测、滑块匹配等接口由服务提供但不会在本站点登录流程中自动调用。保存设置时会检查 /status；OCR 未加载时自动调用 /initialize。服务重启后，下次识别也会自动重新检查。"
                   tabIndex={0}
                 >
                   <HelpCircle size={16} />
@@ -2076,7 +2528,7 @@ function SettingsPanel({
                 最低剩余登录次数
                 <span
                   className="help-tip"
-                  title="站点显示的剩余尝试次数小于或等于该值时，停止自动填写、验证码识别和登录重试，避免 IP 被封锁。"
+                  data-tooltip="站点显示的剩余尝试次数小于或等于该值时，停止自动填写、验证码识别和登录重试，避免 IP 被封锁。"
                   tabIndex={0}
                 >
                   <HelpCircle size={15} />
@@ -2303,19 +2755,18 @@ function LogsPanel({
   onRefresh: () => void;
 }) {
   const [searchText, setSearchText] = useState("");
+  const [levelFilter, setLevelFilter] = useState<LogEntry["level"] | "ALL">("ALL");
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const filteredLogs = useMemo(() => {
     const query = searchText.trim().toLowerCase();
-    if (!query) {
-      return logs;
-    }
-
-    return logs.filter((entry) =>
-      `${formatLogTime(entry.timestamp)} ${entry.level} ${entry.message}`
+    return logs.filter((entry) => {
+      if (levelFilter !== "ALL" && entry.level !== levelFilter) return false;
+      if (!query) return true;
+      return `${formatLogTime(entry.timestamp)} ${entry.level} ${entry.message}`
         .toLowerCase()
-        .includes(query),
-    );
-  }, [logs, searchText]);
+        .includes(query);
+    });
+  }, [levelFilter, logs, searchText]);
 
   function handleCopyLog(entry: LogEntry, key: string) {
     copyLogEntry(entry);
@@ -2338,6 +2789,21 @@ function LogsPanel({
               placeholder="搜索日志"
               value={searchText}
             />
+          </label>
+          <label className="log-level-filter">
+            <span>级别</span>
+            <select
+              aria-label="按日志级别筛选"
+              onChange={(event) =>
+                setLevelFilter(event.target.value as LogEntry["level"] | "ALL")
+              }
+              value={levelFilter}
+            >
+              <option value="ALL">全部</option>
+              <option value="SUCCESS">成功 SUCCESS</option>
+              <option value="INFO">信息 INFO</option>
+              <option value="ERROR">错误 ERROR</option>
+            </select>
           </label>
           <button className="ghost" onClick={onRefresh} type="button">
             <RefreshCw size={16} />

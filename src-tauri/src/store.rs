@@ -25,7 +25,7 @@ pub struct Site {
     pub password: String,
     #[serde(default)]
     pub totp_secret: String,
-    #[serde(default)]
+    #[serde(default = "default_auto_login")]
     pub auto_login: bool,
     #[serde(default)]
     pub login_attempts_remaining: Option<u32>,
@@ -37,6 +37,8 @@ pub struct Site {
     pub auto_keepalive: bool,
     #[serde(default)]
     pub auto_signin: bool,
+    #[serde(default = "default_cookiecloud_upload")]
+    pub cookiecloud_upload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,14 @@ fn default_auto_keepalive() -> bool {
     true
 }
 
+fn default_auto_login() -> bool {
+    true
+}
+
+fn default_cookiecloud_upload() -> bool {
+    true
+}
+
 /// 已确认的 NexusPHP 站点登录失败上限。站点可能调整策略，下一次读取到登录页时会以实际值纠正。
 pub fn known_login_attempt_limit(site_url: &str) -> Option<u32> {
     let normalized = site_url.trim().to_ascii_lowercase();
@@ -195,7 +205,7 @@ pub fn observe_login_attempts(site: &mut Site, remaining: Option<u32>) {
 }
 
 /// 保存一次登录流程的结果。失败时只采用页面返回的实际剩余次数；
-/// 确认进入登录状态且次数尚未恢复时，才启动 24 小时恢复计时。
+/// 确认处于登录状态后启动 24 小时显示保留计时。
 pub fn record_login_outcome(
     site: &mut Site,
     remaining: Option<u32>,
@@ -203,20 +213,13 @@ pub fn record_login_outcome(
 ) -> Option<u32> {
     observe_login_attempts(site, remaining);
     if logged_in {
-        if let Some(limit) = known_login_attempt_limit(&site.url) {
-            if site
-                .login_attempts_remaining
-                .map_or(true, |remaining| remaining < limit)
-            {
-                site.login_success_recorded_at = Some(Local::now().timestamp());
-            }
-        }
+        site.login_success_recorded_at = Some(Local::now().timestamp());
     }
     site.login_attempts_recorded_at = None;
     site.login_attempts_remaining
 }
 
-/// 仅在确认成功登录满 24 小时后，将仍未恢复的次数恢复到站点已知上限。
+/// 仅在确认成功登录满 24 小时后，清除页面上显示的剩余次数。
 pub fn refresh_login_attempt_resets(config: &mut AppConfig) -> bool {
     let now = Local::now().timestamp();
     let mut changed = false;
@@ -227,21 +230,11 @@ pub fn refresh_login_attempt_resets(config: &mut AppConfig) -> bool {
         let Some(success_at) = site.login_success_recorded_at else {
             continue;
         };
-        let Some(limit) = known_login_attempt_limit(&site.url) else {
-            site.login_success_recorded_at = None;
-            changed = true;
-            continue;
-        };
         if now.saturating_sub(success_at) < LOGIN_ATTEMPT_RESET_SECONDS {
             continue;
         }
 
-        if site
-            .login_attempts_remaining
-            .map_or(true, |remaining| remaining < limit)
-        {
-            site.login_attempts_remaining = Some(limit);
-        }
+        site.login_attempts_remaining = None;
         site.login_success_recorded_at = None;
         changed = true;
     }

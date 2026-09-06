@@ -59,10 +59,20 @@ struct ImportedSite {
     password: String,
     #[serde(default)]
     totp_secret: String,
-    #[serde(default)]
+    #[serde(default = "default_auto_login")]
     auto_login: bool,
     #[serde(default)]
     auto_signin: bool,
+    #[serde(default = "default_cookiecloud_upload")]
+    cookiecloud_upload: bool,
+}
+
+fn default_cookiecloud_upload() -> bool {
+    true
+}
+
+fn default_auto_login() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +173,7 @@ pub async fn add_site(
     totp_secret: String,
     auto_login: bool,
     auto_signin: bool,
+    cookiecloud_upload: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     let site = store::Site {
@@ -178,6 +189,7 @@ pub async fn add_site(
         login_success_recorded_at: None,
         auto_keepalive: true,
         auto_signin,
+        cookiecloud_upload,
     };
     config.sites.push(site);
     store::save_config(&state.app_handle, &config);
@@ -233,6 +245,7 @@ pub async fn import_sites_from_json(
             login_success_recorded_at: None,
             auto_keepalive: true,
             auto_signin: site.auto_signin,
+            cookiecloud_upload: site.cookiecloud_upload,
         });
         imported += 1;
     }
@@ -286,6 +299,7 @@ pub async fn update_site(
     auto_login: bool,
     auto_keepalive: bool,
     auto_signin: bool,
+    cookiecloud_upload: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
     if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
@@ -297,6 +311,7 @@ pub async fn update_site(
         site.auto_login = auto_login;
         site.auto_keepalive = auto_keepalive;
         site.auto_signin = auto_signin;
+        site.cookiecloud_upload = cookiecloud_upload;
     }
     store::save_config(&state.app_handle, &config);
     let next = config.clone();
@@ -482,7 +497,7 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         }
     }
 
-    if config.auto_sync_cookie_after_keepalive {
+    if config.auto_sync_cookie_after_keepalive && site.cookiecloud_upload {
         push_log(
             &state.logs,
             LogEntry::info(format!(
@@ -1177,6 +1192,25 @@ pub async fn clear_browser_data(state: State<'_, AppState>) -> Result<(), String
     };
 
     push_log(&state.logs, LogEntry::success(message)).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_cookiecloud_data(
+    state: State<'_, AppState>,
+    config: crate::store::CookieCloudConfig,
+) -> Result<(), String> {
+    if *state.task_running.lock().await {
+        return Err("保活任务执行中，请等待结束后再清空 CookieCloud 数据".to_string());
+    }
+
+    cookiecloud::clear_cloud_data(&config).await?;
+
+    push_log(
+        &state.logs,
+        LogEntry::success("已清空 CookieCloud 服务器上的 Cookie 和 Local Storage 数据"),
+    )
+    .await;
     Ok(())
 }
 

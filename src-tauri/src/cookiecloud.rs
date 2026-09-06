@@ -78,6 +78,48 @@ pub async fn upload_current_cookies(
     Ok(cookie_count)
 }
 
+pub async fn clear_cloud_data(config: &CookieCloudConfig) -> Result<(), String> {
+    let server_url = config.server_url.trim();
+    let uuid = config.uuid.trim();
+    let password = config.password.as_str();
+    if server_url.is_empty() || uuid.is_empty() || password.is_empty() {
+        return Err("请先填写 CookieCloud 地址、UUID 和密码".to_string());
+    }
+
+    let empty_payload = serde_json::json!({
+        "cookie_data": {},
+        "local_storage_data": {},
+        "update_time": chrono::Local::now().to_rfc3339()
+    });
+    let plaintext = serde_json::to_string(&empty_payload).map_err(|err| err.to_string())?;
+    let encrypted = encrypt_cookiecloud_payload(uuid, password, plaintext.as_bytes())?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| err.to_string())?
+        .post(cookiecloud_update_endpoint(server_url))
+        .json(&serde_json::json!({
+            "uuid": uuid,
+            "encrypted": encrypted,
+            "crypto_type": "legacy"
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("CookieCloud 清空失败：{}", err.without_url()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("CookieCloud 清空失败：HTTP {}", status));
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("CookieCloud 清空响应解析失败：{}", err.without_url()))?;
+    if payload.get("action").and_then(Value::as_str) != Some("done") {
+        return Err("CookieCloud 服务端未确认清空成功".to_string());
+    }
+    Ok(())
+}
+
 async fn fetch_sync_payload_async(config: &CookieCloudConfig) -> Result<Value, String> {
     let server_url = config.server_url.trim();
     let uuid = config.uuid.trim();
