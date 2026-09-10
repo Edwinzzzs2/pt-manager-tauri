@@ -53,7 +53,7 @@ PT Manager 是一个面向 PT 站点的桌面保活工具。应用通过 Chrome 
 - 保活前自动同步 Cookie 和 Local Storage。
 - 同步完成后刷新已打开的目标站点，使新登录态立即生效。
 - 可在同步完成 15 秒后自动关闭为写入 Local Storage 而打开的标签页。
-- 保活结束后把专用 Chrome 中最新的站点 Cookie 加密上传回 CookieCloud。
+- 保活结束后把专用 Chrome 中最新的站点 Cookie 和 Local Storage 加密上传回 CookieCloud。
 - 只处理与已配置站点域名严格匹配的数据，不会把 CookieCloud 中的全部浏览器数据写入专用 Chrome。
 
 推荐操作顺序：

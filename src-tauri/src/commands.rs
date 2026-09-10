@@ -507,28 +507,46 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         )
         .await;
         match cdp.get_all_cookies().await {
-            Ok(cookies) => match cookiecloud::upload_current_cookies(
-                &config.cookiecloud,
-                std::slice::from_ref(&site),
-                cookies,
-            )
-            .await
-            {
-                Ok(count) => {
-                    let upload_message = format!(
-                        "{} CookieCloud 上传完成：已上传 {} 条 Cookie",
-                        site.name, count
-                    );
-                    push_log(&state.logs, LogEntry::success(upload_message)).await;
+            Ok(cookies) => {
+                let site_urls = vec![site.url.clone()];
+                let local_storages = match cdp.get_local_storage_for_urls(&site_urls).await {
+                    Ok(storages) => storages,
+                    Err(err) => {
+                        push_log(
+                            &state.logs,
+                            LogEntry::error(format!(
+                                "{} CookieCloud 上传失败：读取 Local Storage 失败：{}",
+                                site.name, err
+                            )),
+                        )
+                        .await;
+                        Vec::new()
+                    }
+                };
+                match cookiecloud::upload_current_data(
+                    &config.cookiecloud,
+                    std::slice::from_ref(&site),
+                    cookies,
+                    local_storages,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        let upload_message = format!(
+                            "{} CookieCloud 上传完成：已上传 {} 条 Cookie / {} 条 Local Storage",
+                            site.name, result.cookie_count, result.local_storage_count
+                        );
+                        push_log(&state.logs, LogEntry::success(upload_message)).await;
+                    }
+                    Err(err) => {
+                        push_log(
+                            &state.logs,
+                            LogEntry::error(format!("{} CookieCloud 上传失败：{}", site.name, err)),
+                        )
+                        .await;
+                    }
                 }
-                Err(err) => {
-                    push_log(
-                        &state.logs,
-                        LogEntry::error(format!("{} CookieCloud 上传失败：{}", site.name, err)),
-                    )
-                    .await;
-                }
-            },
+            }
             Err(err) => {
                 push_log(
                     &state.logs,

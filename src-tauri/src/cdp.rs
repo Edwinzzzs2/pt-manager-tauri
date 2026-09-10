@@ -329,6 +329,59 @@ impl CdpClient {
             .unwrap_or_default())
     }
 
+    /// 读取已打开目标站点的 Local Storage，用于把 M-Team 等无登录 Cookie 的站点同步到 CookieCloud。
+    pub async fn get_local_storage_for_urls(
+        &self,
+        site_urls: &[String],
+    ) -> Result<Vec<CdpLocalStorageParam>, String> {
+        let mut storages = Vec::new();
+        for origin in unique_origins(site_urls) {
+            let Some(host) = host_from_url(&origin) else {
+                continue;
+            };
+            let Some(tab_id) = self.find_tab_for_url(&origin).await else {
+                continue;
+            };
+            let Some(websocket_url) = self.websocket_url_for_tab(&tab_id)? else {
+                continue;
+            };
+            let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
+            let response = websocket.call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": "Object.entries(localStorage)",
+                    "returnByValue": true
+                }),
+            )?;
+            let mut items = response
+                .get("result")
+                .and_then(|value| value.get("result"))
+                .and_then(|value| value.get("value"))
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let pair = entry.as_array()?;
+                    Some(CdpLocalStorageEntry {
+                        name: pair.first()?.as_str()?.to_string(),
+                        value: pair.get(1)?.as_str()?.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                continue;
+            }
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            items.dedup_by(|a, b| a.name == b.name);
+            storages.push(CdpLocalStorageParam {
+                host,
+                origin,
+                items,
+            });
+        }
+        Ok(storages)
+    }
+
     /// 写入 Local Storage，并返回本次为写入数据而新打开的标签页 ID。
     /// 调用方可据此延迟关闭标签页，不影响用户原本已经打开的页面。
     pub async fn set_local_storage_with_opened_tabs(

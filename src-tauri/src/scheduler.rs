@@ -418,7 +418,11 @@ async fn sync_cookiecloud_after_keepalive(
         .cloned()
         .collect::<Vec<_>>();
     if upload_sites.is_empty() {
-        push_log(logs, LogEntry::info("未选择需要上传 CookieCloud 的站点，跳过上传")).await;
+        push_log(
+            logs,
+            LogEntry::info("未选择需要上传 CookieCloud 的站点，跳过上传"),
+        )
+        .await;
         return;
     }
 
@@ -438,13 +442,38 @@ async fn sync_cookiecloud_after_keepalive(
             return;
         }
     };
-    match cookiecloud::upload_current_cookies(&config.cookiecloud, &upload_sites, cookies).await {
-        Ok(count) => {
+    let site_urls = upload_sites
+        .iter()
+        .map(|site| site.url.clone())
+        .collect::<Vec<_>>();
+    let local_storages = match cdp.get_local_storage_for_urls(&site_urls).await {
+        Ok(storages) => storages,
+        Err(err) => {
+            push_log(
+                logs,
+                LogEntry::error(format!(
+                    "保活后 CookieCloud 同步读取 Local Storage 失败：{}，继续上传 Cookie",
+                    err
+                )),
+            )
+            .await;
+            Vec::new()
+        }
+    };
+    match cookiecloud::upload_current_data(
+        &config.cookiecloud,
+        &upload_sites,
+        cookies,
+        local_storages,
+    )
+    .await
+    {
+        Ok(result) => {
             push_log(
                 logs,
                 LogEntry::success(format!(
-                    "保活后 CookieCloud 同步完成：已上传 {} 条最新 Cookie",
-                    count
+                    "保活后 CookieCloud 同步完成：已上传 {} 条 Cookie / {} 条 Local Storage",
+                    result.cookie_count, result.local_storage_count
                 )),
             )
             .await;

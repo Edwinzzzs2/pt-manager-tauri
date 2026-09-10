@@ -40,19 +40,32 @@ pub struct CookieCloudSyncData {
     pub local_storages: Vec<CdpLocalStorageParam>,
 }
 
-pub async fn upload_current_cookies(
+pub struct CookieCloudUploadResult {
+    pub cookie_count: usize,
+    pub local_storage_count: usize,
+}
+
+pub async fn upload_current_data(
     config: &CookieCloudConfig,
     sites: &[Site],
     browser_cookies: Vec<Value>,
-) -> Result<usize, String> {
+    local_storages: Vec<CdpLocalStorageParam>,
+) -> Result<CookieCloudUploadResult, String> {
     let current_payload = fetch_sync_payload_async(config).await?;
     let config = config.clone();
     let sites = sites.to_vec();
-    let (endpoint, request_body, cookie_count) = tauri::async_runtime::spawn_blocking(move || {
-        prepare_upload_request(&config, &sites, browser_cookies, current_payload)
-    })
-    .await
-    .map_err(|err| err.to_string())??;
+    let (endpoint, request_body, cookie_count, local_storage_count) =
+        tauri::async_runtime::spawn_blocking(move || {
+            prepare_upload_request(
+                &config,
+                &sites,
+                browser_cookies,
+                local_storages,
+                current_payload,
+            )
+        })
+        .await
+        .map_err(|err| err.to_string())??;
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -75,7 +88,10 @@ pub async fn upload_current_cookies(
         return Err("CookieCloud 服务端未确认上传成功".to_string());
     }
 
-    Ok(cookie_count)
+    Ok(CookieCloudUploadResult {
+        cookie_count,
+        local_storage_count,
+    })
 }
 
 pub async fn clear_cloud_data(config: &CookieCloudConfig) -> Result<(), String> {
@@ -190,8 +206,9 @@ fn prepare_upload_request(
     config: &CookieCloudConfig,
     sites: &[Site],
     browser_cookies: Vec<Value>,
+    local_storages: Vec<CdpLocalStorageParam>,
     mut current_payload: Value,
-) -> Result<(String, Value, usize), String> {
+) -> Result<(String, Value, usize, usize), String> {
     let uuid = config.uuid.trim();
     let password = config.password.as_str();
     if config.server_url.trim().is_empty() || uuid.is_empty() || password.is_empty() {
@@ -285,8 +302,41 @@ fn prepare_upload_request(
         uploaded_count += 1;
     }
 
-    if uploaded_count == 0 {
-        return Err("专用 Chrome 中没有匹配已配置站点的 Cookie".to_string());
+    let local_storage_data = payload
+        .entry("local_storage_data".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "CookieCloud local_storage_data 格式无效".to_string())?;
+    local_storage_data.retain(|domain, _| {
+        let host = match_host(domain);
+        !target_hosts
+            .iter()
+            .any(|target| cookie_host_matches_site(&host, target))
+    });
+
+    let mut local_storage_count = 0usize;
+    for storage in local_storages {
+        let host = match_host(&storage.host);
+        if !target_hosts
+            .iter()
+            .any(|target| cookie_host_matches_site(&host, target))
+        {
+            continue;
+        }
+        let items = storage
+            .items
+            .into_iter()
+            .map(|item| (item.name, Value::String(item.value)))
+            .collect::<serde_json::Map<_, _>>();
+        if items.is_empty() {
+            continue;
+        }
+        local_storage_count += items.len();
+        local_storage_data.insert(storage.host, Value::Object(items));
+    }
+
+    if uploaded_count == 0 && local_storage_count == 0 {
+        return Err("专用 Chrome 中没有匹配已配置站点的 Cookie 或 Local Storage".to_string());
     }
     payload.insert(
         "update_time".to_string(),
@@ -302,6 +352,7 @@ fn prepare_upload_request(
             "crypto_type": "legacy"
         }),
         uploaded_count,
+        local_storage_count,
     ))
 }
 
