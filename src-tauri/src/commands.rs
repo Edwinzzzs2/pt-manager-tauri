@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
+#[cfg(not(debug_assertions))]
 use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::Mutex;
 #[cfg(all(windows, debug_assertions))]
@@ -1256,7 +1257,7 @@ async fn push_log(logs: &Arc<Mutex<Vec<LogEntry>>>, entry: LogEntry) {
     store::push_log(logs, entry).await;
 }
 
-pub fn apply_auto_launch(app_handle: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+pub fn apply_auto_launch(_app_handle: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     // `yarn dev` runs target/debug/pt-manager.exe. Never register that temporary
     // executable as a Windows startup app, and remove a stale entry only when it
     // points to this exact debug executable so an installed release is untouched.
@@ -1272,7 +1273,7 @@ pub fn apply_auto_launch(app_handle: &tauri::AppHandle, enabled: bool) -> Result
 
     #[cfg(not(debug_assertions))]
     {
-        let manager = app_handle.autolaunch();
+        let manager = _app_handle.autolaunch();
         if manager.is_enabled().map_err(|err| err.to_string()).ok() == Some(enabled) {
             return Ok(());
         }
@@ -1325,6 +1326,7 @@ fn remove_current_debug_auto_launch() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(debug_assertions))]
 fn is_auto_launch_entry_missing(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("os error 2")
