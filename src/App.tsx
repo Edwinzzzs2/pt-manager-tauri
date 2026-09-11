@@ -183,7 +183,7 @@ const defaultConfig: AppConfig = {
   cdp_port: 9222,
   visit_duration: 30,
   random_delay: true,
-  auto_launch: true,
+  auto_launch: false,
   log_retention: 500,
   auto_sync_cookie: false,
   auto_sync_cookie_after_keepalive: false,

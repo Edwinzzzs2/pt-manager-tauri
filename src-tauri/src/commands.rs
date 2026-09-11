@@ -19,6 +19,10 @@ use std::time::Duration;
 use tauri::State;
 use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::Mutex;
+#[cfg(all(windows, debug_assertions))]
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+#[cfg(all(windows, debug_assertions))]
+use winreg::RegKey;
 
 /// 应用全局状态
 pub struct AppState {
@@ -1253,26 +1257,72 @@ async fn push_log(logs: &Arc<Mutex<Vec<LogEntry>>>, entry: LogEntry) {
 }
 
 pub fn apply_auto_launch(app_handle: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    let manager = app_handle.autolaunch();
-    if manager.is_enabled().map_err(|err| err.to_string()).ok() == Some(enabled) {
+    // `yarn dev` runs target/debug/pt-manager.exe. Never register that temporary
+    // executable as a Windows startup app, and remove a stale entry only when it
+    // points to this exact debug executable so an installed release is untouched.
+    #[cfg(debug_assertions)]
+    {
+        let _ = enabled;
+
+        #[cfg(windows)]
+        remove_current_debug_auto_launch()?;
+
         return Ok(());
     }
 
-    if enabled {
-        manager.enable().map_err(|err| err.to_string())
-    } else {
-        match manager.disable() {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                let message = err.to_string();
-                if is_auto_launch_entry_missing(&message) {
-                    Ok(())
-                } else {
-                    Err(message)
+    #[cfg(not(debug_assertions))]
+    {
+        let manager = app_handle.autolaunch();
+        if manager.is_enabled().map_err(|err| err.to_string()).ok() == Some(enabled) {
+            return Ok(());
+        }
+
+        if enabled {
+            manager.enable().map_err(|err| err.to_string())
+        } else {
+            match manager.disable() {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    let message = err.to_string();
+                    if is_auto_launch_entry_missing(&message) {
+                        Ok(())
+                    } else {
+                        Err(message)
+                    }
                 }
             }
         }
     }
+}
+
+#[cfg(all(windows, debug_assertions))]
+fn remove_current_debug_auto_launch() -> Result<(), String> {
+    const RUN_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let run_key = match hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_SET_VALUE) {
+        Ok(key) => key,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    let current_exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let current_exe = current_exe.to_string_lossy().to_string();
+
+    for entry in run_key.enum_values() {
+        let (name, _) = entry.map_err(|err| err.to_string())?;
+        let Ok(registered_command) = run_key.get_value::<String, _>(&name) else {
+            continue;
+        };
+        if registered_command
+            .trim()
+            .trim_matches('"')
+            .eq_ignore_ascii_case(&current_exe)
+        {
+            run_key.delete_value(name).map_err(|err| err.to_string())?;
+        }
+    }
+
+    Ok(())
 }
 
 fn is_auto_launch_entry_missing(message: &str) -> bool {

@@ -131,7 +131,7 @@ impl Default for AppConfig {
 }
 
 fn default_auto_launch() -> bool {
-    true
+    false
 }
 
 fn default_ocr_server_url() -> String {
