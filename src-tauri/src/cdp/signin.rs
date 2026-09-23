@@ -80,6 +80,7 @@ struct PageState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigninAdapter {
+    Dian115,
     Audiences,
     Hdfans,
     PterClub,
@@ -112,7 +113,9 @@ struct ApiSigninState {
 
 impl SigninAdapter {
     fn from_url(url: &str) -> Self {
-        if url.to_ascii_lowercase().contains("audiences.me") {
+        if host_from_url(url).as_deref() == Some("m.dian115.com") {
+            Self::Dian115
+        } else if url.to_ascii_lowercase().contains("audiences.me") {
             Self::Audiences
         } else if url.to_ascii_lowercase().contains("hdfans.org") {
             Self::Hdfans
@@ -133,6 +136,7 @@ impl SigninAdapter {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Dian115 => "癫影站点适配",
             Self::Audiences => "观众站点适配",
             Self::Hdfans => "红豆饭站点适配",
             Self::PterClub => "PTerClub 站点适配",
@@ -156,6 +160,9 @@ impl SigninAdapter {
     }
 
     fn fallback_url(self, site_url: &str) -> String {
+        if self == Self::Dian115 {
+            return "https://m.dian115.com/me/signin".to_string();
+        }
         let cleaned = site_url
             .trim()
             .split(['?', '#'])
@@ -273,7 +280,12 @@ impl CdpClient {
 
         let initial = inspect_page(&mut websocket)?;
         if initial.success {
-            return Ok(result_from_state(SigninStatus::Success, initial));
+            let status = if adapter == SigninAdapter::Dian115 {
+                SigninStatus::AlreadySigned
+            } else {
+                SigninStatus::Success
+            };
+            return Ok(result_from_state(status, initial));
         }
         // Rousi 首页只显示连续天数，进入经济页后才能同时读取新版累计签到统计。
         if initial.already_signed && adapter != SigninAdapter::Rousi {
@@ -283,7 +295,7 @@ impl CdpClient {
 
         let target_url = match initial.entry_url.filter(|url| same_site(url, site_url)) {
             Some(url) => url,
-            None if initial.nexusphp_like || adapter == SigninAdapter::Rousi => {
+            None if initial.nexusphp_like || matches!(adapter, SigninAdapter::Rousi | SigninAdapter::Dian115) => {
                 adapter.fallback_url(site_url)
             }
             None => {
@@ -590,7 +602,8 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         const selectedNavigation = el.getAttribute('aria-pressed') === 'true'
             || el.getAttribute('aria-selected') === 'true'
             || el.dataset?.state === 'active';
-        return exactActionPattern.test(text)
+        return (exactActionPattern.test(text)
+            || (location.hostname === 'm.dian115.com' && text === '普通签到'))
             && !/(登录|登入|login)/i.test(text)
             && !selectedNavigation;
     }).sort((left, right) => Number(/^立即/i.test(right.text)) - Number(/^立即/i.test(left.text)));
@@ -637,19 +650,30 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         || Boolean(document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], .cf-turnstile, .g-recaptcha'));
     const challengeReady = !hasChallenge || clean(challengeResponse?.value).length > 10;
     const hasLoginForm = Boolean(document.querySelector('input[type="password"]'))
-        && Boolean(document.querySelector('form[action*="login" i], input[name="username" i], input[name="uid" i]'));
+        && (Boolean(document.querySelector('form[action*="login" i], input[name="username" i], input[name="uid" i]'))
+            || (location.hostname === 'm.dian115.com' && location.pathname === '/login'
+                && Boolean(document.querySelector('input[type="email"]'))));
     const nexusphpLike = Boolean(document.querySelector(
         'a[href*="torrents.php"], a[href*="userdetails.php"], a[href*="attendance.php"], a[href*="logout.php"]'
     ));
     const hasInteractiveQuestion = Boolean(document.querySelector('input[type="radio"], select[name*="answer" i], input[name*="answer" i]'));
     const completedAttendancePattern = /第\s*\d+\s*次(?:签到|簽到).{0,80}(?:已)?(?:连续|連續)(?:签到|簽到)\s*\d+\s*(?:天|日)/i;
-    const success = successPattern.test(bodyText) || completedAttendancePattern.test(bodyText);
+    const dian115Result = location.hostname === 'm.dian115.com'
+        ? Array.from(document.querySelectorAll('div.mt-6.rounded.p-4.text-left'))
+            .map((el) => clean(el.textContent))
+            .find((text) => /^(普通签到|运气签到).{0,15}[+\-]\d+\s*积分\s*余额\s*\d+/i.test(text)) || ''
+        : '';
+    const dian115Award = dian115Result.match(/([+\-]\d+)\s*积分/);
+    const success = location.hostname === 'm.dian115.com'
+        ? Boolean(dian115Result)
+        : successPattern.test(bodyText) || completedAttendancePattern.test(bodyText);
     const alreadySigned = !success && signedPattern.test(bodyText);
     const explicitFailure = failurePattern.test(bodyText);
     const resultMessage = Array.from(document.querySelectorAll('h1, h2, h3, .message, .alert, .attendance-card__title'))
         .map((el) => clean(el.textContent))
         .find((text) => text && text.length < 120
-            && (successPattern.test(text) || signedPattern.test(text) || failurePattern.test(text))) || '';
+            && (successPattern.test(text) || signedPattern.test(text) || failurePattern.test(text)))
+        || (dian115Result ? '签到成功' : '');
 
     return {
         ready: document.readyState === 'interactive' || document.readyState === 'complete',
@@ -668,7 +692,8 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         actionKey,
         explicitFailure,
         message: resultMessage,
-        reward: textReward() || statValue(/本次.{0,8}(获得|獲得|奖励|獎勵|魔力|爆米花)/i),
+        reward: (dian115Award ? `${dian115Award[1]} 积分` : null)
+            || textReward() || statValue(/本次.{0,8}(获得|獲得|奖励|獎勵|魔力|爆米花)/i),
         totalDays: textNumber(/第\s*(\d+)\s*次(?:签到|簽到)/i)
             ?? textNumber(/(?:累计|累計)\s*(\d+)\s*(?:天|日|次)/i)
             ?? numberStat(/(累计|累計).{0,8}(签到|簽到).{0,4}(次数|次數)?/i),
@@ -828,6 +853,13 @@ mod tests {
             adapter.fallback_url("https://rousi.pro/"),
             "https://rousi.pro/account/economy"
         );
+    }
+
+    #[test]
+    fn selects_dian115_page_adapter() {
+        let adapter = SigninAdapter::from_url("https://m.dian115.com/");
+        assert_eq!(adapter, SigninAdapter::Dian115);
+        assert_eq!(adapter.fallback_url("https://m.dian115.com/"), "https://m.dian115.com/me/signin");
     }
 
     #[test]

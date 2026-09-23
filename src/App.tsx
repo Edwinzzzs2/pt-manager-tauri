@@ -2660,11 +2660,11 @@ function SettingsPanel({
             <dl className="site-support-list">
               <div>
                 <dt>专门适配的自动登录</dt>
-                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing（pting.club）、SixCloud（666clouds.com）。</dd>
+                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing（pting.club）、SixCloud（666clouds.com）、癫影（m.dian115.com）。</dd>
               </div>
               <div>
                 <dt>专门适配的自动签到</dt>
-                <dd>Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing（pting.club）。</dd>
+                <dd>Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing（pting.club）、癫影（m.dian115.com，普通签到）。</dd>
               </div>
               <div>
                 <dt>通用站点支持</dt>

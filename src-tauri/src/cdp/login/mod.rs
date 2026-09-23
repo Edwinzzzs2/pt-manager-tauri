@@ -1,4 +1,5 @@
 mod common;
+mod dian115;
 mod hdkylin;
 mod mteam;
 mod nexusphp;
@@ -10,6 +11,7 @@ use crate::cdp::{CdpClient, CdpProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteAdapter {
+    Dian115,
     MTeam,
     Hdkylin,
     Pting,
@@ -35,7 +37,9 @@ impl SiteAdapter {
             .next()
             .unwrap_or_default()
             .trim_start_matches("www.");
-        if host == "666clouds.com" {
+        if host == "m.dian115.com" {
+            Self::Dian115
+        } else if host == "666clouds.com" {
             Self::SixCloud
         } else if normalized.contains("kp.m-team.cc") {
             Self::MTeam
@@ -84,6 +88,19 @@ impl CdpClient {
         progress: Option<&CdpProgress>,
     ) -> Result<LoginOutcome, LoginError> {
         match SiteAdapter::from_url(request.site_url) {
+            SiteAdapter::Dian115 => self
+                .login_dian115(
+                    tab_id,
+                    request.username,
+                    request.password,
+                    progress,
+                )
+                .await
+                .map(|logged_in| LoginOutcome {
+                    state: if logged_in { LoginState::LoggedIn } else { LoginState::AlreadyLoggedIn },
+                    remaining_attempts: None,
+                })
+                .map_err(|message| LoginError { message, remaining_attempts: None }),
             SiteAdapter::MTeam => {
                 // M-Team 旧流程会在进入适配器前校验已配置的密钥，这里保持相同行为。
                 let totp_code = request
@@ -210,6 +227,8 @@ mod tests {
 
     #[test]
     fn selects_special_adapters_before_nexusphp_fallback() {
+        assert_eq!(SiteAdapter::from_url("https://m.dian115.com/me/signin"), SiteAdapter::Dian115);
+        assert_eq!(SiteAdapter::from_url("https://m.dian115.com.evil.example/"), SiteAdapter::NexusPhp);
         assert_eq!(
             SiteAdapter::from_url("https://kp.m-team.cc/login"),
             SiteAdapter::MTeam
