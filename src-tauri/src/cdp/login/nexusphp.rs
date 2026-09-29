@@ -8,6 +8,8 @@ use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
 use std::time::Duration;
 
+const TOTP_INPUT_SELECTOR: &str = "input[name=\"two_factor\"], input[name=\"twofactor\"], input[name=\"two_step_code\"], input[name=\"otp\"], input[name=\"two_factor_code\"], input[name=\"2fa_secret\"], input[name=\"2fa\"], input[autocomplete=\"one-time-code\"]";
+
 impl CdpClient {
     /// 通用 NexusPHP 站点的登录逻辑（包含可选的 TOTP、Cloudflare 绕过、以及自动 OCR 验证码识别）
     pub(super) async fn login_nexusphp(
@@ -130,25 +132,6 @@ impl CdpClient {
                     last_remaining_attempts,
                 ));
             }
-            if let Some(secret) = totp_secret {
-                if login_state.has_two_factor {
-                    let code =
-                        auth::current_totp(secret).map_err(|err| (err, last_remaining_attempts))?;
-                    human_delay(450, 950).await;
-                    if !type_runtime_input(
-                        &mut websocket,
-                        "input[name=\"two_factor\"], input[name=\"twofactor\"], input[name=\"two_step_code\"], input[name=\"otp\"], input[name=\"two_factor_code\"], input[name=\"2fa_secret\"], input[name=\"2fa\"], input[autocomplete=\"one-time-code\"]",
-                        &code,
-                        70,
-                        145,
-                    )
-                    .await
-                    {
-                        return Err((format!("未找到 {} 两步验证码输入框", site_name), last_remaining_attempts));
-                    }
-                }
-            }
-
             let has_ocr = ocr_config.is_some();
             let current = nexus_login_page_state(&mut websocket).ok_or_else(|| {
                 (
@@ -307,7 +290,7 @@ impl CdpClient {
                         .unwrap_or_default();
                     return Err((
                         format!(
-                            "{} 登录信息已填写{}，请人工输入图片验证码并点击登录",
+                            "{} 登录信息已填写{}，请人工输入图片验证码和所需的两步验证码后点击登录",
                             site_name, attempts
                         ),
                         last_remaining_attempts,
@@ -405,6 +388,40 @@ impl CdpClient {
             let delay_min = if has_ocr { 1200 } else { 750 };
             let delay_max = if has_ocr { 2500 } else { 1550 };
             human_delay(delay_min, delay_max).await;
+            if let Some(secret) = totp_secret {
+                if current.has_two_factor {
+                    // 图片验证码和人机验证结束后才填 2FA，避免等待期间跨过有效期。
+                    let code = auth::fresh_totp(secret)
+                        .await
+                        .map_err(|err| (err, last_remaining_attempts))?;
+                    if !type_runtime_input(&mut websocket, TOTP_INPUT_SELECTOR, &code, 70, 145)
+                        .await
+                    {
+                        return Err((
+                            format!("未找到 {} 两步验证码输入框", site_name),
+                            last_remaining_attempts,
+                        ));
+                    }
+                    let latest = auth::fresh_totp(secret)
+                        .await
+                        .map_err(|err| (err, last_remaining_attempts))?;
+                    if latest != code
+                        && !type_runtime_input(
+                            &mut websocket,
+                            TOTP_INPUT_SELECTOR,
+                            &latest,
+                            70,
+                            145,
+                        )
+                        .await
+                    {
+                        return Err((
+                            format!("未找到 {} 两步验证码输入框", site_name),
+                            last_remaining_attempts,
+                        ));
+                    }
+                }
+            }
             let submit_expr = r#"(() => {
                 const passwordInput = document.querySelector('input[type="password"]');
                 if (!passwordInput) return false;

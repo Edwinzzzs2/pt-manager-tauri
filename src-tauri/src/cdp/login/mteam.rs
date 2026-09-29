@@ -13,7 +13,7 @@ impl CdpClient {
         tab_id: &str,
         username: &str,
         password: &str,
-        totp_code: Option<&str>,
+        totp_secret: Option<&str>,
     ) -> Result<bool, String> {
         let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
             return Err("无法连接 M-Team 标签页".to_string());
@@ -69,9 +69,9 @@ impl CdpClient {
                 continue;
             };
             if current.has_otp && !otp_submitted {
-                let code = totp_code
+                let secret = totp_secret
                     .ok_or_else(|| "M-Team 要求 2FA，但站点未配置 2FA 密钥".to_string())?;
-                if !submit_otp(&mut websocket, code).await {
+                if !submit_otp(&mut websocket, secret).await? {
                     return Err("检测到 M-Team 2FA 验证，但未能填写或提交验证码".to_string());
                 }
                 otp_submitted = true;

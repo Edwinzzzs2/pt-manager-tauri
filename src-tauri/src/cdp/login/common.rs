@@ -316,7 +316,7 @@ pub(super) fn runtime_object_bool(
         .as_bool()
 }
 
-pub(super) async fn submit_otp(websocket: &mut CdpWebSocket, code: &str) -> bool {
+pub(super) async fn submit_otp(websocket: &mut CdpWebSocket, secret: &str) -> Result<bool, String> {
     let locate_expression = r#"(() => {
             const input = Array.from(document.querySelectorAll('input')).find((element) => {
                 const hint = [element.id, element.name, element.placeholder, element.autocomplete]
@@ -328,20 +328,35 @@ pub(super) async fn submit_otp(websocket: &mut CdpWebSocket, code: &str) -> bool
             return { ok: true };
         })()"#;
     if !runtime_object_bool(websocket, locate_expression, "ok").unwrap_or(false) {
-        return false;
+        return Ok(false);
     }
+    let code = crate::auth::fresh_totp(secret).await?;
     if !type_runtime_input(
         websocket,
         "input[data-pt-manager-otp=\"true\"]",
-        code,
+        &code,
         70,
         145,
     )
     .await
     {
-        return false;
+        return Ok(false);
     }
     human_delay(550, 1200).await;
+    // 输入和点击之间可能正好跨过 30 秒边界，提交前再读取一次当前码。
+    let latest = crate::auth::fresh_totp(secret).await?;
+    if latest != code
+        && !type_runtime_input(
+            websocket,
+            "input[data-pt-manager-otp=\"true\"]",
+            &latest,
+            70,
+            145,
+        )
+        .await
+    {
+        return Ok(false);
+    }
     let submit_expression = r#"(() => {
             const input = document.querySelector('input[data-pt-manager-otp="true"]');
             if (!input) return { ok: false };
@@ -353,5 +368,5 @@ pub(super) async fn submit_otp(websocket: &mut CdpWebSocket, code: &str) -> bool
             submit.click();
             return { ok: true };
         })()"#;
-    runtime_object_bool(websocket, submit_expression, "ok").unwrap_or(false)
+    Ok(runtime_object_bool(websocket, submit_expression, "ok").unwrap_or(false))
 }

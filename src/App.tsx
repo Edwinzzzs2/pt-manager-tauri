@@ -2859,14 +2859,22 @@ function TotpCode({ secret }: { secret: string }) {
 
   useEffect(() => {
     let active = true;
+    let latestRequest = 0;
+    let displayedStep = -1;
     const update = async () => {
       const now = Math.floor(Date.now() / 1000);
+      const step = Math.floor(now / 30);
       setRemaining(30 - (now % 30));
+      if (step === displayedStep) return;
+      displayedStep = step;
+      const request = ++latestRequest;
+      setCode("------");
       try {
         const next = await generateTotp(secret, now);
-        if (active) setCode(next);
+        // 加密计算可能晚于下一次定时刷新完成，只显示最近时间窗的结果。
+        if (active && request === latestRequest) setCode(next);
       } catch {
-        if (active) setCode("密钥无效");
+        if (active && request === latestRequest) setCode("密钥无效");
       }
     };
     update();

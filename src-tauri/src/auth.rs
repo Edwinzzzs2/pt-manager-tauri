@@ -1,9 +1,22 @@
 use data_encoding::BASE32_NOPAD_NOCASE;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha1 = Hmac<Sha1>;
+
+/// 避开即将过期的时间窗，给逐字输入和页面提交留出时间。
+pub async fn fresh_totp(secret: &str) -> Result<String, String> {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "系统时间无效，无法生成 2FA 验证码".to_string())?
+        .as_secs();
+    let remaining = 30 - unix_seconds % 30;
+    if remaining <= 5 {
+        tokio::time::sleep(Duration::from_secs(remaining)).await;
+    }
+    current_totp(secret)
+}
 
 pub fn current_totp(secret: &str) -> Result<String, String> {
     let normalized = secret

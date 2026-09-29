@@ -3,7 +3,6 @@
 use super::common::{
     click_runtime_element, hdk_login_page_state, human_delay, submit_otp, type_runtime_input,
 };
-use crate::auth;
 use crate::cdp::{CdpClient, CdpWebSocket};
 use std::time::Duration;
 
@@ -100,9 +99,8 @@ impl CdpClient {
             if current.has_otp && !otp_submitted {
                 let secret = totp_secret
                     .ok_or_else(|| "HDKylin 要求 2FA，但站点未配置 2FA 密钥".to_string())?;
-                let code = auth::current_totp(secret)?;
                 human_delay(550, 1200).await;
-                if !submit_otp(&mut websocket, &code).await {
+                if !submit_otp(&mut websocket, secret).await? {
                     return Err("检测到 HDKylin 2FA，但未能填写或提交验证码".to_string());
                 }
                 otp_submitted = true;

@@ -6,7 +6,6 @@ mod nexusphp;
 mod pting;
 mod sixcloud;
 
-use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,20 +101,11 @@ impl CdpClient {
                 })
                 .map_err(|message| LoginError { message, remaining_attempts: None }),
             SiteAdapter::MTeam => {
-                // M-Team 旧流程会在进入适配器前校验已配置的密钥，这里保持相同行为。
-                let totp_code = request
-                    .totp_secret
-                    .map(auth::current_totp)
-                    .transpose()
-                    .map_err(|message| LoginError {
-                        message,
-                        remaining_attempts: None,
-                    })?;
                 self.login_mteam(
                     tab_id,
                     request.username,
                     request.password,
-                    totp_code.as_deref(),
+                    request.totp_secret,
                 )
                 .await
                 .map(|logged_in| LoginOutcome {
