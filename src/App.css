@@ -691,7 +691,8 @@ button.ghost {
   gap: 8px;
 }
 
-input {
+input,
+select {
   box-sizing: border-box;
   width: 100%;
   height: 38px;
@@ -704,7 +705,8 @@ input {
   font: inherit;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: var(--color-accent);
   box-shadow: 0 0 0 3px var(--accent-focus-ring);
 }

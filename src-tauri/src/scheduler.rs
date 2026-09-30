@@ -178,7 +178,7 @@ async fn run_keepalive_inner(
         }
     }
 
-    let mut cdp = CdpClient::new(config.cdp_port);
+    let mut cdp = CdpClient::with_browser(config.cdp_port, config.browser);
     let had_cdp_before_sync = cdp.available_port().await.is_some();
 
     if !config.ocr_server_url.is_empty() {
@@ -241,7 +241,7 @@ async fn run_keepalive_inner(
     let mut launched_with_initial_sites = false;
     let launched_browser;
     if let Some(active_port) = cdp.available_port().await {
-        // CookieCloud 保活前同步可能在没有现成 CDP 时自动启动 Chrome；这种实例也属于本次任务。
+        // CookieCloud 保活前同步可能自动启动所选浏览器；这种实例也属于本次任务。
         launched_browser = !had_cdp_before_sync;
         if active_port != config.cdp_port {
             push_log(
@@ -254,7 +254,10 @@ async fn run_keepalive_inner(
     } else {
         push_log(
             logs,
-            LogEntry::info("Chrome CDP 未连接，正在尝试自动启动 Chrome"),
+            LogEntry::info(format!(
+                "{} CDP 未连接，正在尝试自动启动",
+                config.browser.name()
+            )),
         )
         .await;
         let cdp_progress = CdpProgress::new(Arc::clone(logs), Arc::clone(task_cancel_requested));
@@ -326,7 +329,7 @@ async fn sync_cookiecloud_before_keepalive(
         return Err("CookieCloud 未解析到可同步的 Cookie 或 Local Storage".to_string());
     }
 
-    let cdp = CdpClient::new(config.cdp_port);
+    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
     let active_port = match cdp.available_port().await {
         Some(port) => port,
         None => {
@@ -994,11 +997,11 @@ async fn close_browser_instance(
     if let Err(err) = cdp.close_browser().await {
         push_log(
             logs,
-            LogEntry::error(format!("关闭专用 Chrome 实例失败: {}", err)),
+            LogEntry::error(format!("关闭专用浏览器实例失败: {}", err)),
         )
         .await;
     } else {
-        push_log(logs, LogEntry::info("已关闭本次保活启动的专用 Chrome 实例")).await;
+        push_log(logs, LogEntry::info("已关闭本次保活启动的专用浏览器实例")).await;
     }
 }
 

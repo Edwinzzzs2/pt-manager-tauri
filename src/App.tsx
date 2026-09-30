@@ -109,6 +109,7 @@ type AppConfig = {
   cron: string;
   cron_offset_minutes: number;
   cdp_port: number;
+  browser: "chrome" | "edge";
   visit_duration: number;
   random_delay: boolean;
   auto_launch: boolean;
@@ -145,7 +146,7 @@ type LogEntry = {
 
 type AppStatus = {
   cdp_connected: boolean;
-  chrome_installed: boolean;
+  browser_installed: boolean;
   active_cdp_port: number | null;
   next_run: string | null;
   last_result: LogEntry | null;
@@ -181,6 +182,7 @@ const defaultConfig: AppConfig = {
   cron: "0 9 * * *",
   cron_offset_minutes: 30,
   cdp_port: 9222,
+  browser: "chrome",
   visit_duration: 30,
   random_delay: true,
   auto_launch: false,
@@ -299,6 +301,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  const browserName = config.browser === "edge" ? "Edge" : "Chrome";
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
 
   useEffect(() => {
@@ -409,10 +412,10 @@ function App() {
     }
   }
 
-  async function openChromeDownload() {
+  async function openBrowserDownload() {
     setError(null);
     try {
-      await invoke("open_chrome_download");
+      await invoke("open_browser_download");
     } catch (err) {
       showError(err);
     }
@@ -451,7 +454,7 @@ function App() {
 
   async function clearBrowserData() {
     const confirmed = await ask(
-      "将清除专用 Chrome 的 Cookie、Local Storage 和缓存。清除后可重新同步 CookieCloud，确定继续？",
+      `将清除专用 ${browserName} 的 Cookie、Local Storage 和缓存。清除后可重新同步 CookieCloud，确定继续？`,
       {
         kind: "warning",
         okLabel: "清除",
@@ -972,15 +975,15 @@ function App() {
           <div>
             <strong>
               {status?.cdp_connected
-                ? "Chrome 已连接"
-                : status?.chrome_installed === false
-                  ? "需要安装 Chrome"
+                ? `${browserName} 已连接`
+                : status?.browser_installed === false
+                  ? `需要安装 ${browserName}`
                   : "自动模式待命"}
             </strong>
             <span>
               {status?.cdp_connected
                 ? `localhost:${status.active_cdp_port ?? config.cdp_port}`
-                : status?.chrome_installed === false
+                : status?.browser_installed === false
                   ? "安装后自动接管"
               : "运行时自动准备"}
             </span>
@@ -1063,7 +1066,7 @@ function App() {
               config={config}
               lastLog={lastVisibleLog}
               onEnsureCdp={ensureCdp}
-              onOpenChromeDownload={openChromeDownload}
+              onOpenBrowserDownload={openBrowserDownload}
               recentLogs={logs.slice(-30).reverse()}
               status={status}
               onRefresh={() => {
@@ -1250,7 +1253,7 @@ function Dashboard({
   config,
   lastLog,
   onEnsureCdp,
-  onOpenChromeDownload,
+  onOpenBrowserDownload,
   recentLogs,
   status,
   onRefresh,
@@ -1259,13 +1262,14 @@ function Dashboard({
   config: AppConfig;
   lastLog?: LogEntry;
   onEnsureCdp: () => void;
-  onOpenChromeDownload: () => void;
+  onOpenBrowserDownload: () => void;
   recentLogs: LogEntry[];
   status: AppStatus | null;
   onRefresh: () => void;
 }) {
-  const chromeInstalled = status?.chrome_installed !== false;
-  const chromeConnected = !!status?.cdp_connected;
+  const browserName = config.browser === "edge" ? "Edge" : "Chrome";
+  const browserInstalled = status?.browser_installed !== false;
+  const browserConnected = !!status?.cdp_connected;
   const latestResult = status?.last_result ?? lastLog;
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
@@ -1279,10 +1283,10 @@ function Dashboard({
     <div className="dashboard">
       <section className="metric-grid">
         <MetricCard
-          icon={chromeConnected ? CheckCircle2 : chromeInstalled ? PauseCircle : Download}
-          label="Chrome 环境"
-          tone={chromeConnected ? "ok" : chromeInstalled ? "muted" : "warning"}
-          value={chromeConnected ? "已就绪" : chromeInstalled ? "自动模式" : "需安装"}
+          icon={browserConnected ? CheckCircle2 : browserInstalled ? PauseCircle : Download}
+          label={`${browserName} 环境`}
+          tone={browserConnected ? "ok" : browserInstalled ? "muted" : "warning"}
+          value={browserConnected ? "已就绪" : browserInstalled ? "自动模式" : "需安装"}
         />
         <MetricCard icon={ListChecks} label="站点数量" value={`${config.sites.length}`} />
         <MetricCard
@@ -1302,20 +1306,20 @@ function Dashboard({
         <div className="panel setup-panel">
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">Chrome</p>
+              <p className="eyebrow">{browserName}</p>
               <h2>自动模式</h2>
             </div>
             <div className="row-actions">
-              {!chromeInstalled ? (
+              {!browserInstalled ? (
                 <button
                   className="ghost install-action"
-                  onClick={onOpenChromeDownload}
+                  onClick={onOpenBrowserDownload}
                   type="button"
                 >
                   <Download size={16} />
-                  <span>安装 Chrome</span>
+                  <span>安装 {browserName}</span>
                 </button>
-              ) : !chromeConnected ? (
+              ) : !browserConnected ? (
                 <button
                   className="ghost"
                   disabled={cdpBusy || status?.is_running}
@@ -1332,16 +1336,16 @@ function Dashboard({
             </div>
           </div>
           <code className="command-line">
-            {chromeConnected
+            {browserConnected
               ? `CDP 已连接：localhost:${status?.active_cdp_port ?? config.cdp_port}`
-              : chromeInstalled
-                ? "自动模式待命：执行保活时会自动启动专用 Chrome"
-                : "未检测到 Chrome：安装完成后即可自动启动专用浏览器"}
+              : browserInstalled
+                ? `自动模式待命：执行保活时会自动启动专用 ${browserName}`
+                : `未检测到 ${browserName}：安装完成后即可自动启动专用浏览器`}
           </code>
           <div className="setup-steps">
-            <span>1. 默认自动模式，保活时自动启动专用 Chrome Profile</span>
+            <span>1. 默认自动模式，保活时自动启动专用 {browserName} Profile</span>
             <span>2. 首次打开后登录站点，后续会复用同一个专用浏览器环境</span>
-            <span>3. 未安装 Chrome 时先安装，安装完成后点刷新或立即保活</span>
+            <span>3. 未安装 {browserName} 时先安装，安装完成后点刷新或立即保活</span>
           </div>
         </div>
 
@@ -1358,7 +1362,7 @@ function Dashboard({
           <p className="result-text" title={latestResult?.message}>
             {latestResult
               ? summarizeResult(latestResult.message)
-              : "添加站点后即可开始，Chrome 会在运行时自动准备。"}
+              : `添加站点后即可开始，${browserName} 会在运行时自动准备。`}
           </p>
         </div>
       </section>
@@ -2274,6 +2278,16 @@ function SettingsPanel({
 
           <div className="settings-form">
           <label>
+            <span>专用浏览器</span>
+            <select
+              onChange={(event) => onChange({ ...draft, browser: event.target.value as AppConfig["browser"] })}
+              value={draft.browser}
+            >
+              <option value="chrome">Google Chrome</option>
+              <option value="edge">Microsoft Edge</option>
+            </select>
+          </label>
+          <label>
             <span>Cron 表达式</span>
             <input
               onChange={(event) => onChange({ ...draft, cron: event.target.value })}
@@ -2340,7 +2354,7 @@ function SettingsPanel({
           <details className="advanced-settings">
           <summary>手动端口（可选）</summary>
           <label>
-            <span>Chrome 调试端口</span>
+            <span>浏览器调试端口</span>
             <input
               min={1}
               onChange={(event) => onChange({ ...draft, cdp_port: Number(event.target.value) })}
@@ -2360,7 +2374,7 @@ function SettingsPanel({
               <h2>Cookie 同步</h2>
               <span
                 className="help-tip"
-                data-tooltip="填写与 CookieCloud 插件相同的服务地址、UUID 和密码；“同步 Cookie”会把云端 Cookie 与 Local Storage 导入专用 Chrome。"
+                data-tooltip="填写与 CookieCloud 插件相同的服务地址、UUID 和密码；“同步 Cookie”会把云端 Cookie 与 Local Storage 导入所选专用浏览器。"
                 tabIndex={0}
               >
                 <HelpCircle size={16} />
@@ -2445,7 +2459,7 @@ function SettingsPanel({
               保活前自动同步
               <span
                 className="help-tip"
-                data-tooltip="每次保活开始前，从 CookieCloud 下载 Cookie 和 Local Storage 到专用 Chrome；不会上传本地数据。"
+                data-tooltip="每次保活开始前，从 CookieCloud 下载 Cookie 和 Local Storage 到所选专用浏览器；不会上传本地数据。"
                 tabIndex={0}
               >
                 <HelpCircle size={14} />
@@ -2715,7 +2729,7 @@ function SettingsPanel({
         <section className="panel settings-card browser-data-panel">
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">Chrome</p>
+              <p className="eyebrow">Browser</p>
               <h2>浏览器数据</h2>
             </div>
             <div className="row-actions">

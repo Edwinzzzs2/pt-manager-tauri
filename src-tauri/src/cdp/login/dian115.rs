@@ -37,7 +37,7 @@ impl CdpClient {
         let page = wait_for_state(&mut websocket, progress, 160, true).await?;
         if page.logged_in { return Ok(false); }
         if page.has_verification {
-            return Err("癫影登录页要求人机验证，请在专用 Chrome 中完成验证".to_string());
+            return Err("癫影登录页要求人机验证，请在专用浏览器中完成验证".to_string());
         }
         if !page.has_login_form {
             return Err("癫影登录页未找到邮箱和密码表单".to_string());
@@ -59,7 +59,7 @@ impl CdpClient {
             let Some(state) = page_state(&mut websocket) else { continue };
             if state.logged_in { return Ok(true); }
             if state.has_verification {
-                return Err("癫影登录要求人机验证，请在专用 Chrome 中完成验证".to_string());
+                return Err("癫影登录要求人机验证，请在专用浏览器中完成验证".to_string());
             }
             if state.has_login_form && !state.error_message.is_empty() {
                 if last_error == state.error_message { repeated_error += 1; }

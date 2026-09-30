@@ -1,4 +1,4 @@
-use crate::store::{self, LogEntry};
+use crate::store::{self, BrowserKind, LogEntry};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -39,6 +39,7 @@ struct HttpResponse {
 
 pub struct CdpClient {
     port: u16,
+    browser: BrowserKind,
 }
 
 pub struct CdpLaunchResult {
@@ -108,14 +109,18 @@ impl CdpProgress {
 
 impl CdpClient {
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self::with_browser(port, BrowserKind::Chrome)
+    }
+
+    pub fn with_browser(port: u16, browser: BrowserKind) -> Self {
+        Self { port, browser }
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// 返回当前可用的 CDP 端口；自动模式会从 Chrome 写出的 DevToolsActivePort 中读取真实端口。
+    /// 只复用所选浏览器的 CDP，避免端口相同时接入另一种浏览器。
     pub async fn available_port(&self) -> Option<u16> {
         if self
             .is_available_with_timeout(Duration::from_millis(600))
@@ -124,11 +129,14 @@ impl CdpClient {
             return Some(self.port);
         }
 
-        for profile_dir in [dedicated_profile_dir(), recovery_profile_dir()] {
+        for profile_dir in [
+            dedicated_profile_dir(self.browser),
+            recovery_profile_dir(self.browser),
+        ] {
             let Some(port) = read_devtools_port(&profile_dir) else {
                 continue;
             };
-            if CdpClient::new(port)
+            if CdpClient::with_browser(port, self.browser)
                 .is_available_with_timeout(Duration::from_millis(600))
                 .await
             {
@@ -139,18 +147,35 @@ impl CdpClient {
         None
     }
 
-    /// 检测 Chrome 是否以调试模式运行。
+    /// 检测所选浏览器是否以调试模式运行。
     pub async fn is_available(&self) -> bool {
         self.is_available_with_timeout(Duration::from_secs(3)).await
     }
 
     async fn is_available_with_timeout(&self, timeout: Duration) -> bool {
         self.request("GET", "/json/version", timeout)
-            .map(|response| (200..300).contains(&response.status))
+            .map(|response| {
+                if !(200..300).contains(&response.status) {
+                    return false;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&response.body) else {
+                    return false;
+                };
+                let product = value
+                    .get("Browser")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                match self.browser {
+                    BrowserKind::Chrome => {
+                        product.starts_with("Chrome/") || product.starts_with("Chromium/")
+                    }
+                    BrowserKind::Edge => product.starts_with("Edg/"),
+                }
+            })
             .unwrap_or(false)
     }
 
-    /// 确保 Chrome 已开放 CDP 端口；自动启动时优先使用配置端口，冲突时再退回随机端口。
+    /// 确保所选浏览器已开放 CDP 端口；端口冲突时退回随机端口。
     pub async fn ensure_available_with_progress(
         &self,
         initial_urls: &[String],
@@ -176,23 +201,34 @@ impl CdpClient {
             let opened_initial_urls = self.ensure_initial_urls(initial_urls, progress).await?;
             return Ok(CdpLaunchResult {
                 port: self.port,
-                message: connected_message("Chrome CDP 已连接", self.port, opened_initial_urls),
+                message: connected_message(
+                    &format!("{} CDP 已连接", self.browser.name()),
+                    self.port,
+                    opened_initial_urls,
+                ),
                 opened_initial_urls,
                 launched: false,
             });
         }
         check_cancel(progress)?;
 
-        let profile_dir = dedicated_profile_dir();
+        let profile_dir = dedicated_profile_dir(self.browser);
         log_progress(
             progress,
-            format!("检查专用 Chrome Profile：{}", profile_dir.display()),
+            format!(
+                "检查专用 {} Profile：{}",
+                self.browser.name(),
+                profile_dir.display()
+            ),
         )
         .await;
         if profile_dir_in_use(&profile_dir) {
             log_progress(
                 progress,
-                "专用 Chrome Profile 正在被占用，但没有可用 CDP；跳过复用，改用备用 Profile",
+                format!(
+                    "专用 {} Profile 正在被占用，但没有可用 CDP；跳过复用，改用备用 Profile",
+                    self.browser.name()
+                ),
             )
             .await;
         } else if self.port > 0 && port_is_free(self.port) {
@@ -201,9 +237,15 @@ impl CdpClient {
                 format!("配置端口 localhost:{} 可用，优先按该端口启动", self.port),
             )
             .await;
-            if let Some(result) =
-                launch_and_wait(&profile_dir, false, initial_urls, Some(self.port), progress)
-                    .await?
+            if let Some(result) = launch_and_wait(
+                self.browser,
+                &profile_dir,
+                false,
+                initial_urls,
+                Some(self.port),
+                progress,
+            )
+            .await?
             {
                 return Ok(result);
             }
@@ -226,8 +268,15 @@ impl CdpClient {
                 ),
             )
             .await;
-            if let Some(result) =
-                launch_and_wait(&profile_dir, false, initial_urls, None, progress).await?
+            if let Some(result) = launch_and_wait(
+                self.browser,
+                &profile_dir,
+                false,
+                initial_urls,
+                None,
+                progress,
+            )
+            .await?
             {
                 return Ok(result);
             }
@@ -236,20 +285,27 @@ impl CdpClient {
             log_progress(progress, "随机端口启动后未响应，准备尝试备用 Profile").await;
         }
 
-        let recovery_dir = recovery_profile_dir();
-        if let Some(result) =
-            launch_and_wait(&recovery_dir, true, initial_urls, None, progress).await?
+        let recovery_dir = recovery_profile_dir(self.browser);
+        if let Some(result) = launch_and_wait(
+            self.browser,
+            &recovery_dir,
+            true,
+            initial_urls,
+            None,
+            progress,
+        )
+        .await?
         {
             return Ok(result);
         }
 
         Err(format!(
-            "已尝试自动启动 Chrome，但 CDP 仍未连接。请关闭刚打开的专用 Chrome 后重试，或在设置里更换 CDP 端口。原端口：{}",
-            self.port
+            "已尝试自动启动 {}，但 CDP 仍未连接。请关闭刚打开的专用浏览器后重试，或在设置里更换 CDP 端口。原端口：{}",
+            self.browser.name(), self.port
         ))
     }
 
-    /// 在 Chrome 中打开新标签页，返回 tab ID。
+    /// 在所选浏览器中打开新标签页，返回 tab ID。
     pub async fn open_tab(&self, url: &str) -> Result<String, String> {
         let encoded = encode_cdp_target_url(url);
         let response = self.request(
@@ -265,7 +321,7 @@ impl CdpClient {
         Ok(tab.id)
     }
 
-    /// 查找已经打开到相同站点的标签页，避免启动 Chrome 后再重复打开同一个站点。
+    /// 查找已经打开到相同站点的标签页，避免启动后重复打开同一个站点。
     pub async fn find_tab_for_url(&self, url: &str) -> Option<String> {
         let response = self
             .request("GET", "/json/list", Duration::from_secs(5))
@@ -444,7 +500,7 @@ impl CdpClient {
         Ok((imported, opened_tab_ids))
     }
 
-    /// Cookie 写入后，对 Chrome 中已打开的目标站点页面执行刷新，
+    /// Cookie 写入后，对浏览器中已打开的目标站点页面执行刷新，
     /// 使新 Cookie 立即生效——否则用户看到的仍是旧的未登录状态。
     pub async fn reload_tabs_for_sites(&self, site_urls: &[String]) {
         let response = match self.request("GET", "/json/list", Duration::from_secs(5)) {
@@ -513,7 +569,7 @@ impl CdpClient {
 
         self.open_tab("about:blank").await?;
         self.find_page_websocket_url()?
-            .ok_or_else(|| "未找到可用的 Chrome 页面调试通道".to_string())
+            .ok_or_else(|| "未找到可用的浏览器页面调试通道".to_string())
     }
 
     fn find_page_websocket_url(&self) -> Result<Option<String>, String> {
@@ -588,7 +644,7 @@ impl CdpClient {
             check_cancel(progress)?;
             log_progress(progress, format!("检查站点标签页：{}", url)).await;
             if self.find_tab_for_url(url).await.is_some() {
-                log_progress(progress, format!("站点已在 Chrome 中打开：{}", url)).await;
+                log_progress(progress, format!("站点已在浏览器中打开：{}", url)).await;
                 opened_count += 1;
                 continue;
             }
@@ -617,7 +673,7 @@ impl CdpClient {
         }
     }
 
-    /// 关闭当前 CDP 浏览器实例。仅用于本次任务自动启动的专用 Chrome。
+    /// 关闭当前 CDP 浏览器实例。仅用于本次任务自动启动的专用浏览器。
     pub async fn close_browser(&self) -> Result<(), String> {
         #[derive(Deserialize)]
         struct CdpVersion {
@@ -630,7 +686,7 @@ impl CdpClient {
             return Err(format!("CDP 返回 HTTP {}", response.status));
         }
         let version = serde_json::from_str::<CdpVersion>(&response.body)
-            .map_err(|err| format!("解析 Chrome 版本信息失败: {}", err))?;
+            .map_err(|err| format!("解析浏览器版本信息失败: {}", err))?;
         let mut websocket =
             CdpWebSocket::connect(&version.web_socket_debugger_url, Duration::from_secs(10))?;
         websocket.call("Browser.close", serde_json::json!({}))?;
@@ -972,21 +1028,24 @@ fn dom_storage_response_has_item(
     }
 }
 
-pub fn chrome_installed() -> bool {
-    find_chrome_executable().is_some()
+pub fn browser_installed(browser: BrowserKind) -> bool {
+    find_browser_executable(browser).is_some()
 }
 
-pub fn clear_dedicated_profile_data() -> Result<usize, String> {
-    let profile_dir = dedicated_profile_dir();
+pub fn clear_dedicated_profile_data(browser: BrowserKind) -> Result<usize, String> {
+    let profile_dir = dedicated_profile_dir(browser);
     if profile_dir_in_use(&profile_dir) {
-        return Err("专用 Chrome 正在运行，请关闭专用 Chrome 后再清除离线浏览器数据".to_string());
+        return Err(format!(
+            "专用 {} 正在运行，请关闭后再清除离线浏览器数据",
+            browser.name()
+        ));
     }
     if !profile_dir.exists() {
         return Ok(0);
     }
 
     fs::remove_dir_all(&profile_dir)
-        .map_err(|err| format!("清除专用 Chrome Profile 失败：{}", err))?;
+        .map_err(|err| format!("清除专用 {} Profile 失败：{}", browser.name(), err))?;
     Ok(1)
 }
 
@@ -994,7 +1053,7 @@ fn read_http_response(stream: &mut TcpStream) -> Result<String, String> {
     let mut raw = Vec::new();
     let mut buffer = [0_u8; 8192];
 
-    // Chrome 的 CDP HTTP 端口通常会返回 Content-Length，但不保证立刻关闭连接。
+    // Chromium 系浏览器的 CDP HTTP 端口通常会返回 Content-Length，但不保证立刻关闭连接。
     // 因此不能用 read_to_string 等 EOF，而要按响应头声明的长度读完整个 body。
     let header_end = loop {
         let read = stream
@@ -1232,7 +1291,7 @@ fn parse_ws_url(url: &str) -> Result<WsEndpoint, String> {
     }
 
     Ok(WsEndpoint {
-        // Chrome 启动时绑定 127.0.0.1；localhost 在 Windows 上可能先解析到 ::1，导致写 Cookie 时 10061。
+        // 浏览器启动时绑定 127.0.0.1；localhost 在 Windows 上可能先解析到 ::1，导致写 Cookie 时 10061。
         host: "127.0.0.1".to_string(),
         port,
         path: format!("/{}", path),
@@ -1327,6 +1386,7 @@ fn launch_urls(urls: &[String]) -> Vec<String> {
 }
 
 async fn launch_and_wait(
+    browser: BrowserKind,
     profile_dir: &Path,
     recovery: bool,
     initial_urls: &[String],
@@ -1335,9 +1395,9 @@ async fn launch_and_wait(
 ) -> Result<Option<CdpLaunchResult>, String> {
     let launch_urls = launch_urls(initial_urls);
     let mode = if recovery {
-        "备用专用 Chrome"
+        format!("备用专用 {}", browser.name())
     } else {
-        "专用 Chrome"
+        format!("专用 {}", browser.name())
     };
     log_progress(
         progress,
@@ -1353,7 +1413,7 @@ async fn launch_and_wait(
     )
     .await;
     let _ = fs::remove_file(devtools_port_path(profile_dir));
-    launch_chrome(profile_dir, &launch_urls, fixed_port)?;
+    launch_browser(browser, profile_dir, &launch_urls, fixed_port)?;
     log_progress(progress, format!("{} 进程已启动，等待 CDP 响应", mode)).await;
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1369,7 +1429,11 @@ async fn launch_and_wait(
                 if attempt % 4 == 0 {
                     log_progress(
                         progress,
-                        format!("等待 Chrome 写入 CDP 端口... 已等待 {} 秒", attempt / 2),
+                        format!(
+                            "等待 {} 写入 CDP 端口... 已等待 {} 秒",
+                            browser.name(),
+                            attempt / 2
+                        ),
                     )
                     .await;
                 }
@@ -1385,7 +1449,7 @@ async fn launch_and_wait(
             )
             .await;
         }
-        let cdp = CdpClient::new(port);
+        let cdp = CdpClient::with_browser(port, browser);
         if cdp
             .is_available_with_timeout(Duration::from_millis(800))
             .await
@@ -1396,16 +1460,20 @@ async fn launch_and_wait(
             if opened_initial_urls > 0 {
                 log_progress(
                     progress,
-                    format!("Chrome 启动参数已打开 {} 个初始站点", opened_initial_urls),
+                    format!(
+                        "{} 启动参数已打开 {} 个初始站点",
+                        browser.name(),
+                        opened_initial_urls
+                    ),
                 )
                 .await;
             }
             let prefix = if recovery {
-                "已启动备用专用调试 Chrome"
+                format!("已启动备用专用调试 {}", browser.name())
             } else {
-                "已启动专用调试 Chrome"
+                format!("已启动专用调试 {}", browser.name())
             };
-            let message = connected_message(prefix, port, opened_initial_urls);
+            let message = connected_message(&prefix, port, opened_initial_urls);
             return Ok(Some(CdpLaunchResult {
                 port,
                 message,
@@ -1423,18 +1491,22 @@ async fn launch_and_wait(
     Ok(None)
 }
 
-fn launch_chrome(
+fn launch_browser(
+    browser: BrowserKind,
     profile_dir: &Path,
     urls: &[String],
     fixed_port: Option<u16>,
 ) -> Result<(), String> {
-    let chrome_path = find_chrome_executable().ok_or_else(|| {
-        "未检测到 Google Chrome。请在总览点击“安装 Chrome”，安装完成后再重试。".to_string()
+    let browser_path = find_browser_executable(browser).ok_or_else(|| {
+        format!(
+            "未检测到 {}。请在总览点击安装按钮，安装完成后再重试。",
+            browser.name()
+        )
     })?;
 
-    let mut command = Command::new(chrome_path);
+    let mut command = Command::new(browser_path);
     fs::create_dir_all(profile_dir)
-        .map_err(|err| format!("创建 Chrome 专用 Profile 失败：{}", err))?;
+        .map_err(|err| format!("创建 {} 专用 Profile 失败：{}", browser.name(), err))?;
 
     command
         .arg(format!(
@@ -1454,14 +1526,16 @@ fn launch_chrome(
     command
         .spawn()
         .map(|_| ())
-        .map_err(|err| format!("自动启动 Chrome 失败：{}", err))
+        .map_err(|err| format!("自动启动 {} 失败：{}", browser.name(), err))
 }
 
-fn dedicated_profile_dir() -> PathBuf {
+fn dedicated_profile_dir(browser: BrowserKind) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Some(root) = env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(root).join("pt-manager\\chrome-cdp-profile-auto");
+            return PathBuf::from(root)
+                .join("pt-manager")
+                .join(browser.profile_name());
         }
     }
 
@@ -1470,16 +1544,18 @@ fn dedicated_profile_dir() -> PathBuf {
         // Profile 保存登录态，不能放在可能被 macOS 自动清理的临时目录。
         if let Some(root) = env::var_os("HOME") {
             return PathBuf::from(root)
-                .join("Library/Application Support/com.ptmanager.app/chrome-cdp-profile-auto");
+                .join("Library/Application Support/com.ptmanager.app")
+                .join(browser.profile_name());
         }
     }
 
-    env::temp_dir().join("pt-manager-chrome-cdp-profile-auto")
+    env::temp_dir().join(format!("pt-manager-{}", browser.profile_name()))
 }
 
-fn recovery_profile_dir() -> PathBuf {
+fn recovery_profile_dir(browser: BrowserKind) -> PathBuf {
     env::temp_dir().join(format!(
-        "pt-manager-chrome-cdp-recovery-{}",
+        "pt-manager-{}-cdp-recovery-{}",
+        browser.name().to_ascii_lowercase(),
         std::process::id()
     ))
 }
@@ -1578,8 +1654,8 @@ fn unique_origins(urls: &[String]) -> Vec<String> {
     origins
 }
 
-fn find_chrome_executable() -> Option<PathBuf> {
-    chrome_candidates().into_iter().find_map(|path| {
+fn find_browser_executable(browser: BrowserKind) -> Option<PathBuf> {
+    browser_candidates(browser).into_iter().find_map(|path| {
         if path.exists() {
             return Some(path);
         }
@@ -1587,42 +1663,68 @@ fn find_chrome_executable() -> Option<PathBuf> {
     })
 }
 
-fn chrome_candidates() -> Vec<PathBuf> {
+fn browser_candidates(browser: BrowserKind) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    if let Ok(value) = env::var("CHROME") {
+    // 优先使用显式路径；默认候选只查找所选浏览器，避免缺失 Edge 时回退到 Chrome。
+    let override_name = match browser {
+        BrowserKind::Chrome => "CHROME",
+        BrowserKind::Edge => "EDGE",
+    };
+    if let Ok(value) = env::var(override_name) {
         paths.push(PathBuf::from(value));
     }
 
     #[cfg(target_os = "windows")]
     {
-        for key in ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"] {
-            if let Ok(root) = env::var(key) {
-                paths.push(PathBuf::from(root).join("Google\\Chrome\\Application\\chrome.exe"));
+        match browser {
+            BrowserKind::Chrome => {
+                for key in ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"] {
+                    if let Ok(root) = env::var(key) {
+                        paths.push(
+                            PathBuf::from(root).join("Google\\Chrome\\Application\\chrome.exe"),
+                        );
+                    }
+                }
+                paths.push(PathBuf::from("chrome.exe"));
+            }
+            BrowserKind::Edge => {
+                for key in ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"] {
+                    if let Ok(root) = env::var(key) {
+                        paths.push(
+                            PathBuf::from(root).join("Microsoft\\Edge\\Application\\msedge.exe"),
+                        );
+                    }
+                }
+                paths.push(PathBuf::from("msedge.exe"));
             }
         }
-        paths.push(PathBuf::from("chrome.exe"));
     }
 
     #[cfg(target_os = "macos")]
     {
-        paths.push(PathBuf::from(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        ));
+        let app_path = match browser {
+            BrowserKind::Chrome => "Google Chrome.app/Contents/MacOS/Google Chrome",
+            BrowserKind::Edge => "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        };
+        paths.push(PathBuf::from("/Applications").join(app_path));
         if let Some(root) = env::var_os("HOME") {
-            paths.push(
-                PathBuf::from(root)
-                    .join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            );
+            paths.push(PathBuf::from(root).join("Applications").join(app_path));
         }
     }
 
     #[cfg(target_os = "linux")]
     {
-        paths.push(PathBuf::from("google-chrome"));
-        paths.push(PathBuf::from("google-chrome-stable"));
-        paths.push(PathBuf::from("chromium"));
-        paths.push(PathBuf::from("chromium-browser"));
+        let commands: &[&str] = match browser {
+            BrowserKind::Chrome => &[
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+            ],
+            BrowserKind::Edge => &["microsoft-edge", "microsoft-edge-stable"],
+        };
+        paths.extend(commands.iter().map(|name| PathBuf::from(*name)));
     }
 
     paths

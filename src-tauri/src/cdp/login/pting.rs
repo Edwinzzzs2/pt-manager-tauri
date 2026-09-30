@@ -54,7 +54,7 @@ impl CdpClient {
         }
         if login_page.has_verification {
             return Err(
-                "PTing 登录页要求验证码或工作量证明，需要先在专用 Chrome 中人工完成验证"
+                "PTing 登录页要求验证码或工作量证明，需要先在专用浏览器中人工完成验证"
                     .to_string(),
             );
         }
@@ -115,7 +115,7 @@ impl CdpClient {
             }
             if state.has_verification {
                 return Err(
-                    "PTing 登录要求验证码或工作量证明，需要先在专用 Chrome 中人工完成验证"
+                    "PTing 登录要求验证码或工作量证明，需要先在专用浏览器中人工完成验证"
                         .to_string(),
                 );
             }

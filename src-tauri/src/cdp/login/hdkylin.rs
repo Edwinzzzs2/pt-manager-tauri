@@ -26,7 +26,7 @@ impl CdpClient {
             if let Some(current) = hdk_login_page_state(&mut websocket) {
                 if current.blocked_debug {
                     return Err(
-                        "雷池 WAF 检测到调试环境，需要在专用 Chrome 中人工完成验证".to_string()
+                        "雷池 WAF 检测到调试环境，需要在专用浏览器中人工完成验证".to_string()
                     );
                 }
                 if current.has_captcha {

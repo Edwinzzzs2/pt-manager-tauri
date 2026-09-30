@@ -47,7 +47,7 @@ impl CdpClient {
             return Ok(false);
         }
         if initial.has_verification {
-            return Err("六六云登录页要求人机验证，请先在专用 Chrome 中人工完成验证".to_string());
+            return Err("六六云登录页要求人机验证，请先在专用浏览器中人工完成验证".to_string());
         }
         if !initial.has_login_form {
             return Err("六六云登录页已打开，但未找到登录表单".to_string());
@@ -98,7 +98,7 @@ impl CdpClient {
                 return Ok(true);
             }
             if state.has_verification {
-                return Err("六六云登录要求人机验证，请先在专用 Chrome 中人工完成验证".to_string());
+                return Err("六六云登录要求人机验证，请先在专用浏览器中人工完成验证".to_string());
             }
             if !state.error_message.is_empty() && state.has_login_form {
                 if stable_error == state.error_message {

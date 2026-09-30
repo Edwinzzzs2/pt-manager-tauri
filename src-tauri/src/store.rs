@@ -49,6 +49,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub cron_offset_minutes: i64,
     pub cdp_port: u16,
+    #[serde(default)]
+    pub browser: BrowserKind,
     pub visit_duration: u64,
     pub random_delay: bool,
     #[serde(default = "default_auto_launch")]
@@ -73,6 +75,30 @@ pub struct AppConfig {
     pub cookiecloud: CookieCloudConfig,
     #[serde(default)]
     pub gotify: GotifyConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserKind {
+    #[default]
+    Chrome,
+    Edge,
+}
+
+impl BrowserKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Chrome => "Chrome",
+            Self::Edge => "Edge",
+        }
+    }
+
+    pub fn profile_name(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome-cdp-profile-auto",
+            Self::Edge => "edge-cdp-profile-auto",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -113,6 +139,7 @@ impl Default for AppConfig {
             cron: "0 9 * * *".to_string(),
             cron_offset_minutes: 30,
             cdp_port: 9222,
+            browser: BrowserKind::default(),
             visit_duration: 30,
             random_delay: true,
             auto_launch: default_auto_launch(),

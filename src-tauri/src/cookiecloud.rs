@@ -336,7 +336,7 @@ fn prepare_upload_request(
     }
 
     if uploaded_count == 0 && local_storage_count == 0 {
-        return Err("专用 Chrome 中没有匹配已配置站点的 Cookie 或 Local Storage".to_string());
+        return Err("专用浏览器中没有匹配已配置站点的 Cookie 或 Local Storage".to_string());
     }
     payload.insert(
         "update_time".to_string(),

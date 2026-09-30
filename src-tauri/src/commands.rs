@@ -38,7 +38,7 @@ pub struct AppState {
 #[derive(Debug, Clone, Serialize)]
 pub struct AppStatus {
     pub cdp_connected: bool,
-    pub chrome_installed: bool,
+    pub browser_installed: bool,
     pub active_cdp_port: Option<u16>,
     pub next_run: Option<DateTime<Local>>,
     pub last_result: Option<LogEntry>,
@@ -345,7 +345,7 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         return Err("请先配置登录用户名和密码".to_string());
     }
 
-    let mut cdp = CdpClient::new(config.cdp_port);
+    let mut cdp = CdpClient::with_browser(config.cdp_port, config.browser);
     if let Some(active_port) = cdp.available_port().await {
         cdp = CdpClient::new(active_port);
     } else {
@@ -602,11 +602,13 @@ pub async fn recognize_site_captcha(
             return Err(message);
         }
     }
-    let mut cdp = CdpClient::new(config.cdp_port);
-    let active_port = cdp
-        .available_port()
-        .await
-        .ok_or_else(|| "专用 Chrome 未连接，请先点击该站点的测试按钮".to_string())?;
+    let mut cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let active_port = cdp.available_port().await.ok_or_else(|| {
+        format!(
+            "专用 {} 未连接，请先点击该站点的测试按钮",
+            config.browser.name()
+        )
+    })?;
     cdp = CdpClient::new(active_port);
     let tab_id = cdp
         .find_tab_for_url(&site.url)
@@ -734,23 +736,26 @@ pub async fn recognize_site_captcha(
 
 #[tauri::command]
 pub async fn check_cdp(state: State<'_, AppState>) -> Result<bool, String> {
-    let cdp_port = state.config.lock().await.cdp_port;
-    let cdp = CdpClient::new(cdp_port);
+    let (cdp_port, browser) = {
+        let config = state.config.lock().await;
+        (config.cdp_port, config.browser)
+    };
+    let cdp = CdpClient::with_browser(cdp_port, browser);
     Ok(cdp.available_port().await.is_some())
 }
 
 #[tauri::command]
 pub async fn ensure_cdp(state: State<'_, AppState>) -> Result<bool, String> {
-    let (cdp_port, initial_urls) = {
+    let (cdp_port, browser, initial_urls) = {
         let config = state.config.lock().await;
         let urls = config
             .sites
             .iter()
             .map(|site| site.url.clone())
             .collect::<Vec<_>>();
-        (config.cdp_port, urls)
+        (config.cdp_port, config.browser, urls)
     };
-    let cdp = CdpClient::new(cdp_port);
+    let cdp = CdpClient::with_browser(cdp_port, browser);
     let progress = CdpProgress::new(
         Arc::clone(&state.logs),
         Arc::clone(&state.task_cancel_requested),
@@ -798,7 +803,7 @@ async fn import_cookiecloud_cookies(
         return Err(message);
     }
 
-    let cdp = CdpClient::new(config.cdp_port);
+    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
     let mut launched_sync_browser = false;
     let active_port = match cdp.available_port().await {
         Some(port) => port,
@@ -823,7 +828,7 @@ async fn import_cookiecloud_cookies(
         Err(err) if is_connection_refused(&err) => {
             push_log(
                 &state.logs,
-                LogEntry::info("Cookie 已拉取，但 Chrome CDP 连接失效，正在重新准备后重试"),
+                LogEntry::info("Cookie 已拉取，但浏览器 CDP 连接失效，正在重新准备后重试"),
             )
             .await;
             let progress = CdpProgress::new(
@@ -836,18 +841,18 @@ async fn import_cookiecloud_cookies(
             CdpClient::new(write_port)
                 .set_cookies(&sync_data.cookies)
                 .await
-                .map_err(|retry_err| format!("Cookie 已拉取，但写入 Chrome 失败：{}", retry_err))?
+                .map_err(|retry_err| format!("Cookie 已拉取，但写入浏览器失败：{}", retry_err))?
         }
         Err(err) => {
-            return Err(format!("Cookie 已拉取，但写入 Chrome 失败：{}", err));
+            return Err(format!("Cookie 已拉取，但写入浏览器失败：{}", err));
         }
     };
     let (imported_local_storages, opened_sync_tabs) = CdpClient::new(write_port)
         .set_local_storage_with_opened_tabs(&sync_data.local_storages)
         .await
-        .map_err(|err| format!("Local Storage 已拉取，但写入 Chrome 失败：{}", err))?;
+        .map_err(|err| format!("Local Storage 已拉取，但写入浏览器失败：{}", err))?;
 
-    // Cookie/Local Storage 写入成功后，刷新 Chrome 中已打开的站点页面，使新登录态立即生效。
+    // Cookie/Local Storage 写入成功后，刷新所选浏览器中已打开的站点页面。
     let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
     CdpClient::new(write_port)
         .reload_tabs_for_sites(&site_urls)
@@ -863,11 +868,10 @@ async fn import_cookiecloud_cookies(
             let cdp = CdpClient::new(write_port);
             if launched_sync_browser {
                 let entry = match cdp.close_browser().await {
-                    Ok(()) => LogEntry::info("Cookie 同步启动的专用 Chrome 已自动关闭"),
-                    Err(err) => LogEntry::error(format!(
-                        "Cookie 同步启动的专用 Chrome 自动关闭失败：{}",
-                        err
-                    )),
+                    Ok(()) => LogEntry::info("Cookie 同步启动的专用浏览器已自动关闭"),
+                    Err(err) => {
+                        LogEntry::error(format!("Cookie 同步启动的专用浏览器自动关闭失败：{}", err))
+                    }
                 };
                 push_log(&logs, entry).await;
                 return;
@@ -1109,10 +1113,10 @@ fn is_connection_refused(message: &str) -> bool {
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let config = state.config.lock().await.clone();
-    let cdp = CdpClient::new(config.cdp_port);
+    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
     let active_cdp_port = cdp.available_port().await;
     let cdp_connected = active_cdp_port.is_some();
-    let chrome_installed = cdp::chrome_installed();
+    let browser_installed = cdp::browser_installed(config.browser);
     let next_run = state.scheduler.lock().await.next_run().await;
     let is_running = *state.task_running.lock().await;
     let cancel_requested = state.task_cancel_requested.load(Ordering::SeqCst);
@@ -1120,7 +1124,7 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String>
 
     Ok(AppStatus {
         cdp_connected,
-        chrome_installed,
+        browser_installed,
         active_cdp_port,
         next_run,
         last_result,
@@ -1195,22 +1199,25 @@ pub async fn clear_browser_data(state: State<'_, AppState>) -> Result<(), String
         .iter()
         .map(|site| site.url.clone())
         .collect::<Vec<_>>();
-    let cdp = CdpClient::new(config.cdp_port);
+    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
     let message = if let Some(active_port) = cdp.available_port().await {
         CdpClient::new(active_port)
             .clear_browser_data(&site_urls)
             .await?;
         format!(
-            "已通过 CDP 清除专用 Chrome 浏览器数据：localhost:{}",
+            "已通过 CDP 清除专用 {} 浏览器数据：localhost:{}",
+            config.browser.name(),
             active_port
         )
     } else {
-        let cleared = cdp::clear_dedicated_profile_data()?;
+        let cleared = cdp::clear_dedicated_profile_data(config.browser)?;
         if cleared == 0 {
-            "专用 Chrome 浏览器数据为空，无需清除".to_string()
+            format!("专用 {} 浏览器数据为空，无需清除", config.browser.name())
         } else {
-            "已清除专用 Chrome Profile，Cookie、Local Storage 和缓存将在下次启动时重新生成"
-                .to_string()
+            format!(
+                "已清除专用 {} Profile，Cookie、Local Storage 和缓存将在下次启动时重新生成",
+                config.browser.name()
+            )
         }
     };
 
@@ -1238,8 +1245,13 @@ pub async fn clear_cookiecloud_data(
 }
 
 #[tauri::command]
-pub async fn open_chrome_download() -> Result<(), String> {
-    open_url("https://www.google.com/chrome/").map_err(|err| err.to_string())
+pub async fn open_browser_download(state: State<'_, AppState>) -> Result<(), String> {
+    let browser = state.config.lock().await.browser;
+    let url = match browser {
+        store::BrowserKind::Chrome => "https://www.google.com/chrome/",
+        store::BrowserKind::Edge => "https://www.microsoft.com/edge/download",
+    };
+    open_url(url).map_err(|err| err.to_string())
 }
 
 async fn restart_scheduler(state: &State<'_, AppState>, config: AppConfig) {
@@ -1356,7 +1368,7 @@ fn open_url(url: &str) -> std::io::Result<()> {
     #[allow(unreachable_code)]
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "当前系统不支持自动打开 Chrome 下载页",
+        "当前系统不支持自动打开浏览器下载页",
     ))
 }
 

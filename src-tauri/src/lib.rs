@@ -96,7 +96,7 @@ pub fn run() {
             commands::clear_logs,
             commands::clear_browser_data,
             commands::clear_cookiecloud_data,
-            commands::open_chrome_download,
+            commands::open_browser_download,
             commands::export_config,
             commands::import_config,
             updater::check_for_app_update,
