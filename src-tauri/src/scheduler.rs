@@ -1,6 +1,6 @@
 use crate::cdp::{
-    CdpClient, CdpProgress, LoginRequest, LoginState, SigninResult, SigninStatus, SiteTraffic,
-    CDP_CANCELLED,
+    is_qingwa_site, CdpClient, CdpProgress, LoginRequest, LoginState, SigninResult, SigninStatus,
+    SiteTraffic, CDP_CANCELLED,
 };
 use crate::cookiecloud;
 use crate::gotify;
@@ -686,6 +686,7 @@ async fn run_keepalive_batch(
     let mut failed_logins = Vec::new();
     let mut failed_login_site_ids = HashSet::new();
     let mut signin_targets: Vec<(Site, String)> = Vec::new();
+    let mut bonus_targets: Vec<(Site, String)> = Vec::new();
     let mut signin_results = Vec::new();
     let mut traffic_targets: Vec<(Site, String)> = Vec::new();
     let mut traffic_results = Vec::new();
@@ -753,6 +754,20 @@ async fn run_keepalive_batch(
                 push_log(logs, LogEntry::info(format!("{} 已打开", site.name))).await;
                 if site.auto_signin {
                     signin_targets.push((site.clone(), tab_id.clone()));
+                }
+                if site.auto_daily_bonus {
+                    if is_qingwa_site(&site.url) {
+                        bonus_targets.push((site.clone(), tab_id.clone()));
+                    } else {
+                        push_log(
+                            logs,
+                            LogEntry::error(format!(
+                                "{} 的每日福利开关仅适用于青蛙站点，已跳过",
+                                site.name
+                            )),
+                        )
+                        .await;
+                    }
                 }
                 traffic_targets.push((site.clone(), tab_id.clone()));
                 opened_tabs.push((site.name.clone(), tab_id));
@@ -854,6 +869,39 @@ async fn run_keepalive_batch(
                 push_log(
                     logs,
                     LogEntry::error(format!("自动签到任务异常结束：{err}")),
+                )
+                .await
+            }
+        }
+    }
+
+    // 签到和流量读取都完成后再导航到福利商店，避免并行任务操作同一标签页。
+    for (site, tab_id) in bonus_targets {
+        if task_cancel_requested.load(Ordering::SeqCst) {
+            close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
+            return true;
+        }
+        if failed_login_site_ids.contains(&site.id) {
+            push_log(
+                logs,
+                LogEntry::error(format!("{} 自动登录失败，未购买每日福利", site.name)),
+            )
+            .await;
+            continue;
+        }
+        push_log(
+            logs,
+            LogEntry::info(format!("{} 正在检查每日福利", site.name)),
+        )
+        .await;
+        match cdp.purchase_qingwa_daily_bonus(&tab_id).await {
+            Ok(message) => {
+                push_log(logs, LogEntry::info(format!("{}：{}", site.name, message))).await
+            }
+            Err(error) => {
+                push_log(
+                    logs,
+                    LogEntry::error(format!("{} 每日福利：{}", site.name, error)),
                 )
                 .await
             }

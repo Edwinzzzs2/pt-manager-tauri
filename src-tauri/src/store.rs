@@ -37,6 +37,8 @@ pub struct Site {
     pub auto_keepalive: bool,
     #[serde(default)]
     pub auto_signin: bool,
+    #[serde(default)]
+    pub auto_daily_bonus: bool,
     #[serde(default = "default_cookiecloud_upload")]
     pub cookiecloud_upload: bool,
 }

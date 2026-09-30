@@ -68,6 +68,8 @@ struct ImportedSite {
     auto_login: bool,
     #[serde(default)]
     auto_signin: bool,
+    #[serde(default)]
+    auto_daily_bonus: bool,
     #[serde(default = "default_cookiecloud_upload")]
     cookiecloud_upload: bool,
 }
@@ -178,6 +180,7 @@ pub async fn add_site(
     totp_secret: String,
     auto_login: bool,
     auto_signin: bool,
+    auto_daily_bonus: bool,
     cookiecloud_upload: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
@@ -194,6 +197,7 @@ pub async fn add_site(
         login_success_recorded_at: None,
         auto_keepalive: true,
         auto_signin,
+        auto_daily_bonus,
         cookiecloud_upload,
     };
     config.sites.push(site);
@@ -250,6 +254,7 @@ pub async fn import_sites_from_json(
             login_success_recorded_at: None,
             auto_keepalive: true,
             auto_signin: site.auto_signin,
+            auto_daily_bonus: site.auto_daily_bonus,
             cookiecloud_upload: site.cookiecloud_upload,
         });
         imported += 1;
@@ -304,6 +309,7 @@ pub async fn update_site(
     auto_login: bool,
     auto_keepalive: bool,
     auto_signin: bool,
+    auto_daily_bonus: bool,
     cookiecloud_upload: bool,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
@@ -316,6 +322,7 @@ pub async fn update_site(
         site.auto_login = auto_login;
         site.auto_keepalive = auto_keepalive;
         site.auto_signin = auto_signin;
+        site.auto_daily_bonus = auto_daily_bonus;
         site.cookiecloud_upload = cookiecloud_upload;
     }
     store::save_config(&state.app_handle, &config);

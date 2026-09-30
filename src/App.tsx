@@ -55,6 +55,7 @@ type Site = {
   login_success_recorded_at: number | null;
   auto_keepalive: boolean;
   auto_signin: boolean;
+  auto_daily_bonus: boolean;
   cookiecloud_upload: boolean;
 };
 
@@ -68,6 +69,7 @@ type SiteDraft = Pick<
   | "auto_login"
   | "auto_keepalive"
   | "auto_signin"
+  | "auto_daily_bonus"
   | "cookiecloud_upload"
 >;
 
@@ -259,6 +261,14 @@ function effectiveLoginAttemptThreshold(siteUrl: string, configured: number): nu
   return limit == null ? configured : Math.min(configured, Math.max(1, limit - 1));
 }
 
+function isQingwaSite(siteUrl: string): boolean {
+  try {
+    return new URL(siteUrl).hostname.toLowerCase().replace(/^www\./, "") === "qingwapt.com";
+  } catch {
+    return false;
+  }
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
   const [colorMode, setColorMode] = useState<ColorMode>(() => readStoredTheme());
@@ -275,6 +285,7 @@ function App() {
     auto_login: true,
     auto_keepalive: true,
     auto_signin: false,
+    auto_daily_bonus: false,
     cookiecloud_upload: true,
   });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
@@ -287,6 +298,7 @@ function App() {
     auto_login: true,
     auto_keepalive: true,
     auto_signin: false,
+    auto_daily_bonus: false,
     cookiecloud_upload: true,
   });
   const [busy, setBusy] = useState(false);
@@ -552,6 +564,7 @@ function App() {
         totpSecret: newSite.totp_secret.trim(),
         autoLogin: newSite.auto_login,
         autoSignin: newSite.auto_signin,
+        autoDailyBonus: newSite.auto_daily_bonus,
         cookiecloudUpload: newSite.cookiecloud_upload,
       });
       setConfig(next);
@@ -565,6 +578,7 @@ function App() {
         auto_login: true,
         auto_keepalive: true,
         auto_signin: false,
+        auto_daily_bonus: false,
         cookiecloud_upload: true,
       });
       await refreshStatus();
@@ -676,6 +690,7 @@ function App() {
       auto_login: site.auto_login,
       auto_keepalive: site.auto_keepalive,
       auto_signin: site.auto_signin,
+      auto_daily_bonus: site.auto_daily_bonus,
       cookiecloud_upload: site.cookiecloud_upload,
     });
   }
@@ -701,6 +716,7 @@ function App() {
         autoLogin: editingSite.auto_login,
         autoKeepalive: editingSite.auto_keepalive,
         autoSignin: editingSite.auto_signin,
+        autoDailyBonus: editingSite.auto_daily_bonus,
         cookiecloudUpload: editingSite.cookiecloud_upload,
       });
       setConfig(next);
@@ -761,6 +777,7 @@ function App() {
         autoLogin: site.auto_login,
         autoKeepalive: !site.auto_keepalive,
         autoSignin: site.auto_signin,
+        autoDailyBonus: site.auto_daily_bonus,
         cookiecloudUpload: site.cookiecloud_upload,
       });
       setConfig(next);
@@ -1939,6 +1956,27 @@ function SitesPanel({
                         type="checkbox"
                       />
                     </label>
+                    {isQingwaSite(editingSite.url) ? (
+                      <label className="switch-row site-auto-daily-bonus">
+                        <span className="label-with-help">
+                          自动购买每日福利
+                          <span
+                            className="help-tip"
+                            data-tooltip="保活时打开青蛙福利商店，仅购买 1 蝌蚪兑换 1000 蝌蚪的每日福利；需开启自动保活。"
+                            tabIndex={0}
+                          >
+                            <HelpCircle size={14} />
+                          </span>
+                        </span>
+                        <input
+                          checked={editingSite.auto_daily_bonus}
+                          onChange={(event) =>
+                            onEditChange({ ...editingSite, auto_daily_bonus: event.target.checked })
+                          }
+                          type="checkbox"
+                        />
+                      </label>
+                    ) : null}
                     <label
                       className="switch-row site-cookiecloud-upload"
                     >
@@ -1983,6 +2021,9 @@ function SitesPanel({
                       )}
                       {site.auto_signin ? (
                         <span className="site-login-badge active">自动签到</span>
+                      ) : null}
+                      {site.auto_daily_bonus && isQingwaSite(site.url) ? (
+                        <span className="site-login-badge active">每日福利</span>
                       ) : null}
                     </div>
                     <div className="site-details">

@@ -13,10 +13,12 @@ use tokio::sync::Mutex;
 
 // 登录适配器作为 CDP 的子模块，可以复用内部 WebSocket，同时不向业务层暴露传输细节。
 mod login;
+mod qingwa_bonus;
 mod signin;
 mod traffic;
 
 pub use login::{LoginRequest, LoginState, SiteAdapter};
+pub use qingwa_bonus::is_qingwa_site;
 pub use signin::{SigninResult, SigninStatus};
 pub use traffic::SiteTraffic;
 
