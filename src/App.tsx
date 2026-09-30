@@ -12,6 +12,7 @@ import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
   Activity,
+  BellDot,
   CheckCircle2,
   Clock3,
   Cookie,
@@ -175,6 +176,7 @@ type TabKey = "dashboard" | "sites" | "settings" | "logs";
 type ColorMode = "dark" | "light";
 
 const themeStorageKey = "pt-manager-theme";
+const updateCheckIntervalMs = 60 * 60 * 1000;
 const releaseTag = import.meta.env.VITE_RELEASE_TAG as string | undefined;
 
 const defaultConfig: AppConfig = {
@@ -295,6 +297,8 @@ function App() {
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
+  const updateCheckPromise = useRef<Promise<AppUpdateInfo | null> | null>(null);
   const [testingSiteId, setTestingSiteId] = useState<string | null>(null);
   const [recognizingSiteId, setRecognizingSiteId] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("");
@@ -338,6 +342,18 @@ function App() {
       refreshLogs().catch(showError);
     }, 1000);
 
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    // 自动检查只更新版本提示；安装确认仍由用户点击“检查更新”触发。
+    const checkSilently = () => {
+      void fetchAvailableUpdate().catch(() => {
+        // 后台网络失败不打断应用，下次定时检查会重试。
+      });
+    };
+    checkSilently();
+    const timer = window.setInterval(checkSilently, updateCheckIntervalMs);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -904,11 +920,26 @@ function App() {
     }
   }
 
+  function fetchAvailableUpdate(): Promise<AppUpdateInfo | null> {
+    // 手动检查与整点自动检查重合时，复用同一次请求，避免并发弹窗或重复网络请求。
+    if (!updateCheckPromise.current) {
+      updateCheckPromise.current = invoke<AppUpdateInfo | null>("check_for_app_update")
+        .then((update) => {
+          setAvailableUpdate(update);
+          return update;
+        })
+        .finally(() => {
+          updateCheckPromise.current = null;
+        });
+    }
+    return updateCheckPromise.current;
+  }
+
   async function checkForUpdates() {
     setUpdateBusy(true);
     setError(null);
     try {
-      const update = await invoke<AppUpdateInfo | null>("check_for_app_update");
+      const update = await fetchAvailableUpdate();
       if (!update) {
         await message("当前已是最新版本", {
           kind: "info",
@@ -994,10 +1025,20 @@ function App() {
           <div>
             <span>当前版本</span>
             <strong>{appVersion ? formatVersion(appVersion) : "读取中"}</strong>
+            {availableUpdate ? (
+              <div
+                className="update-available"
+                role="status"
+                title={`发现新版本 ${formatVersion(availableUpdate.version)}`}
+              >
+                <BellDot size={13} aria-hidden="true" />
+                <span>新版 {formatVersion(availableUpdate.version)}</span>
+              </div>
+            ) : null}
           </div>
           <button disabled={updateBusy} onClick={checkForUpdates} type="button">
             <RefreshCw size={14} />
-            <span>{updateBusy ? "检查中" : "检查更新"}</span>
+            <span>{updateBusy ? "检查中" : availableUpdate ? "查看更新" : "检查更新"}</span>
           </button>
         </div>
       </aside>
