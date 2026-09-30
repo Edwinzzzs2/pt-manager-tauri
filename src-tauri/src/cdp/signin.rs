@@ -81,6 +81,7 @@ struct PageState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigninAdapter {
     Dian115,
+    Hdarea,
     Audiences,
     Hdfans,
     PterClub,
@@ -115,6 +116,8 @@ impl SigninAdapter {
     fn from_url(url: &str) -> Self {
         if host_from_url(url).as_deref() == Some("m.dian115.com") {
             Self::Dian115
+        } else if matches!(host_from_url(url).as_deref(), Some("hdarea.club" | "www.hdarea.club")) {
+            Self::Hdarea
         } else if url.to_ascii_lowercase().contains("audiences.me") {
             Self::Audiences
         } else if url.to_ascii_lowercase().contains("hdfans.org") {
@@ -137,6 +140,7 @@ impl SigninAdapter {
     fn label(self) -> &'static str {
         match self {
             Self::Dian115 => "癫影站点适配",
+            Self::Hdarea => "HDArea 首页签到适配",
             Self::Audiences => "观众站点适配",
             Self::Hdfans => "红豆饭站点适配",
             Self::PterClub => "PTerClub 站点适配",
@@ -216,7 +220,15 @@ impl CdpClient {
         progress: Option<&CdpProgress>,
     ) -> Result<SigninResult, String> {
         let adapter = SigninAdapter::from_url(site_url);
+        if adapter == SigninAdapter::Hdarea {
+            check_cancel(progress)?;
+            if let Some(progress) = progress {
+                progress.info(format!("{site_name} 开始点击首页签到按钮（{}）", adapter.label())).await;
+            }
+            return self.evaluate_signin_result(tab_id, HDAREA_SIGNIN_EXPRESSION).await;
+        }
         if adapter == SigninAdapter::Pting {
+            check_cancel(progress)?;
             if let Some(progress) = progress {
                 progress
                     .info(format!("{site_name} 开始自动签到（{}）", adapter.label()))
@@ -279,6 +291,10 @@ impl CdpClient {
         let adapter = SigninAdapter::from_url(site_url);
 
         let initial = inspect_page(&mut websocket)?;
+        // 首页“签到已得”表示此前已经签到，应记录为已签到而不是本次签到成功。
+        if initial.home_already_signed && adapter != SigninAdapter::Rousi {
+            return Ok(result_from_state(SigninStatus::AlreadySigned, initial));
+        }
         if initial.success {
             let status = if adapter == SigninAdapter::Dian115 {
                 SigninStatus::AlreadySigned
@@ -412,10 +428,6 @@ impl CdpClient {
         tab_id: &str,
         kind: ApiSigninKind,
     ) -> Result<SigninResult, String> {
-        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
-            return Err("未找到站点标签页".to_string());
-        };
-        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(15))?;
         let (path, kind_name) = match kind {
             ApiSigninKind::PterClub => ("/attendance-ajax.php", "pterclub"),
             ApiSigninKind::Yema => ("/api/consumer/checkIn", "yema"),
@@ -429,6 +441,14 @@ impl CdpClient {
         }))
         .map_err(|err| err.to_string())?;
         let expression = API_SIGNIN_EXPRESSION.replace("__CONFIG__", &config);
+        self.evaluate_signin_result(tab_id, &expression).await
+    }
+
+    async fn evaluate_signin_result(&self, tab_id: &str, expression: &str) -> Result<SigninResult, String> {
+        let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
+            return Err("未找到站点标签页".to_string());
+        };
+        let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(15))?;
         let response = websocket.call(
             "Runtime.evaluate",
             serde_json::json!({
@@ -578,7 +598,7 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         || el.querySelector?.('img[alt]')?.alt
         || ''
     );
-    const signedPattern = /(今日|今天|本日)?已[签到簽到]|签到已得|簽到已得/i;
+    const signedPattern = /(今日|今天|本日)?已(?:经|經)?(?:签到|簽到)|签到已得|簽到已得/i;
     const successPattern = /(签到|簽到|打卡)(成功|完成)|签到已得|簽到已得/i;
     const failurePattern = /(签到|簽到|打卡).{0,8}(失败|失敗|错误|錯誤)/i;
     const entryPattern = /(签到|簽到|打卡|check[ -]?in|attendance|daily.?sign)/i;
@@ -596,7 +616,10 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         return { el, text, href, score };
     }).filter((item) => item.score > 0).sort((a, b) => b.score - a.score);
 
-    const homeSigned = elements.some((el) => visible(el) && signedPattern.test(textOf(el)));
+    // HDDolby 将“签到已得”作为退出链接附近的普通文本，而不是签到链接。
+    const accountHeader = document.querySelector('a[href*="logout.php"]')?.closest('td');
+    const homeSigned = elements.some((el) => visible(el) && signedPattern.test(textOf(el)))
+        || Boolean(accountHeader && signedPattern.test(clean(accountHeader.innerText)));
     const actionCandidates = elements.map((el, index) => ({ el, index, text: textOf(el) })).filter(({ el, text }) => {
         if (!visible(el) || el.tagName === 'A') return false;
         const selectedNavigation = el.getAttribute('aria-pressed') === 'true'
@@ -664,9 +687,11 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
             .find((text) => /^(普通签到|运气签到).{0,15}[+\-]\d+\s*积分\s*余额\s*\d+/i.test(text)) || ''
         : '';
     const dian115Award = dian115Result.match(/([+\-]\d+)\s*积分/);
+    // HDDolby 的重复签到页仍保留页头“签到已得”，应优先采用正文的“今天已经签到过了”。
+    const explicitAlreadySigned = /(?:今天|今日|本日).{0,8}已(?:经|經)?(?:签到|簽到)|请勿重[复複]刷新/i.test(bodyText);
     const success = location.hostname === 'm.dian115.com'
         ? Boolean(dian115Result)
-        : successPattern.test(bodyText) || completedAttendancePattern.test(bodyText);
+        : !explicitAlreadySigned && (successPattern.test(bodyText) || completedAttendancePattern.test(bodyText));
     const alreadySigned = !success && signedPattern.test(bodyText);
     const explicitFailure = failurePattern.test(bodyText);
     const resultMessage = Array.from(document.querySelectorAll('h1, h2, h3, .message, .alert, .attendance-card__title'))
@@ -700,6 +725,49 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         consecutiveDays: textNumber(/(?:已)?(?:连续|連續)(?:签到|簽到)?\s*(\d+)\s*(?:天|日)/i)
             ?? numberStat(/(连续|連續).{0,8}(签到|簽到).{0,4}(天数|天數|日数|日數)?/i)
     };
+})()"#;
+
+// HDArea 点击首页按钮后通过 alert 返回结果。临时读取该提示，避免原生弹窗阻塞 CDP，且不依据无条件显示的“已签到”节点判定成功。
+const HDAREA_SIGNIN_EXPRESSION: &str = r#"(async () => {
+    const result = (success, alreadySigned, message, reward = null, consecutiveDays = null) => ({
+        success, alreadySigned, message, reward, totalDays: null, consecutiveDays
+    });
+    const visible = (el) => Boolean(el && el.getClientRects().length
+        && getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden');
+    if (!['hdarea.club', 'www.hdarea.club'].includes(location.hostname)
+        || document.querySelector('input[type="password"]'))
+        return result(false, false, 'HDArea 登录状态已失效或当前页面域名不匹配');
+    if (visible(document.getElementById('sign_in_done')))
+        return result(false, true, '今日已签到');
+    const entries = [...document.querySelectorAll('a[onclick*="sign_in("]')].filter(visible);
+    if (entries.length !== 1)
+        return result(false, false, `HDArea 首页签到按钮数量异常：${entries.length}`);
+    return await new Promise(resolve => {
+        const originalAlert = window.alert;
+        let timer;
+        const finish = value => {
+            clearTimeout(timer);
+            window.alert = originalAlert;
+            resolve(value);
+        };
+        window.alert = message => {
+            const text = String(message || '').replace(/\s+/g, ' ').trim();
+            const already = /已(?:经)?(?:签到|簽到)|重[复複].{0,8}(签到|簽到)/.test(text);
+            const failed = /失败|失敗|错误|錯誤|未登录|未登入/.test(text);
+            const success = !already && !failed &&
+                (/(签到|簽到).{0,12}(成功|完成)/.test(text) || /此次(?:签到|簽到).{0,12}(?:获得|獲得)/.test(text));
+            const reward = text.match(/(?:获得|獲得)了?\s*([\d,.]+)\s*([^!！。，\s]{1,12})/);
+            const days = text.match(/(?:连续|連續)(?:签到|簽到)\s*(\d+)\s*天/);
+            finish(result(success, already, text.slice(0, 300) || 'HDArea 签到提示为空',
+                reward ? `${reward[1]} ${reward[2].replace(/奖励$/, '')}` : null,
+                days ? Number(days[1]) : null));
+        };
+        timer = setTimeout(() => finish(result(false, false,
+            '已点击 HDArea 签到按钮，但未收到结果提示，请检查站点状态')), 12000);
+        try { entries[0].click(); } catch (error) {
+            finish(result(false, false, `HDArea 签到点击失败：${error?.message || error}`));
+        }
+    });
 })()"#;
 
 const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
