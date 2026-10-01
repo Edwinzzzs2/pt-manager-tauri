@@ -2,7 +2,7 @@
 
 use super::common::{
     click_runtime_element, human_delay, nexus_captcha_page_state, nexus_login_page_state,
-    type_runtime_input,
+    runtime_object_bool, type_runtime_input,
 };
 use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
@@ -102,6 +102,16 @@ impl CdpClient {
                         ),
                         last_remaining_attempts,
                     ));
+                }
+            }
+
+            // 青蛙初始页虽已有输入框节点，但表单收起；先点入口再填写。
+            if reveal_qingwa_login_form(&mut websocket)
+                .await
+                .map_err(|err| (err, last_remaining_attempts))?
+            {
+                if let Some(p) = progress {
+                    p.info("已点击青蛙登录入口，登录表单已展开").await;
                 }
             }
 
@@ -301,6 +311,8 @@ impl CdpClient {
             let mut captcha_solved = false;
             let mut logged_challenge_msg = false;
             let mut stable_solved_samples = 0usize;
+            let mut has_altcha = false;
+            let mut altcha_clicked = false;
 
             for _ in 0..120 {
                 // 最多等待 60 秒
@@ -324,11 +336,20 @@ impl CdpClient {
                             || src.includes('recaptcha/api.js')
                             || src.includes('hcaptcha.com/1/api.js');
                     });
-                    const hasChallenge = fields.length > 0 || Boolean(challengeElement) || challengeScript;
-                    const solved = Array.from(fields).some((field) =>
+                    const altcha = document.querySelector('altcha-widget');
+                    const altchaVerified = altcha?.querySelector('.altcha[data-state="verified"]')
+                        || (altcha?.querySelector('input[name="altcha"]')?.value || '').trim().length > 0;
+                    const canClickAltcha = ['qingwapt.com', 'www.qingwapt.com'].includes(location.hostname)
+                        && Boolean(altcha?.querySelector('.altcha[data-state="unverified"] input[type="checkbox"]'));
+                    const hasTokenChallenge = fields.length > 0 || Boolean(challengeElement) || challengeScript;
+                    const hasChallenge = hasTokenChallenge || Boolean(altcha);
+                    const tokenSolved = Array.from(fields).some((field) =>
                         typeof field.value === 'string' && field.value.trim().length > 10
                     );
-                    return { hasChallenge, solved };
+                    // 青蛙的 ALTCHA 完成前禁用登录按钮，不能把点击禁用按钮视作提交成功。
+                    const solved = (!hasTokenChallenge || tokenSolved)
+                        && (!altcha || Boolean(altchaVerified));
+                    return { hasChallenge, solved, hasAltcha: Boolean(altcha), canClickAltcha };
                 })()"#;
 
                 let val_res = websocket.call(
@@ -350,6 +371,27 @@ impl CdpClient {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         let solved = val.get("solved").and_then(|v| v.as_bool()).unwrap_or(true);
+                        has_altcha |= val
+                            .get("hasAltcha")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        // 只点击一次；验证过程会异步进入 verifying，重复点击可能重置结果。
+                        if !altcha_clicked
+                            && val
+                                .get("canClickAltcha")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            && click_runtime_element(
+                                &mut websocket,
+                                "altcha-widget .altcha[data-state=\"unverified\"] input[type=\"checkbox\"]",
+                            )
+                        {
+                            altcha_clicked = true;
+                            logged_challenge_msg = true;
+                            if let Some(p) = progress {
+                                p.info("已点击青蛙 ALTCHA 验证框，等待验证完成...").await;
+                            }
+                        }
 
                         if !has_challenge {
                             captcha_solved = true;
@@ -368,7 +410,12 @@ impl CdpClient {
 
                         if !logged_challenge_msg {
                             if let Some(p) = progress {
-                                p.info("检测到页面存在人机验证（如 Cloudflare Turnstile），请在浏览器中完成验证...").await;
+                                let message = if has_altcha {
+                                    "检测到 ALTCHA 验证，请在浏览器中勾选并等待验证完成..."
+                                } else {
+                                    "检测到页面存在人机验证（如 Cloudflare Turnstile），请在浏览器中完成验证..."
+                                };
+                                p.info(message).await;
                             }
                             logged_challenge_msg = true;
                         }
@@ -380,7 +427,11 @@ impl CdpClient {
 
             if !captcha_solved {
                 return Err((
-                    format!("等待 {} 人机验证通过超时", site_name),
+                    format!(
+                        "等待 {} {}验证通过超时",
+                        site_name,
+                        if has_altcha { "ALTCHA " } else { "人机" }
+                    ),
                     last_remaining_attempts,
                 ));
             }
@@ -435,13 +486,14 @@ impl CdpClient {
                     const challengeSubmit = form.querySelector(
                         '#submit-btn, input[type="button"][value="登录"], input[type="button"][value="Login"]'
                     );
-                    if (!challengeSubmit) return false;
+                    if (!challengeSubmit || challengeSubmit.disabled) return false;
                     challengeSubmit.click();
                     return true;
                 }
 
                 const submitBtn = form.querySelector('input[type="submit"], button[type="submit"]');
                 if (submitBtn) {
+                    if (submitBtn.disabled) return false;
                     submitBtn.click();
                     return true;
                 }
@@ -475,7 +527,7 @@ impl CdpClient {
             if !submitted {
                 if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"], button[type=\"submit\"]") {
                     if !click_runtime_element(&mut websocket, "input[type=\"submit\"]") {
-                        return Err((format!("未找到 {} 登录按钮", site_name), last_remaining_attempts));
+                        return Err((format!("{} 登录按钮尚未启用或未找到", site_name), last_remaining_attempts));
                     }
                 }
             }
@@ -729,4 +781,50 @@ impl CdpClient {
             Err("未找到 NexusPHP 图片验证码输入框".to_string())
         }
     }
+}
+
+async fn reveal_qingwa_login_form(websocket: &mut CdpWebSocket) -> Result<bool, String> {
+    let expression = r#"(() => {
+        if (!['qingwapt.com', 'www.qingwapt.com'].includes(location.hostname))
+            return { ok: true, opened: false };
+        const form = document.querySelector('form[action*="takelogin.php"]');
+        const username = form?.querySelector('input[name="username"]');
+        if (!username) return { ok: false, opened: false };
+        if (form.getBoundingClientRect().width > 0) return { ok: true, opened: false };
+        const entry = document.querySelector('button#login');
+        if (!entry || entry.disabled) return { ok: false, opened: false };
+        entry.click();
+        return { ok: true, opened: true };
+    })()"#;
+    let response = websocket
+        .call(
+            "Runtime.evaluate",
+            serde_json::json!({ "expression": expression, "returnByValue": true }),
+        )
+        .map_err(|err| format!("检查青蛙登录入口失败：{}", err))?;
+    let value = response
+        .get("result")
+        .and_then(|result| result.get("result"))
+        .and_then(|result| result.get("value"))
+        .ok_or_else(|| "无法读取青蛙登录入口状态".to_string())?;
+    if !value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false) {
+        return Err("未找到青蛙登录入口或登录表单".to_string());
+    }
+    let opened = value
+        .get("opened")
+        .and_then(|opened| opened.as_bool())
+        .unwrap_or(false);
+    if opened {
+        let visible = r#"(() => ({
+            ready: (document.querySelector('form[action*="takelogin.php"]')?.getBoundingClientRect().width || 0) > 0
+        }))()"#;
+        for _ in 0..20 {
+            if runtime_object_bool(websocket, visible, "ready").unwrap_or(false) {
+                return Ok(true);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        return Err("已点击青蛙登录入口，但登录表单未展开".to_string());
+    }
+    Ok(false)
 }

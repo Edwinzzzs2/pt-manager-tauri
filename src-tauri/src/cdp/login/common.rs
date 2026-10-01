@@ -237,6 +237,7 @@ pub(super) fn click_runtime_element(websocket: &mut CdpWebSocket, selector: &str
         r#"(() => {{
             const element = document.querySelector({selector});
             if (!element) return {{ ok: false }};
+            if (element.matches(':disabled')) return {{ ok: false }};
             element.focus();
             element.click();
             return {{ ok: true }};

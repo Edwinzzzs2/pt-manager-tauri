@@ -1,3 +1,4 @@
+use crate::bark;
 use crate::cdp::{
     is_qingwa_site, CdpClient, CdpProgress, LoginRequest, LoginState, SigninResult, SigninStatus,
     SiteTraffic, CDP_CANCELLED,
@@ -640,7 +641,7 @@ async fn try_read_site_traffic(
     }
 }
 
-async fn send_gotify_login_summary(
+async fn send_notification_summary(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     successful_sites: &[String],
@@ -648,24 +649,33 @@ async fn send_gotify_login_summary(
     signin_results: &[(String, SigninResult)],
     traffic_results: &[(String, SiteTraffic)],
 ) {
-    if !config.gotify.enabled {
-        return;
-    }
-
-    match gotify::send_login_summary(
-        &config.gotify,
-        successful_sites,
-        failed_sites,
-        signin_results,
-        traffic_results,
-    )
-    .await
-    {
-        Ok(()) => {
-            push_log(logs, LogEntry::success("Gotify 保活结果通知已发送")).await;
+    if config.gotify.enabled {
+        match gotify::send_login_summary(
+            &config.gotify,
+            successful_sites,
+            failed_sites,
+            signin_results,
+            traffic_results,
+        )
+        .await
+        {
+            Ok(()) => push_log(logs, LogEntry::success("Gotify 保活结果通知已发送")).await,
+            Err(err) => push_log(logs, LogEntry::error(err)).await,
         }
-        Err(err) => {
-            push_log(logs, LogEntry::error(err)).await;
+    }
+    // 两种通知分别发送，任一服务失败都不会阻止另一种通知。
+    if config.bark.enabled {
+        match bark::send_login_summary(
+            &config.bark,
+            successful_sites,
+            failed_sites,
+            signin_results,
+            traffic_results,
+        )
+        .await
+        {
+            Ok(()) => push_log(logs, LogEntry::success("Bark 保活结果通知已发送")).await,
+            Err(err) => push_log(logs, LogEntry::error(err)).await,
         }
     }
 }
@@ -911,7 +921,7 @@ async fn run_keepalive_batch(
     if opened_tabs.is_empty() {
         push_log(logs, LogEntry::error("没有成功打开任何站点，保活任务结束")).await;
         close_browser_instance(cdp, logs, launched_browser).await;
-        send_gotify_login_summary(
+        send_notification_summary(
             config,
             logs,
             &successful_logins,
@@ -966,7 +976,7 @@ async fn run_keepalive_batch(
     }
 
     push_log(logs, LogEntry::success("保活任务全部完成".to_string())).await;
-    send_gotify_login_summary(
+    send_notification_summary(
         config,
         logs,
         &successful_logins,

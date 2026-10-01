@@ -126,6 +126,7 @@ type AppConfig = {
   update_proxy_password: string;
   cookiecloud: CookieCloudConfig;
   gotify: GotifyConfig;
+  bark: BarkConfig;
 };
 
 type CookieCloudConfig = {
@@ -138,6 +139,13 @@ type GotifyConfig = {
   enabled: boolean;
   server_url: string;
   token: string;
+  title: string;
+};
+
+type BarkConfig = {
+  enabled: boolean;
+  server_url: string;
+  device_key: string;
   title: string;
 };
 
@@ -207,6 +215,12 @@ const defaultConfig: AppConfig = {
     enabled: false,
     server_url: "",
     token: "",
+    title: "PT Manager 保活结果",
+  },
+  bark: {
+    enabled: false,
+    server_url: "https://api.day.app",
+    device_key: "",
     title: "PT Manager 保活结果",
   },
 };
@@ -306,6 +320,7 @@ function App() {
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
   const [cookieCloudClearBusy, setCookieCloudClearBusy] = useState(false);
   const [gotifyTestBusy, setGotifyTestBusy] = useState(false);
+  const [barkTestBusy, setBarkTestBusy] = useState(false);
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -891,6 +906,12 @@ function App() {
         token: settingsDraft.gotify.token.trim(),
         title: settingsDraft.gotify.title.trim() || "PT Manager 保活结果",
       },
+      bark: {
+        ...settingsDraft.bark,
+        server_url: settingsDraft.bark.server_url.trim().replace(/\/+$/, ""),
+        device_key: settingsDraft.bark.device_key.trim(),
+        title: settingsDraft.bark.title.trim() || "PT Manager 保活结果",
+      },
     };
 
     setBusy(true);
@@ -924,6 +945,25 @@ function App() {
       showError(err);
     } finally {
       setGotifyTestBusy(false);
+    }
+  }
+
+  async function testBark() {
+    setBarkTestBusy(true);
+    setError(null);
+    try {
+      const result = await invoke<string>("test_bark", {
+        config: {
+          ...settingsDraft.bark,
+          server_url: settingsDraft.bark.server_url.trim().replace(/\/+$/, ""),
+          device_key: settingsDraft.bark.device_key.trim(),
+        },
+      });
+      setNotice(result);
+    } catch (err) {
+      showError(err);
+    } finally {
+      setBarkTestBusy(false);
     }
   }
 
@@ -1168,6 +1208,7 @@ function App() {
               cookieCloudClearBusy={cookieCloudClearBusy}
               cookieSyncBusy={cookieSyncBusy}
               gotifyTestBusy={gotifyTestBusy}
+              barkTestBusy={barkTestBusy}
               draft={settingsDraft}
               onChange={setSettingsDraft}
               onClearBrowserData={clearBrowserData}
@@ -1175,6 +1216,7 @@ function App() {
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               onTestGotify={testGotify}
+              onTestBark={testBark}
               taskRunning={!!status?.is_running}
               onImportConfig={importConfig}
               onExportConfig={exportConfig}
@@ -2251,6 +2293,7 @@ function SettingsPanel({
   cookieCloudClearBusy,
   cookieSyncBusy,
   gotifyTestBusy,
+  barkTestBusy,
   draft,
   onChange,
   onClearBrowserData,
@@ -2258,6 +2301,7 @@ function SettingsPanel({
   onSave,
   onSyncCookieCloud,
   onTestGotify,
+  onTestBark,
   taskRunning,
   onImportConfig,
   onExportConfig,
@@ -2267,6 +2311,7 @@ function SettingsPanel({
   cookieCloudClearBusy: boolean;
   cookieSyncBusy: boolean;
   gotifyTestBusy: boolean;
+  barkTestBusy: boolean;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
   onClearBrowserData: () => void;
@@ -2274,6 +2319,7 @@ function SettingsPanel({
   onSave: () => void;
   onSyncCookieCloud: () => void;
   onTestGotify: () => void;
+  onTestBark: () => void;
   taskRunning: boolean;
   onImportConfig: () => void;
   onExportConfig: () => void;
@@ -2281,6 +2327,7 @@ function SettingsPanel({
   const [showProxyPassword, setShowProxyPassword] = useState(false);
   const [showCookiePassword, setShowCookiePassword] = useState(false);
   const [showGotifyToken, setShowGotifyToken] = useState(false);
+  const [showBarkKey, setShowBarkKey] = useState(false);
 
   return (
     <div className="settings-stack">
@@ -2736,6 +2783,84 @@ function SettingsPanel({
             </label>
             <p className="field-hint">
               每次保活任务结束后发送一条通知；开启自动登录时会同时汇总登录结果。
+            </p>
+          </div>
+        </section>
+
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Bark</p>
+              <h2>任务通知</h2>
+            </div>
+            <div className="row-actions">
+              <button
+                className="ghost"
+                disabled={barkTestBusy || !draft.bark.server_url.trim() || !draft.bark.device_key.trim()}
+                onClick={onTestBark}
+                type="button"
+              >
+                {barkTestBusy ? <RefreshCw size={16} /> : <Send size={16} />}
+                <span>{barkTestBusy ? "测试中" : "测试通知"}</span>
+              </button>
+            </div>
+          </div>
+          <div className="settings-form">
+            <label className="switch-row">
+              <span>启用 Bark 通知</span>
+              <input
+                checked={draft.bark.enabled}
+                onChange={(event) =>
+                  onChange({ ...draft, bark: { ...draft.bark, enabled: event.target.checked } })
+                }
+                type="checkbox"
+              />
+            </label>
+            <label>
+              <span>Bark 服务地址</span>
+              <input
+                onChange={(event) =>
+                  onChange({ ...draft, bark: { ...draft.bark, server_url: event.target.value } })
+                }
+                placeholder="https://api.day.app"
+                type="url"
+                value={draft.bark.server_url}
+              />
+            </label>
+            <label>
+              <span>通知标题</span>
+              <input
+                onChange={(event) =>
+                  onChange({ ...draft, bark: { ...draft.bark, title: event.target.value } })
+                }
+                placeholder="PT Manager 保活结果"
+                type="text"
+                value={draft.bark.title}
+              />
+            </label>
+            <label>
+              <span>设备 Key</span>
+              <div className="password-field">
+                <input
+                  onChange={(event) =>
+                    onChange({ ...draft, bark: { ...draft.bark, device_key: event.target.value } })
+                  }
+                  placeholder="Bark 设备 Key"
+                  type={showBarkKey ? "text" : "password"}
+                  value={draft.bark.device_key}
+                />
+                <button
+                  aria-label={showBarkKey ? "隐藏设备 Key" : "显示设备 Key"}
+                  onClick={() => setShowBarkKey((value) => !value)}
+                  title={showBarkKey ? "隐藏设备 Key" : "显示设备 Key"}
+                  type="button"
+                >
+                  {showBarkKey ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
+            <p className="field-hint">
+              填写 Bark App 中显示的服务地址和设备 Key；保活任务结束后发送登录与签到汇总。
             </p>
           </div>
         </section>

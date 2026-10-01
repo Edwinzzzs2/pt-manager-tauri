@@ -77,6 +77,8 @@ pub struct AppConfig {
     pub cookiecloud: CookieCloudConfig,
     #[serde(default)]
     pub gotify: GotifyConfig,
+    #[serde(default)]
+    pub bark: BarkConfig,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +121,26 @@ pub struct GotifyConfig {
     pub title: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarkConfig {
+    pub enabled: bool,
+    pub server_url: String,
+    pub device_key: String,
+    #[serde(default = "default_gotify_title")]
+    pub title: String,
+}
+
+impl Default for BarkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: "https://api.day.app".to_string(),
+            device_key: String::new(),
+            title: default_gotify_title(),
+        }
+    }
+}
+
 impl Default for GotifyConfig {
     fn default() -> Self {
         Self {
@@ -155,6 +177,7 @@ impl Default for AppConfig {
             update_proxy_password: String::new(),
             cookiecloud: CookieCloudConfig::default(),
             gotify: GotifyConfig::default(),
+            bark: BarkConfig::default(),
         }
     }
 }

@@ -1,3 +1,4 @@
+use crate::bark;
 use crate::cdp::{
     self, CdpClient, CdpLocalStorageParam, CdpProgress, LoginRequest, LoginState, SigninStatus,
     SiteAdapter,
@@ -136,6 +137,20 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     {
         return Err("启用 Gotify 通知前，请填写服务地址和应用 Token".to_string());
     }
+    config.bark.server_url = config
+        .bark
+        .server_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    config.bark.device_key = config.bark.device_key.trim().to_string();
+    config.bark.title = config.bark.title.trim().to_string();
+    if config.bark.title.is_empty() {
+        config.bark.title = "PT Manager 保活结果".to_string();
+    }
+    if config.bark.enabled {
+        bark::validate_config(&config.bark)?;
+    }
     if (config.auto_sync_cookie || config.auto_sync_cookie_after_keepalive)
         && (config.cookiecloud.server_url.trim().is_empty()
             || config.cookiecloud.uuid.trim().is_empty()
@@ -168,6 +183,12 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
 pub async fn test_gotify(config: crate::store::GotifyConfig) -> Result<String, String> {
     gotify::send_test(&config).await?;
     Ok("Gotify 测试通知已发送，请检查接收端".to_string())
+}
+
+#[tauri::command]
+pub async fn test_bark(config: crate::store::BarkConfig) -> Result<String, String> {
+    bark::send_test(&config).await?;
+    Ok("Bark 测试通知已发送，请检查接收设备".to_string())
 }
 
 #[tauri::command]

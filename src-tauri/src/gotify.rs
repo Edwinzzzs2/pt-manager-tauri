@@ -257,6 +257,40 @@ fn build_report(
     (lines.join("\n"), report)
 }
 
+/// Bark 发送普通文本；复用同一份统计，去掉仅用于 Gotify Markdown 展示的标记。
+pub(crate) fn build_plain_report(
+    successful_sites: &[String],
+    failed_sites: &[(String, String)],
+    signin_results: &[(String, SigninResult)],
+    traffic_results: &[(String, SiteTraffic)],
+) -> String {
+    let (markdown, _) = build_report(
+        successful_sites,
+        failed_sites,
+        signin_results,
+        traffic_results,
+    );
+    markdown
+        .lines()
+        .map(|line| {
+            line.trim_start_matches("## ")
+                .trim_start_matches("**")
+                .replace("**", "")
+                .replace("\\`", "`")
+                .replace("\\*", "*")
+                .replace("\\_", "_")
+                .replace("\\[", "[")
+                .replace("\\]", "]")
+                .replace("\\<", "<")
+                .replace("\\>", ">")
+                .replace("\\#", "#")
+                .replace("\\|", "|")
+                .replace("\\\\", "\\")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub async fn send_login_summary(
     config: &GotifyConfig,
     successful_sites: &[String],

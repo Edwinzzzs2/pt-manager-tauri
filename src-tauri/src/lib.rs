@@ -1,4 +1,5 @@
 mod auth;
+mod bark;
 mod cdp;
 mod commands;
 mod cookiecloud;
@@ -78,6 +79,7 @@ pub fn run() {
             commands::get_config,
             commands::save_config,
             commands::test_gotify,
+            commands::test_bark,
             commands::add_site,
             commands::import_sites_from_json,
             commands::remove_site,
