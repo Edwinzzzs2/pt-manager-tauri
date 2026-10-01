@@ -12,6 +12,7 @@ dist
 dist-ssr
 artifacts
 release-assets
+.playwright-mcp/
 *.local
 package-lock.json
 yarn.lock
