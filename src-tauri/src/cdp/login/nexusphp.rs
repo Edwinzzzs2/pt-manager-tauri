@@ -44,16 +44,15 @@ impl CdpClient {
             if attempt > 0 {
                 if let Some(p) = progress {
                     p.info(format!(
-                        "前一次登录尝试失败，准备点击获取新的图片代码进行第 {}/{} 次重试...",
+                        "前一次验证码识别或登录失败，准备换一张验证码进行第 {}/{} 次尝试...",
                         attempt + 1,
                         max_attempts
                     ))
                     .await;
                 }
-                self.prepare_nexusphp_captcha_retry(tab_id)
+                self.prepare_nexusphp_captcha_retry(tab_id, true)
                     .await
                     .map_err(|err| (err, last_remaining_attempts))?;
-                tokio::time::sleep(Duration::from_millis(1500)).await;
             }
 
             let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))
@@ -247,7 +246,7 @@ impl CdpClient {
                     let image_base64_clone = image_base64.to_string();
                     // 每张验证码只识别一次；识别失败时由外层登录重试刷新页面并获取新验证码。
                     let recognition = tauri::async_runtime::spawn_blocking(move || {
-                        crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone, 1)
+                        crate::ocr::recognize(&ocr_server_url_clone, &image_base64_clone)
                     })
                     .await
                     .map_err(|err| (err.to_string(), last_remaining_attempts))?;
@@ -257,12 +256,23 @@ impl CdpClient {
                         Err(err) => {
                             if let Some(p) = progress {
                                 p.info(format!(
-                                    "第 {}/{} 张验证码识别失败：{}，准备刷新页面获取新验证码",
+                                    "第 {}/{} 张验证码识别失败：{}{}",
                                     attempt + 1,
                                     max_attempts,
-                                    err
+                                    err,
+                                    if attempt + 1 < max_attempts {
+                                        "，准备原地刷新页面获取新验证码"
+                                    } else {
+                                        "，已达到换图尝试上限"
+                                    }
                                 ))
                                 .await;
+                            }
+                            if attempt + 1 >= max_attempts {
+                                return Err((
+                                    format!("{} 验证码识别失败：{}，已尝试 {} 张验证码", site_name, err, max_attempts),
+                                    last_remaining_attempts,
+                                ));
                             }
                             continue;
                         }
@@ -313,6 +323,7 @@ impl CdpClient {
             let mut stable_solved_samples = 0usize;
             let mut has_altcha = false;
             let mut altcha_clicked = false;
+            let mut logged_challenge_state = false;
 
             for _ in 0..120 {
                 // 最多等待 60 秒
@@ -321,27 +332,37 @@ impl CdpClient {
                 }
 
                 let eval_expr = r#"(() => {
-                    const fields = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
-                    const challengeElement = document.querySelector([
+                    const password = document.querySelector('input[name="password"], input[type="password"]');
+                    const form = password?.form || password?.closest('form');
+                    // 公共脚本和广告里的验证不属于登录；只等待登录表单实际需要的验证。
+                    const fields = Array.from(document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]'))
+                        .filter((field) => form && (field.form === form || form.contains(field)));
+                    const widgets = Array.from(form?.querySelectorAll([
                         '.cf-turnstile',
                         '.g-recaptcha',
                         '.h-captcha',
                         'iframe[src*="challenges.cloudflare.com"]',
                         'iframe[src*="recaptcha"]',
                         'iframe[src*="hcaptcha.com"]'
-                    ].join(','));
+                    ].join(',')) || []).filter((element) => {
+                        const bounds = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        return bounds.width > 0 && bounds.height > 0
+                            && style.display !== 'none' && style.visibility !== 'hidden';
+                    });
                     const challengeScript = Array.from(document.scripts).some((script) => {
                         const src = (script.src || '').toLowerCase();
                         return src.includes('challenges.cloudflare.com/turnstile')
                             || src.includes('recaptcha/api.js')
                             || src.includes('hcaptcha.com/1/api.js');
                     });
-                    const altcha = document.querySelector('altcha-widget');
+                    const altcha = form?.querySelector('altcha-widget');
                     const altchaVerified = altcha?.querySelector('.altcha[data-state="verified"]')
                         || (altcha?.querySelector('input[name="altcha"]')?.value || '').trim().length > 0;
                     const canClickAltcha = ['qingwapt.com', 'www.qingwapt.com'].includes(location.hostname)
                         && Boolean(altcha?.querySelector('.altcha[data-state="unverified"] input[type="checkbox"]'));
-                    const hasTokenChallenge = fields.length > 0 || Boolean(challengeElement) || challengeScript;
+                    // 仅加载验证脚本不能证明需要验证，否则没有验证码的页面会一直等待。
+                    const hasTokenChallenge = fields.length > 0 || widgets.length > 0;
                     const hasChallenge = hasTokenChallenge || Boolean(altcha);
                     const tokenSolved = Array.from(fields).some((field) =>
                         typeof field.value === 'string' && field.value.trim().length > 10
@@ -349,7 +370,10 @@ impl CdpClient {
                     // 青蛙的 ALTCHA 完成前禁用登录按钮，不能把点击禁用按钮视作提交成功。
                     const solved = (!hasTokenChallenge || tokenSolved)
                         && (!altcha || Boolean(altchaVerified));
-                    return { hasChallenge, solved, hasAltcha: Boolean(altcha), canClickAltcha };
+                    return {
+                        hasChallenge, solved, hasAltcha: Boolean(altcha), canClickAltcha,
+                        fieldCount: fields.length, widgetCount: widgets.length, challengeScript
+                    };
                 })()"#;
 
                 let val_res = websocket.call(
@@ -371,6 +395,19 @@ impl CdpClient {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         let solved = val.get("solved").and_then(|v| v.as_bool()).unwrap_or(true);
+                        if !logged_challenge_state {
+                            if let Some(p) = progress {
+                                p.info(format!(
+                                    "{} 人机验证检查：登录表单内响应字段 {} 个，可见验证控件 {} 个，ALTCHA {}，验证脚本 {}",
+                                    site_name,
+                                    val.get("fieldCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    val.get("widgetCount").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    if val.get("hasAltcha").and_then(|v| v.as_bool()).unwrap_or(false) { "有" } else { "无" },
+                                    if val.get("challengeScript").and_then(|v| v.as_bool()).unwrap_or(false) { "已加载" } else { "未加载" },
+                                )).await;
+                            }
+                            logged_challenge_state = true;
+                        }
                         has_altcha |= val
                             .get("hasAltcha")
                             .and_then(|v| v.as_bool())
@@ -394,6 +431,9 @@ impl CdpClient {
                         }
 
                         if !has_challenge {
+                            if let Some(p) = progress {
+                                p.info(format!("{} 登录表单无需人机验证，准备点击登录", site_name)).await;
+                            }
                             captcha_solved = true;
                             break;
                         }
@@ -530,6 +570,9 @@ impl CdpClient {
                         return Err((format!("{} 登录按钮尚未启用或未找到", site_name), last_remaining_attempts));
                     }
                 }
+            }
+            if let Some(p) = progress {
+                p.info(format!("已触发 {} 登录按钮，等待站点返回结果", site_name)).await;
             }
 
             let mut login_success = false;
@@ -679,26 +722,35 @@ impl CdpClient {
             .ok_or_else(|| "验证码截图数据为空".to_string())
     }
 
-    /// 如果当前是图片代码无效页面，进入新的 NexusPHP 验证码登录页。
-    pub async fn prepare_nexusphp_captcha_retry(&self, tab_id: &str) -> Result<bool, String> {
+    /// 失败页通过返回链接换图；登录页重试时原地刷新，避免重复识别同一张图。
+    pub async fn prepare_nexusphp_captcha_retry(
+        &self,
+        tab_id: &str,
+        refresh_current: bool,
+    ) -> Result<bool, String> {
         let Some(websocket_url) = self.websocket_url_for_tab(tab_id)? else {
             return Err("无法连接 NexusPHP 标签页".to_string());
         };
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
-        let expression = r#"(() => {
-            if (document.querySelector('input[name="imagestring"]')) {
-                return { ok: true, renewed: false };
-            }
+        let expression = format!(
+            r#"(() => {{
+            const timeOrigin = performance.timeOrigin;
+            const isSubmissionPage = /\/takelogin\.php$/i.test(location.pathname);
+            if (document.querySelector('input[name="imagestring"]') && !isSubmissionPage) {{
+                return {{ ok: true, renewed: {refresh}, reload: {refresh}, timeOrigin }};
+            }}
             const body = document.body?.innerText || '';
-            if (!body.includes('图片代码无效')) return { ok: false, renewed: false };
+            if (!body.includes('图片代码无效')) return {{ ok: false, renewed: false }};
             const link = Array.from(document.querySelectorAll('a')).find((element) =>
                 (element.textContent || '').includes('获取新的图片代码')
                 || (element.getAttribute('href') || '').includes('login.php')
             );
-            if (!link) return { ok: false, renewed: false };
+            if (!link) return {{ ok: false, renewed: false }};
             link.click();
-            return { ok: true, renewed: true };
-        })()"#;
+            return {{ ok: true, renewed: true, reload: false, timeOrigin }};
+        }})()"#,
+            refresh = refresh_current
+        );
         let response = websocket
             .call(
                 "Runtime.evaluate",
@@ -726,10 +778,33 @@ impl CdpClient {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         if renewed {
+            let previous_origin = value
+                .get("timeOrigin")
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| "无法读取刷新前的验证码页面标识".to_string())?;
+            if value
+                .get("reload")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                // 只刷新当前登录页；错误结果页仍走返回链接，避免重发上一笔登录请求。
+                websocket
+                    .call("Page.reload", serde_json::json!({ "ignoreCache": true }))
+                    .map_err(|err| format!("刷新验证码登录页失败：{}", err))?;
+            }
+            let image_ready = format!(
+                r#"(() => {{
+                const image = document.querySelector('img[alt="CAPTCHA"], img[src*="captcha" i], img[src*="image.php" i]');
+                return {{ ready: performance.timeOrigin !== {previous_origin}
+                    && Boolean(image && image.complete && image.naturalWidth) }};
+            }})()"#
+            );
             for _ in 0..40 {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 if nexus_captcha_page_state(&mut websocket)
-                    .is_some_and(|state| state.has_login_form && state.has_captcha)
+                    .is_some_and(|state| state.ready && !state.challenge && state.has_login_form && state.has_captcha)
+                    // 先确认已进入新文档，再等图片加载，避免截到刷新前仍可见的旧验证码。
+                    && runtime_object_bool(&mut websocket, &image_ready, "ready").unwrap_or(false)
                 {
                     return Ok(true);
                 }

@@ -17,77 +17,53 @@ static BETA_INITIALIZED_SERVERS: LazyLock<Mutex<HashSet<String>>> =
 
 pub struct RecognitionResult {
     pub text: String,
-    pub attempts: u8,
 }
 
-pub fn recognize(
-    server_url: &str,
-    image_base64: &str,
-    retry_count: u8,
-) -> Result<RecognitionResult, String> {
+pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResult, String> {
     ensure_initialized(server_url)?;
     let image_base64 = preprocess_captcha(image_base64)?;
-    let attempts = retry_count.clamp(1, 5);
-    let mut last_error = "OCR 未返回识别文本".to_string();
-    for attempt in 0..attempts {
-        // 重新初始化会重置字符范围，所以每次重试都要传递英数限制。
-        let request = serde_json::json!({
-            "image": &image_base64,
-            "png_fix": attempt > 0,
-            "probability": false,
-            "charset_range": CAPTCHA_CHARSET
-        });
-        match request_json(
-            server_url,
-            "POST",
-            "/ocr",
-            Some(request),
-            Duration::from_secs(30),
-        ) {
-            Ok((_, payload)) if payload.get("success").and_then(Value::as_bool) == Some(true) => {
-                if let Some(text) = payload
-                    .get("data")
-                    .and_then(|value| value.get("text"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    // 站点验证码固定为六位，拒绝缺字结果，避免自动填写后消耗登录次数。
-                    if text.len() == CAPTCHA_LENGTH
-                        && text.chars().all(|char| char.is_ascii_alphanumeric())
-                    {
-                        return Ok(RecognitionResult {
-                            text: text.to_string(),
-                            attempts: attempt + 1,
-                        });
-                    }
-                    last_error = format!(
-                        "OCR 结果格式异常 (识别文本: \"{}\", 长度: {}, 要求长度: {}, 仅含英文数字: {}, 完整响应: {})",
-                        text,
-                        text.len(),
-                        CAPTCHA_LENGTH,
-                        text.chars().all(|c| c.is_ascii_alphanumeric()),
-                        payload
-                    );
-                } else {
-                    last_error = format!("OCR 未返回识别文本 (完整响应: {})", payload);
-                }
-            }
-            Ok((_, payload)) => {
-                last_error = format!(
-                    "{} (完整响应: {})",
-                    api_message(&payload, "OCR 识别失败"),
-                    payload
-                );
-            }
-            Err(err) => last_error = err,
-        }
-        if attempt == 0 && attempts > 1 {
-            initialize(server_url)?;
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    // 同一张图只识别一次；位数不符或识别失败时，由调用方刷新页面换图。
+    let request = serde_json::json!({
+        "image": &image_base64,
+        "png_fix": false,
+        "probability": false,
+        "charset_range": CAPTCHA_CHARSET
+    });
+    let (_, payload) = request_json(
+        server_url,
+        "POST",
+        "/ocr",
+        Some(request),
+        Duration::from_secs(30),
+    )?;
+    if payload.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "{} (完整响应: {})",
+            api_message(&payload, "OCR 识别失败"),
+            payload
+        ));
     }
-    Err(format!("{}，已尝试 {} 次", last_error, attempts))
+    let text = payload
+        .get("data")
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("OCR 未返回识别文本 (完整响应: {})", payload))?;
+    // 拒绝缺字和非英文数字的结果，避免无效识别消耗登录次数。
+    if text.len() != CAPTCHA_LENGTH || !text.chars().all(|char| char.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "OCR 结果格式异常 (识别文本: \"{}\", 长度: {}, 要求长度: {}, 仅含英文数字: {}, 完整响应: {})",
+            text,
+            text.len(),
+            CAPTCHA_LENGTH,
+            text.chars().all(|c| c.is_ascii_alphanumeric()),
+            payload
+        ));
+    }
+    Ok(RecognitionResult {
+        text: text.to_string(),
+    })
 }
 
 fn normalize_image_base64(value: &str) -> Result<String, String> {

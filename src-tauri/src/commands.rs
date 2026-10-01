@@ -642,50 +642,17 @@ pub async fn recognize_site_captcha(
         .find_tab_for_url(&site.url)
         .await
         .ok_or_else(|| format!("未找到 {} 登录页，请先点击测试按钮", site.name))?;
-    let renewed = cdp.prepare_nexusphp_captcha_retry(&tab_id).await?;
-    let remaining = cdp.nexusphp_remaining_attempts(&tab_id).await?;
-    let login_attempt_threshold = store::effective_login_attempt_threshold(
-        &site.url,
-        config.min_login_attempts_remaining as u32,
-    );
-    {
-        let mut current = state.config.lock().await;
-        if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-            store::observe_login_attempts(saved_site, remaining);
-        }
-        store::save_config(&state.app_handle, &current);
-    }
-    if let Some(remaining) = remaining {
-        push_log(
-            &state.logs,
-            LogEntry::info(format!(
-                "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
-                site.name, remaining, login_attempt_threshold
-            )),
-        )
-        .await;
-        if remaining <= login_attempt_threshold {
-            let message = format!(
-                "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止验证码识别与登录重试",
-                site.name, remaining, login_attempt_threshold
-            );
-            push_log(&state.logs, LogEntry::error(message.clone())).await;
-            return Err(message);
-        }
-    }
-    if renewed {
-        push_log(
-            &state.logs,
-            LogEntry::info(format!(
-                "{} 检测到上次验证码无效，已获取新验证码，准备再次尝试登录",
-                site.name
-            )),
-        )
-        .await;
-        if site.username.trim().is_empty() || site.password.is_empty() {
-            return Err("已获取新的图片验证码，但站点用户名或密码未配置".to_string());
-        }
-        let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+    let max_attempts = config.ocr_retry_count.clamp(1, 5);
+    // 每张图只识别一次，失败后刷新当前登录页并重新填写被清空的登录信息。
+    for attempt in 0..max_attempts {
+        let renewed = cdp
+            .prepare_nexusphp_captcha_retry(&tab_id, attempt > 0)
+            .await?;
+        let remaining = cdp.nexusphp_remaining_attempts(&tab_id).await?;
+        let login_attempt_threshold = store::effective_login_attempt_threshold(
+            &site.url,
+            config.min_login_attempts_remaining as u32,
+        );
         {
             let mut current = state.config.lock().await;
             if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
@@ -693,73 +660,129 @@ pub async fn recognize_site_captcha(
             }
             store::save_config(&state.app_handle, &current);
         }
-        let remaining_after = cdp
-            .refill_nexusphp_login_for_captcha(
-                &tab_id,
-                &site.name,
-                &site.username,
-                &site.password,
-                secret,
-                login_attempt_threshold,
+        if let Some(remaining) = remaining {
+            push_log(
+                &state.logs,
+                LogEntry::info(format!(
+                    "{} 当前剩余登录尝试次数：{}（安全阈值：{}）",
+                    site.name, remaining, login_attempt_threshold
+                )),
             )
-            .await?;
-
-        let mut current = state.config.lock().await;
-        if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
-            store::observe_login_attempts(saved_site, remaining_after);
+            .await;
+            if remaining <= login_attempt_threshold {
+                let message = format!(
+                    "{} 当前仅剩 {} 次登录机会，已达到安全阈值 {}，停止验证码识别与登录重试",
+                    site.name, remaining, login_attempt_threshold
+                );
+                push_log(&state.logs, LogEntry::error(message.clone())).await;
+                return Err(message);
+            }
         }
-        store::save_config(&state.app_handle, &current);
-    } else {
+        if renewed {
+            push_log(
+                &state.logs,
+                LogEntry::info(format!("{} 已更换验证码，重新填写登录信息", site.name)),
+            )
+            .await;
+            if site.username.trim().is_empty() || site.password.is_empty() {
+                return Err("已获取新的图片验证码，但站点用户名或密码未配置".to_string());
+            }
+            let secret = (!site.totp_secret.trim().is_empty()).then_some(site.totp_secret.as_str());
+            {
+                let mut current = state.config.lock().await;
+                if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id)
+                {
+                    store::observe_login_attempts(saved_site, remaining);
+                }
+                store::save_config(&state.app_handle, &current);
+            }
+            let remaining_after = cdp
+                .refill_nexusphp_login_for_captcha(
+                    &tab_id,
+                    &site.name,
+                    &site.username,
+                    &site.password,
+                    secret,
+                    login_attempt_threshold,
+                )
+                .await?;
+
+            let mut current = state.config.lock().await;
+            if let Some(saved_site) = current.sites.iter_mut().find(|saved| saved.id == site.id) {
+                store::observe_login_attempts(saved_site, remaining_after);
+            }
+            store::save_config(&state.app_handle, &current);
+        } else {
+            push_log(
+                &state.logs,
+                LogEntry::info(format!(
+                    "{} 未检测到验证码失败页，本次不执行登录重试，仅识别当前验证码",
+                    site.name
+                )),
+            )
+            .await;
+        }
+        let image = cdp.nexusphp_captcha_base64(&tab_id).await?;
         push_log(
             &state.logs,
             LogEntry::info(format!(
-                "{} 未检测到验证码失败页，本次不执行登录重试，仅识别当前验证码",
-                site.name
+                "{} 正在识别第 {}/{} 张验证码",
+                site.name,
+                attempt + 1,
+                max_attempts
             )),
         )
         .await;
+        let image_for_ocr = image.clone();
+        let ocr_server_url = config.ocr_server_url.clone();
+        let recognition = tauri::async_runtime::spawn_blocking(move || {
+            ocr::recognize(&ocr_server_url, &image_for_ocr)
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+        let recognition = match recognition {
+            Ok(result) => result,
+            Err(err) => {
+                if attempt + 1 < max_attempts {
+                    push_log(
+                        &state.logs,
+                        LogEntry::info(format!(
+                            "{} OCR 识别失败：{}，原地刷新页面后识别新验证码",
+                            site.name, err
+                        )),
+                    )
+                    .await;
+                    continue;
+                }
+                let message = format!(
+                    "{} OCR 识别失败：{}，已尝试 {} 张验证码",
+                    site.name, err, max_attempts
+                );
+                push_log(&state.logs, LogEntry::error(message.clone())).await;
+                return Err(message);
+            }
+        };
+        push_log(
+            &state.logs,
+            LogEntry::info(format!(
+                "{} OCR 识别：第 {}/{} 张成功，验证码：{}",
+                site.name,
+                attempt + 1,
+                max_attempts,
+                recognition.text
+            )),
+        )
+        .await;
+        cdp.fill_nexusphp_captcha(&tab_id, &recognition.text)
+            .await?;
+        let message = format!(
+            "{} 验证码已识别并填入，请在浏览器中确认后点击登录",
+            site.name
+        );
+        push_log(&state.logs, LogEntry::info(message.clone())).await;
+        return Ok(message);
     }
-    let image = cdp.nexusphp_captcha_base64(&tab_id).await?;
-    push_log(
-        &state.logs,
-        LogEntry::info(format!(
-            "{} 获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}",
-            site.name, image
-        )),
-    )
-    .await;
-    let image_for_ocr = image.clone();
-    let ocr_server_url = config.ocr_server_url.clone();
-    let ocr_retry_count = config.ocr_retry_count;
-    let recognition = tauri::async_runtime::spawn_blocking(move || {
-        ocr::recognize(&ocr_server_url, &image_for_ocr, ocr_retry_count)
-    })
-    .await
-    .map_err(|err| err.to_string())?;
-    let recognition = match recognition {
-        Ok(result) => result,
-        Err(err) => {
-            let message = format!("{} OCR 识别失败：{}", site.name, err);
-            push_log(&state.logs, LogEntry::error(message.clone())).await;
-            return Err(message);
-        }
-    };
-    push_log(
-        &state.logs,
-        LogEntry::info(format!(
-            "{} OCR 识别：第 {}/{} 次成功，验证码：{}",
-            site.name, recognition.attempts, ocr_retry_count, recognition.text
-        )),
-    )
-    .await;
-    cdp.fill_nexusphp_captcha(&tab_id, &recognition.text)
-        .await?;
-    let message = format!(
-        "{} 验证码已识别并填入，请在浏览器中确认后点击登录",
-        site.name
-    );
-    push_log(&state.logs, LogEntry::info(message.clone())).await;
-    Ok(message)
+    Err(format!("{} 验证码识别已达到换图尝试上限", site.name))
 }
 
 #[tauri::command]
