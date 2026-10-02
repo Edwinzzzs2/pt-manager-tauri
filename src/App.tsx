@@ -324,7 +324,7 @@ function App() {
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
-  const [updateLastCheckedAt, setUpdateLastCheckedAt] = useState<number | null>(null);
+  const [updateHasChecked, setUpdateHasChecked] = useState(false);
   const [updateCheckFailed, setUpdateCheckFailed] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
   const updateCheckPromise = useRef<Promise<AppUpdateInfo | null> | null>(null);
@@ -972,7 +972,7 @@ function App() {
       updateCheckPromise.current = invoke<AppUpdateInfo | null>("check_for_app_update")
         .then((update) => {
           setAvailableUpdate(update);
-          setUpdateLastCheckedAt(Date.now());
+          setUpdateHasChecked(true);
           setUpdateCheckFailed(false);
           return update;
         })
@@ -1084,7 +1084,7 @@ function App() {
             availableVersion={availableUpdate ? formatVersion(availableUpdate.version) : null}
             checking={updateChecking}
             phase={updatePhase}
-            lastCheckedAt={updateLastCheckedAt}
+            hasChecked={updateHasChecked}
             checkFailed={updateCheckFailed}
             onCheck={checkForUpdates}
           />
@@ -2848,19 +2848,27 @@ function SettingsPanel({
             </div>
           </div>
           <p className="field-hint">
-            可添加站点进行定时访问保活；自动登录、签到和流量读取的支持范围各不相同。
+            支持 Chrome 和 Edge。立即保活与定时保活按站点开关执行，测试登录可单独运行本站；自动登录、签到和流量读取的支持范围如下。
           </p>
           <details className="site-support-details">
             <summary>查看当前适配清单与支持范围</summary>
-            {/* Keep this list aligned with the login, signin and traffic modules in src-tauri/src/cdp. */}
+            {/* 说明需与登录、签到、流量读取和青蛙福利模块的实际能力保持一致。 */}
             <dl className="site-support-list">
               <div>
                 <dt>专门适配的自动登录</dt>
                 <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing（pting.club）、SixCloud（666clouds.com）、癫影（m.dian115.com）。</dd>
               </div>
               <div>
+                <dt>NexusPHP 兼容登录</dt>
+                <dd>青蛙、HDArea（好大）、HDDolby（杜比）、UBits（U堡）使用兼容登录流程，支持登录状态识别、按页面要求填写两步验证码及常见图片验证码。青蛙另适配登录入口和 ALTCHA 验证流程。</dd>
+              </div>
+              <div>
                 <dt>专门适配的自动签到</dt>
-                <dd>Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing（pting.club）、癫影（m.dian115.com，普通签到）。</dd>
+                <dd>HDArea（好大，首页签到）、Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing（pting.club）、癫影（m.dian115.com，普通签到）。青蛙、HDDolby（杜比）、UBits（U堡）使用通用签到流程，识别签到成功或今日已签到状态。</dd>
+              </div>
+              <div>
+                <dt>青蛙每日福利</dt>
+                <dd>保存并开启“自动保活”和“自动购买每日福利”后，跟随青蛙本站的登录、流量读取和签到流程独立执行，不等待其他站点。仅购买“1 蝌蚪兑换 1000 蝌蚪”的每日福利；当天已尝试提交时跳过，购买结果或今日已达限购会记录到日志。</dd>
               </div>
               <div>
                 <dt>通用站点支持</dt>
@@ -2872,7 +2880,7 @@ function SettingsPanel({
               </div>
             </dl>
             <p className="field-hint">
-              适配不保证每次执行成功。站点改版、登录状态及验证码可能影响结果，请以任务日志为准；需要 OCR 的登录流程请先配置 OCR 服务。
+              自动化开关需保存后生效。兼容登录中的图片验证码需要配置 OCR 服务，识别失败时会在重试次数内刷新页面换新图；两步验证需配置密钥。需要人工完成的验证请在打开的浏览器中处理。站点页面变化可能影响适配，请以任务日志为准。
             </p>
           </details>
         </section>

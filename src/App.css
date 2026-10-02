@@ -261,26 +261,6 @@ button span,
   outline-offset: 3px;
 }
 
-.version-footnote {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--color-fg-muted);
-  font-size: 10px;
-  line-height: 1.4;
-}
-
-.version-footnote svg {
-  flex: 0 0 auto;
-}
-
-.version-footnote time {
-  margin-left: auto;
-  color: inherit;
-  font-size: inherit;
-  font-variant-numeric: tabular-nums;
-}
-
 .version-hint {
   color: var(--color-fg-muted);
   font-size: 11px;
@@ -1545,7 +1525,6 @@ html[data-theme="light"] .log-level-filter select {
 
   .version-card-header,
   .version-release,
-  .version-footnote,
   .version-hint,
   .version-action > span {
     display: none;

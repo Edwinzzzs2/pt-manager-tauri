@@ -1,4 +1,4 @@
-import { BellDot, CheckCircle2, Clock3, Download, RefreshCw } from "lucide-react";
+import { BellDot, CheckCircle2, Download, RefreshCw } from "lucide-react";
 
 export type UpdatePhase = "checking" | "confirming" | "installing" | null;
 
@@ -7,7 +7,7 @@ type VersionCardProps = {
   availableVersion: string | null;
   checking: boolean;
   phase: UpdatePhase;
-  lastCheckedAt: number | null;
+  hasChecked: boolean;
   checkFailed: boolean;
   onCheck: () => Promise<void>;
 };
@@ -29,7 +29,7 @@ function describeUpdate(props: VersionCardProps) {
     return { label: "可更新", button: "立即更新", tone: "available" };
   }
   // 尚未成功检查时只显示自动检查，避免把网络失败或初始状态误报为最新版。
-  if (props.lastCheckedAt !== null) {
+  if (props.hasChecked) {
     return { label: "已是最新", button: "检查更新", tone: "latest" };
   }
   return { label: "自动检查", button: "检查更新", tone: "idle" };
@@ -41,9 +41,6 @@ export function VersionCard(props: VersionCardProps) {
   const hasUpdate = Boolean(props.availableVersion);
   const spinning = props.checking || props.phase === "checking" || props.phase === "installing";
   const ActionIcon = hasUpdate && !busy && !props.checkFailed ? Download : RefreshCw;
-  const lastChecked = props.lastCheckedAt === null
-    ? null
-    : new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit" }).format(props.lastCheckedAt);
   const actionTitle = props.availableVersion
     ? `${state.button}：${props.currentVersion || "当前版本"} → ${props.availableVersion}`
     : state.button;
@@ -84,11 +81,6 @@ export function VersionCard(props: VersionCardProps) {
         {hasUpdate && <span className="version-compact-dot" aria-hidden="true" />}
       </button>
 
-      <div className="version-footnote">
-        <Clock3 size={12} aria-hidden="true" />
-        <span>每小时自动检查</span>
-        {lastChecked && <time title="上次成功检查时间">{lastChecked}</time>}
-      </div>
       {props.checkFailed && <p className="version-hint">检查失败，可重试或等待自动检查</p>}
       {props.phase === "installing" && <p className="version-hint">安装完成后将自动重启</p>}
     </section>
