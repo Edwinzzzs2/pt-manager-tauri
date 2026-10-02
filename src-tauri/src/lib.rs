@@ -81,7 +81,6 @@ pub fn run() {
             commands::test_gotify,
             commands::test_bark,
             commands::add_site,
-            commands::import_sites_from_json,
             commands::remove_site,
             commands::remove_sites,
             commands::update_site,

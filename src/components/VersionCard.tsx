@@ -26,7 +26,7 @@ function describeUpdate(props: VersionCardProps) {
     return { label: "检查失败", button: "重新检查", tone: "warning" };
   }
   if (props.availableVersion) {
-    return { label: "可更新", button: "立即更新", tone: "available" };
+    return { label: "有新版本", button: "立即更新", tone: "available" };
   }
   // 尚未成功检查时只显示自动检查，避免把网络失败或初始状态误报为最新版。
   if (props.hasChecked) {
@@ -42,7 +42,7 @@ export function VersionCard(props: VersionCardProps) {
   const spinning = props.checking || props.phase === "checking" || props.phase === "installing";
   const ActionIcon = hasUpdate && !busy && !props.checkFailed ? Download : RefreshCw;
   const actionTitle = props.availableVersion
-    ? `${state.button}：${props.currentVersion || "当前版本"} → ${props.availableVersion}`
+    ? `${state.button}：最新版本 ${props.availableVersion}`
     : state.button;
 
   return (
@@ -54,19 +54,10 @@ export function VersionCard(props: VersionCardProps) {
         </div>
         <span className={`version-state ${state.tone}`} role="status">
           {state.tone === "latest" && <CheckCircle2 size={11} aria-hidden="true" />}
+          {state.tone === "available" && <BellDot size={11} aria-hidden="true" />}
           {state.label}
         </span>
       </div>
-
-      {props.availableVersion && (
-        <div className="version-release">
-          <span className="version-release-icon"><BellDot size={16} aria-hidden="true" /></span>
-          <div>
-            <span className="version-label">发现新版本</span>
-            <strong>{props.availableVersion}</strong>
-          </div>
-        </div>
-      )}
 
       <button
         className="version-action"

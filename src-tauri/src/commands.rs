@@ -10,9 +10,7 @@ use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
 use crate::updater;
 use chrono::{DateTime, Local};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use serde::Serialize;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,41 +51,6 @@ pub struct CookieCloudSyncResult {
     pub imported_cookies: usize,
     pub matched_local_storages: usize,
     pub imported_local_storages: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct ImportedSite {
-    name: String,
-    url: String,
-    #[serde(default)]
-    username: String,
-    #[serde(default)]
-    password: String,
-    #[serde(default)]
-    totp_secret: String,
-    #[serde(default = "default_auto_login")]
-    auto_login: bool,
-    #[serde(default)]
-    auto_signin: bool,
-    #[serde(default)]
-    auto_daily_bonus: bool,
-    #[serde(default = "default_cookiecloud_upload")]
-    cookiecloud_upload: bool,
-}
-
-fn default_cookiecloud_upload() -> bool {
-    true
-}
-
-fn default_auto_login() -> bool {
-    true
-}
-
-#[derive(Debug, Serialize)]
-pub struct SiteImportResult {
-    pub config: AppConfig,
-    pub imported: usize,
-    pub skipped: usize,
 }
 
 #[tauri::command]
@@ -227,69 +190,6 @@ pub async fn add_site(
     drop(config);
     restart_scheduler(&state, next.clone()).await;
     Ok(next)
-}
-
-#[tauri::command]
-pub async fn import_sites_from_json(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<SiteImportResult, String> {
-    let content = fs::read_to_string(PathBuf::from(path))
-        .map_err(|err| format!("读取 JSON 文件失败：{}", err))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&content).map_err(|err| format!("JSON 格式错误：{}", err))?;
-    let sites_value = value.get("sites").cloned().unwrap_or(value);
-    let imported_sites: Vec<ImportedSite> = serde_json::from_value(sites_value)
-        .map_err(|_| "JSON 应为站点数组，或包含 sites 数组；每项需有 name 和 url".to_string())?;
-
-    let mut config = state.config.lock().await;
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-    for site in imported_sites {
-        let name = site.name.trim();
-        let url = site.url.trim();
-        let valid_url = (url.starts_with("http://") || url.starts_with("https://"))
-            && url
-                .split_once("://")
-                .is_some_and(|(_, rest)| !rest.is_empty());
-        let duplicate = config.sites.iter().any(|existing| {
-            existing
-                .url
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(url.trim_end_matches('/'))
-        });
-        if name.is_empty() || !valid_url || duplicate {
-            skipped += 1;
-            continue;
-        }
-        config.sites.push(store::Site {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_string(),
-            url: url.to_string(),
-            username: site.username.trim().to_string(),
-            password: site.password,
-            totp_secret: site.totp_secret.trim().replace(' ', ""),
-            auto_login: site.auto_login,
-            login_attempts_remaining: None,
-            login_attempts_recorded_at: None,
-            login_success_recorded_at: None,
-            auto_keepalive: true,
-            auto_signin: site.auto_signin,
-            auto_daily_bonus: site.auto_daily_bonus,
-            cookiecloud_upload: site.cookiecloud_upload,
-        });
-        imported += 1;
-    }
-
-    store::save_config(&state.app_handle, &config);
-    let next = config.clone();
-    drop(config);
-    restart_scheduler(&state, next.clone()).await;
-    Ok(SiteImportResult {
-        config: next,
-        imported,
-        skipped,
-    })
 }
 
 #[tauri::command]

@@ -22,6 +22,7 @@ impl CdpClient {
     pub(super) async fn login_pting(
         &self,
         tab_id: &str,
+        site_url: &str,
         username: &str,
         password: &str,
         totp_secret: Option<&str>,
@@ -38,10 +39,17 @@ impl CdpClient {
         }
 
         if initial.path != "/login" {
+            // 蜂巢已更换域名，登录页跟随用户配置的站点地址，不再跳回旧站。
+            let login_url = reqwest::Url::parse(site_url)
+                .and_then(|url| url.join("/login"))
+                .map_err(|err| format!("PTing 站点地址无效：{err}"))?;
+            if let Some(p) = progress {
+                p.info(format!("PTing（蜂巢）正在打开登录页：{login_url}")).await;
+            }
             websocket.call("Page.enable", serde_json::json!({}))?;
             websocket.call(
                 "Page.navigate",
-                serde_json::json!({ "url": "https://pting.club/login" }),
+                serde_json::json!({ "url": login_url.as_str() }),
             )?;
         }
 

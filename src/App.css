@@ -132,11 +132,6 @@ button span,
   background: var(--subtle-surface-soft);
 }
 
-.version-card.has-update {
-  border-color: var(--accent-soft-border);
-  background: var(--accent-soft-bg);
-}
-
 .version-card-header {
   display: flex;
   align-items: flex-start;
@@ -179,6 +174,7 @@ button span,
   font-size: 10px;
   font-weight: 600;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
 .version-state.latest {
@@ -195,34 +191,6 @@ button span,
 .version-state.warning {
   background: var(--warning-soft-bg);
   color: var(--warning-soft-fg);
-}
-
-.version-release {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding-top: 10px;
-  border-top: 1px solid var(--accent-soft-border);
-}
-
-.version-release > div {
-  min-width: 0;
-}
-
-.version-release-icon {
-  display: grid;
-  flex: 0 0 auto;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border-radius: 9px;
-  background: var(--accent-soft-bg-hover);
-  color: var(--accent-soft-fg);
-}
-
-.version-release strong {
-  color: var(--accent-soft-fg);
-  font-size: 15px;
 }
 
 .version-card .version-action {
@@ -884,10 +852,90 @@ select:focus {
   gap: 10px;
 }
 
+.site-search-bar {
+  display: flex;
+  flex: 1 1 280px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  min-width: 0;
+  max-width: 480px;
+  margin-left: auto;
+}
+
+.site-search-field {
+  display: flex;
+  flex: 1 1 180px;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 420px;
+  height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-bg-input);
+  color: var(--color-fg-muted);
+}
+
+.site-search-field:focus-within {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px var(--accent-focus-ring);
+}
+
+.site-search-field > svg {
+  flex: 0 0 auto;
+}
+
+.site-search-field input {
+  min-width: 0;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.site-search-field input:focus {
+  box-shadow: none;
+}
+
+.site-search-field input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.site-search-clear {
+  display: grid;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-fg-muted);
+  cursor: pointer;
+}
+
+.site-search-clear:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-fg);
+}
+
+.site-search-clear:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.site-search-count {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .site-selection-bar {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 8px 10px;
   border: 1px solid var(--color-border);
@@ -897,6 +945,14 @@ select:focus {
   font-size: 13px;
 }
 
+.site-batch-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  white-space: nowrap;
+}
+
 .site-selection-bar label {
   display: inline-flex;
   align-items: center;
@@ -904,7 +960,7 @@ select:focus {
   cursor: pointer;
 }
 
-.site-selection-bar input,
+.site-selection-bar input[type="checkbox"],
 .site-select-checkbox {
   width: 17px;
   height: 17px;
@@ -916,7 +972,6 @@ select:focus {
 
 .site-selection-bar .danger-action {
   min-height: 34px;
-  margin-left: auto;
   padding: 0 11px;
 }
 
@@ -1378,6 +1433,7 @@ label {
 
 .log-level-filter {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 7px;
   height: 38px;
@@ -1389,7 +1445,14 @@ label {
   font-size: 12px;
 }
 
+.log-level-filter > span {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .log-level-filter select {
+  /* 覆盖全局下拉框的满宽样式，给“级别”文字留出空间。 */
+  width: auto;
   height: 30px;
   padding: 0 2px;
   border: 0;
@@ -1515,8 +1578,7 @@ html[data-theme="light"] .log-level-filter select {
   }
 
   /* 侧栏收起后保留更新入口和提示点，避免窄窗口完全看不到新版本。 */
-  .version-card,
-  .version-card.has-update {
+  .version-card {
     gap: 0;
     padding: 0;
     border: 0;
@@ -1524,7 +1586,6 @@ html[data-theme="light"] .log-level-filter select {
   }
 
   .version-card-header,
-  .version-release,
   .version-hint,
   .version-action > span {
     display: none;

@@ -130,7 +130,10 @@ impl SigninAdapter {
             Self::Hares
         } else if url.to_ascii_lowercase().contains("rousi.pro") {
             Self::Rousi
-        } else if url.to_ascii_lowercase().contains("pting.club") {
+        } else if matches!(
+            host_from_url(url).as_deref(),
+            Some("fengchao.chat" | "www.fengchao.chat" | "pting.club" | "www.pting.club")
+        ) {
             Self::Pting
         } else {
             Self::Generic
@@ -147,7 +150,7 @@ impl SigninAdapter {
             Self::Yema => "野马站点适配",
             Self::Hares => "白兔站点适配",
             Self::Rousi => "Rousi 站点适配",
-            Self::Pting => "PTing 论坛适配",
+            Self::Pting => "PTing（蜂巢）论坛适配",
             Self::Generic => "通用规则",
         }
     }

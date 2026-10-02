@@ -44,7 +44,7 @@ impl SiteAdapter {
             Self::MTeam
         } else if normalized.contains("hdkyl.in") {
             Self::Hdkylin
-        } else if normalized.contains("pting.club") {
+        } else if matches!(host, "fengchao.chat" | "pting.club") {
             Self::Pting
         } else {
             Self::NexusPhp
@@ -144,6 +144,7 @@ impl CdpClient {
             SiteAdapter::Pting => self
                 .login_pting(
                     tab_id,
+                    request.site_url,
                     request.username,
                     request.password,
                     request.totp_secret,

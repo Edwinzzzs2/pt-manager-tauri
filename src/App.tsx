@@ -172,12 +172,6 @@ type CookieCloudSyncResult = {
   imported_local_storages: number;
 };
 
-type SiteImportResult = {
-  config: AppConfig;
-  imported: number;
-  skipped: number;
-};
-
 type AppUpdateInfo = {
   version: string;
 };
@@ -592,34 +586,6 @@ function App() {
     }
   }
 
-  async function importSites() {
-    const path = await open({
-      directory: false,
-      multiple: false,
-      filters: [{ name: "JSON", extensions: ["json"] }],
-    });
-    if (!path) {
-      return;
-    }
-
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await invoke<SiteImportResult>("import_sites_from_json", { path });
-      setConfig(result.config);
-      setSettingsDraft(result.config);
-      await refreshStatus();
-      await message(`成功导入 ${result.imported} 个站点，跳过 ${result.skipped} 个`, {
-        kind: "info",
-        title: "导入完成",
-      });
-    } catch (err) {
-      showError(err);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function exportConfig() {
     const path = await save({
       filters: [{ name: "JSON", extensions: ["json"] }],
@@ -1004,7 +970,7 @@ function App() {
 
       setUpdatePhase("confirming");
       const shouldInstall = await ask(
-        `当前版本：${appVersion ? formatVersion(appVersion) : "读取中"}\n新版本：${formatVersion(update.version)}\n\n是否下载并安装？安装完成后应用将自动重启。`,
+        `最新版本 ${formatVersion(update.version)}，是否立即更新？`,
         {
           kind: "info",
           okLabel: "立即更新",
@@ -1171,7 +1137,6 @@ function App() {
               editingSiteId={editingSiteId}
               newSite={newSite}
               onAdd={addSite}
-              onImport={importSites}
               onCancelEdit={() => setEditingSiteId(null)}
               onEditChange={setEditingSite}
               onNewSiteChange={setNewSite}
@@ -1513,7 +1478,6 @@ function SitesPanel({
   editingSiteId,
   newSite,
   onAdd,
-  onImport,
   onCancelEdit,
   onEditChange,
   onNewSiteChange,
@@ -1536,7 +1500,6 @@ function SitesPanel({
   editingSiteId: string | null;
   newSite: SiteDraft;
   onAdd: () => void;
-  onImport: () => void;
   onCancelEdit: () => void;
   onEditChange: (site: SiteDraft) => void;
   onNewSiteChange: (site: SiteDraft) => void;
@@ -1555,6 +1518,7 @@ function SitesPanel({
   ) => Promise<boolean>;
   onReorderSites: (siteIds: string[]) => Promise<boolean>;
 }) {
+  const [siteSearch, setSiteSearch] = useState("");
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
   const [showSitePassword, setShowSitePassword] = useState(false);
   const [showTotpSecret, setShowTotpSecret] = useState(false);
@@ -1567,14 +1531,33 @@ function SitesPanel({
   const batchDragOverSiteRef = useRef<string | null>(null);
   const batchSettingsListRef = useRef<HTMLDivElement | null>(null);
   const batchPointerPositionRef = useRef<{ clientX: number; clientY: number } | null>(null);
-  const allSelected = config.sites.length > 0 && selectedSiteIds.size === config.sites.length;
+  const visibleSites = useMemo(() => {
+    const keyword = siteSearch.trim().toLowerCase();
+    if (!keyword) return config.sites;
+    return config.sites.filter((site) =>
+      site.name.toLowerCase().includes(keyword) || site.url.toLowerCase().includes(keyword),
+    );
+  }, [config.sites, siteSearch]);
+  const allSelected = visibleSites.length > 0 && visibleSites.every((site) => selectedSiteIds.has(site.id));
+  const selectAllLabel = siteSearch.trim() ? "全选搜索结果" : "全选";
+  const siteCountLabel = siteSearch.trim()
+    ? `匹配 ${visibleSites.length} / ${config.sites.length} 个站点`
+    : `共 ${config.sites.length} 个站点`;
+  const emptySiteLabel = config.sites.length === 0 ? "暂无站点" : "未找到匹配的站点";
 
   useEffect(() => {
-    const availableIds = new Set(config.sites.map((site) => site.id));
+    // 保存编辑后站点也可能不再匹配搜索，只保留当前可见站点的勾选。
+    const availableIds = new Set(visibleSites.map((site) => site.id));
     setSelectedSiteIds((current) =>
       new Set([...current].filter((id) => availableIds.has(id))),
     );
-  }, [config.sites]);
+  }, [visibleSites]);
+
+  function updateSiteSearch(value: string) {
+    setSiteSearch(value);
+    // 搜索范围变化时清空选择，避免批量删除或设置误操作隐藏的站点。
+    setSelectedSiteIds(new Set());
+  }
 
   function toggleSite(id: string) {
     setSelectedSiteIds((current) => {
@@ -1783,16 +1766,6 @@ function SitesPanel({
           value={newSite.url}
         />
         <div className="site-form-actions">
-          <button
-            className="ghost"
-            disabled={busy}
-            onClick={onImport}
-            title={'支持 [{"name":"站点名","url":"https://example.com"}] 或 {"sites":[...] }'}
-            type="button"
-          >
-            <FileUp size={17} />
-            <span>导入 JSON</span>
-          </button>
           <button disabled={busy} onClick={onAdd} type="button">
             <Plus size={17} />
             <span>新增</span>
@@ -1800,47 +1773,74 @@ function SitesPanel({
         </div>
       </section>
 
-      {config.sites.length > 0 ? (
-        <div className="site-selection-bar">
-          <label>
+      <div className="site-selection-bar">
+        {visibleSites.length > 0 && (
+          <div className="site-batch-actions">
+            <label>
+              <input
+                checked={allSelected}
+                onChange={() =>
+                  setSelectedSiteIds(
+                    allSelected ? new Set() : new Set(visibleSites.map((site) => site.id)),
+                  )
+                }
+                type="checkbox"
+              />
+              <span>{allSelected ? "取消全选" : selectAllLabel}</span>
+            </label>
+            <span>已选 {selectedSiteIds.size} 项</span>
+            <button
+              className="ghost batch-settings-button"
+              disabled={busy || selectedSiteIds.size === 0}
+              onClick={openBatchSettings}
+              type="button"
+            >
+              <Settings2 size={16} />
+              <span>批量操作</span>
+            </button>
+            <button
+              className="danger-action batch-delete-btn"
+              disabled={busy || selectedSiteIds.size === 0}
+              onClick={removeSelectedSites}
+              type="button"
+            >
+              <Trash2 size={16} />
+              <span>批量删除</span>
+            </button>
+          </div>
+        )}
+        <div className="site-search-bar">
+          <div className="site-search-field">
+            <Search size={16} aria-hidden="true" />
             <input
-              checked={allSelected}
-              onChange={() =>
-                setSelectedSiteIds(
-                  allSelected ? new Set() : new Set(config.sites.map((site) => site.id)),
-                )
-              }
-              type="checkbox"
+              aria-label="按名称或域名搜索站点"
+              autoComplete="off"
+              onChange={(event) => updateSiteSearch(event.target.value)}
+              placeholder="搜索站点名称或域名"
+              type="search"
+              value={siteSearch}
             />
-            <span>{allSelected ? "取消全选" : "全选"}</span>
-          </label>
-          <span>已选 {selectedSiteIds.size} 项</span>
-          <button
-            className="ghost batch-settings-button"
-            disabled={busy || selectedSiteIds.size === 0}
-            onClick={openBatchSettings}
-            type="button"
-          >
-            <Settings2 size={16} />
-            <span>批量操作</span>
-          </button>
-          <button
-            className="danger-action batch-delete-btn"
-            disabled={busy || selectedSiteIds.size === 0}
-            onClick={removeSelectedSites}
-            type="button"
-          >
-            <Trash2 size={16} />
-            <span>批量删除</span>
-          </button>
+            {siteSearch && (
+              <button
+                aria-label="清空站点搜索"
+                className="site-search-clear"
+                onClick={() => updateSiteSearch("")}
+                title="清空搜索"
+                type="button"
+              >
+                <XCircle size={15} aria-hidden="true" />
+              </button>
+            )}
+          </div>
+          <span className="site-search-count" role="status">{siteCountLabel}</span>
         </div>
-      ) : null}
+      </div>
 
       <section className="site-list site-list-scroll">
-        {config.sites.length === 0 ? (
-          <div className="empty-state">暂无站点</div>
+        {visibleSites.length === 0 ? (
+          <div className="empty-state">{emptySiteLabel}</div>
         ) : (
-          config.sites.map((site) => {
+          visibleSites.map((site) => {
             const editing = editingSiteId === site.id;
             return (
               <article
@@ -2856,7 +2856,7 @@ function SettingsPanel({
             <dl className="site-support-list">
               <div>
                 <dt>专门适配的自动登录</dt>
-                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing（pting.club）、SixCloud（666clouds.com）、癫影（m.dian115.com）。</dd>
+                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing / 蜂巢（fengchao.chat，兼容旧域名 pting.club）、SixCloud（666clouds.com）、癫影（m.dian115.com）。</dd>
               </div>
               <div>
                 <dt>NexusPHP 兼容登录</dt>
@@ -2864,7 +2864,7 @@ function SettingsPanel({
               </div>
               <div>
                 <dt>专门适配的自动签到</dt>
-                <dd>HDArea（好大，首页签到）、Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing（pting.club）、癫影（m.dian115.com，普通签到）。青蛙、HDDolby（杜比）、UBits（U堡）使用通用签到流程，识别签到成功或今日已签到状态。</dd>
+                <dd>HDArea（好大，首页签到）、Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing / 蜂巢（fengchao.chat，兼容旧域名 pting.club）、癫影（m.dian115.com，普通签到）。青蛙、HDDolby（杜比）、UBits（U堡）使用通用签到流程，识别签到成功或今日已签到状态。</dd>
               </div>
               <div>
                 <dt>青蛙每日福利</dt>
@@ -2914,6 +2914,9 @@ function SettingsPanel({
               </button>
             </div>
           </div>
+          <p className="field-hint">
+            导出包含全部站点、账号信息与系统设置；导入用于恢复完整备份，会覆盖当前配置。
+          </p>
         </section>
 
         <section className="panel settings-card browser-data-panel">
