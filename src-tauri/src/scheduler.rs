@@ -406,6 +406,14 @@ enum LoginOutcome {
     Failed(String),
 }
 
+struct SiteTaskResult {
+    site_id: String,
+    site_name: String,
+    login: Option<LoginOutcome>,
+    traffic: Option<SiteTraffic>,
+    signin: Option<SigninResult>,
+}
+
 async fn sync_cookiecloud_after_keepalive(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
@@ -641,6 +649,92 @@ async fn try_read_site_traffic(
     }
 }
 
+// 青蛙在自己的任务里依次读流量、签到、购买，既不等待其他站点，也不并行导航同一标签页。
+async fn finish_qingwa_keepalive(
+    site: &Site,
+    cdp: &CdpClient,
+    tab_id: &str,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    cancel_requested: Arc<AtomicBool>,
+    login: &Option<LoginOutcome>,
+) -> (Option<SiteTraffic>, Option<SigninResult>) {
+    let progress = CdpProgress::new(Arc::clone(logs), Arc::clone(&cancel_requested));
+    if progress.is_cancelled() {
+        push_log(
+            logs,
+            LogEntry::info(format!("{} 每日福利任务已终止", site.name)),
+        )
+        .await;
+        return (None, None);
+    }
+    if matches!(login, Some(LoginOutcome::Failed(_))) {
+        let signin = if site.auto_signin {
+            let result = SigninResult::failure("自动登录失败，未执行签到");
+            push_log(
+                logs,
+                LogEntry::error(format!("{} 签到：{}", site.name, result.summary())),
+            )
+            .await;
+            Some(result)
+        } else {
+            None
+        };
+        push_log(
+            logs,
+            LogEntry::error(format!("{} 自动登录失败，未购买每日福利", site.name)),
+        )
+        .await;
+        return (None, signin);
+    }
+
+    let traffic = try_read_site_traffic(site, cdp, tab_id, logs).await;
+    if progress.is_cancelled() {
+        push_log(
+            logs,
+            LogEntry::info(format!("{} 每日福利任务已终止", site.name)),
+        )
+        .await;
+        return (traffic, None);
+    }
+    let signin = if site.auto_signin {
+        Some(try_auto_signin_site(site, cdp, tab_id, logs, cancel_requested).await)
+    } else {
+        None
+    };
+    if progress.is_cancelled() {
+        push_log(
+            logs,
+            LogEntry::info(format!("{} 每日福利任务已终止", site.name)),
+        )
+        .await;
+        return (traffic, signin);
+    }
+
+    push_log(
+        logs,
+        LogEntry::info(format!("{} 正在检查每日福利", site.name)),
+    )
+    .await;
+    match cdp.purchase_qingwa_daily_bonus(tab_id, &progress).await {
+        Ok(message) => push_log(logs, LogEntry::info(format!("{}：{}", site.name, message))).await,
+        Err(error) if error == CDP_CANCELLED => {
+            push_log(
+                logs,
+                LogEntry::info(format!("{} 每日福利任务已终止", site.name)),
+            )
+            .await;
+        }
+        Err(error) => {
+            push_log(
+                logs,
+                LogEntry::error(format!("{} 每日福利：{}", site.name, error)),
+            )
+            .await;
+        }
+    }
+    (traffic, signin)
+}
+
 async fn send_notification_summary(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
@@ -691,23 +785,56 @@ async fn run_keepalive_batch(
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
     let mut opened_tabs: Vec<(String, String)> = Vec::new();
-    let mut login_jobs = Vec::new();
+    let mut login_jobs: Vec<JoinHandle<SiteTaskResult>> = Vec::new();
     let mut successful_logins = Vec::new();
     let mut failed_logins = Vec::new();
     let mut failed_login_site_ids = HashSet::new();
     let mut signin_targets: Vec<(Site, String)> = Vec::new();
-    let mut bonus_targets: Vec<(Site, String)> = Vec::new();
     let mut signin_results = Vec::new();
     let mut traffic_targets: Vec<(Site, String)> = Vec::new();
     let mut traffic_results = Vec::new();
 
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
+            // 青蛙可能已经开始本站流程；先结束任务，避免关闭浏览器后仍有后台购买。
+            for job in login_jobs {
+                job.abort();
+                let _ = job.await;
+            }
             close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
             return true;
         }
 
+        // 读取任务实际使用的已保存配置，方便区分开关未保存和任务仍在排队。
+        if is_qingwa_site(&site.url) || site.auto_daily_bonus {
+            push_log(
+                logs,
+                LogEntry::info(format!(
+                    "{} 每日福利配置：自动购买{}，自动保活{}",
+                    site.name,
+                    if site.auto_daily_bonus {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                    if site.auto_keepalive {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                )),
+            )
+            .await;
+        }
+
         if !site.auto_keepalive {
+            if site.auto_daily_bonus {
+                push_log(
+                    logs,
+                    LogEntry::info(format!("{} 未开启自动保活，本次不购买每日福利", site.name)),
+                )
+                .await;
+            }
             push_log(
                 logs,
                 LogEntry::info(format!("{} 已关闭自动保活，跳过", site.name)),
@@ -733,7 +860,19 @@ async fn run_keepalive_batch(
 
         match opened_tab {
             Ok(tab_id) => {
-                if site.auto_login {
+                push_log(logs, LogEntry::info(format!("{} 已打开", site.name))).await;
+                let daily_bonus = site.auto_daily_bonus && is_qingwa_site(&site.url);
+                if daily_bonus {
+                    push_log(
+                        logs,
+                        LogEntry::info(format!(
+                            "{} 每日福利已排队，本站登录、流量读取和签到结束后独立执行",
+                            site.name
+                        )),
+                    )
+                    .await;
+                }
+                if site.auto_login || daily_bonus {
                     let login_site = site.clone();
                     let login_tab_id = tab_id.clone();
                     let login_logs = Arc::clone(logs);
@@ -753,36 +892,64 @@ async fn run_keepalive_batch(
                             &login_logs,
                             min_login_attempts_remaining,
                             Some((ocr_server_url, ocr_retry_count)),
-                            Some(cancel_requested),
+                            Some(Arc::clone(&cancel_requested)),
                             app_handle_clone.as_ref(),
                             config_state_clone.as_ref(),
                         )
                         .await;
-                        (login_site.id.clone(), login_site.name.clone(), outcome)
+                        let (traffic, signin) = if daily_bonus {
+                            finish_qingwa_keepalive(
+                                &login_site,
+                                &login_cdp,
+                                &login_tab_id,
+                                &login_logs,
+                                cancel_requested,
+                                &outcome,
+                            )
+                            .await
+                        } else {
+                            (None, None)
+                        };
+                        SiteTaskResult {
+                            site_id: login_site.id,
+                            site_name: login_site.name,
+                            login: outcome,
+                            traffic,
+                            signin,
+                        }
                     }));
                 }
-                push_log(logs, LogEntry::info(format!("{} 已打开", site.name))).await;
+                opened_tabs.push((site.name.clone(), tab_id.clone()));
+                // 已由青蛙自己的任务负责，不能再加入批量签到和流量任务重复操作。
+                if daily_bonus {
+                    continue;
+                }
                 if site.auto_signin {
                     signin_targets.push((site.clone(), tab_id.clone()));
                 }
                 if site.auto_daily_bonus {
-                    if is_qingwa_site(&site.url) {
-                        bonus_targets.push((site.clone(), tab_id.clone()));
-                    } else {
-                        push_log(
-                            logs,
-                            LogEntry::error(format!(
-                                "{} 的每日福利开关仅适用于青蛙站点，已跳过",
-                                site.name
-                            )),
-                        )
-                        .await;
-                    }
+                    push_log(
+                        logs,
+                        LogEntry::error(format!(
+                            "{} 的每日福利开关仅适用于青蛙站点，已跳过",
+                            site.name
+                        )),
+                    )
+                    .await;
                 }
                 traffic_targets.push((site.clone(), tab_id.clone()));
-                opened_tabs.push((site.name.clone(), tab_id));
             }
             Err(e) => {
+                if site.auto_daily_bonus {
+                    push_log(
+                        logs,
+                        LogEntry::error(format!(
+                            "{} 站点打开失败，未购买每日福利：{}",
+                            site.name, e
+                        )),
+                    )
+                    .await;
+                }
                 if site.auto_login {
                     failed_logins.push((site.name.clone(), format!("站点打开失败：{}", e)));
                 }
@@ -806,12 +973,23 @@ async fn run_keepalive_batch(
 
     for job in login_jobs {
         match job.await {
-            Ok((_, site_name, Some(LoginOutcome::Success))) => successful_logins.push(site_name),
-            Ok((site_id, site_name, Some(LoginOutcome::Failed(reason)))) => {
-                failed_login_site_ids.insert(site_id);
-                failed_logins.push((site_name, reason));
+            Ok(result) => {
+                // 汇总只收集结果；青蛙的福利购买已在自己的任务里执行，不受这里的等待影响。
+                if let Some(traffic) = result.traffic {
+                    traffic_results.push((result.site_name.clone(), traffic));
+                }
+                if let Some(signin) = result.signin {
+                    signin_results.push((result.site_name.clone(), signin));
+                }
+                match result.login {
+                    Some(LoginOutcome::Success) => successful_logins.push(result.site_name),
+                    Some(LoginOutcome::Failed(reason)) => {
+                        failed_login_site_ids.insert(result.site_id);
+                        failed_logins.push((result.site_name, reason));
+                    }
+                    None => {}
+                }
             }
-            Ok((_, _, None)) => {}
             Err(err) => {
                 push_log(
                     logs,
@@ -820,6 +998,11 @@ async fn run_keepalive_batch(
                 .await;
             }
         }
+    }
+
+    if task_cancel_requested.load(Ordering::SeqCst) {
+        close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
+        return true;
     }
 
     let mut traffic_jobs = Vec::new();
@@ -879,39 +1062,6 @@ async fn run_keepalive_batch(
                 push_log(
                     logs,
                     LogEntry::error(format!("自动签到任务异常结束：{err}")),
-                )
-                .await
-            }
-        }
-    }
-
-    // 签到和流量读取都完成后再导航到福利商店，避免并行任务操作同一标签页。
-    for (site, tab_id) in bonus_targets {
-        if task_cancel_requested.load(Ordering::SeqCst) {
-            close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
-            return true;
-        }
-        if failed_login_site_ids.contains(&site.id) {
-            push_log(
-                logs,
-                LogEntry::error(format!("{} 自动登录失败，未购买每日福利", site.name)),
-            )
-            .await;
-            continue;
-        }
-        push_log(
-            logs,
-            LogEntry::info(format!("{} 正在检查每日福利", site.name)),
-        )
-        .await;
-        match cdp.purchase_qingwa_daily_bonus(&tab_id).await {
-            Ok(message) => {
-                push_log(logs, LogEntry::info(format!("{}：{}", site.name, message))).await
-            }
-            Err(error) => {
-                push_log(
-                    logs,
-                    LogEntry::error(format!("{} 每日福利：{}", site.name, error)),
                 )
                 .await
             }

@@ -1,4 +1,4 @@
-use super::{CdpClient, CdpWebSocket};
+use super::{check_cancel, CdpClient, CdpProgress, CdpWebSocket};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -26,18 +26,25 @@ pub fn is_qingwa_site(url: &str) -> bool {
 }
 
 impl CdpClient {
-    pub async fn purchase_qingwa_daily_bonus(&self, tab_id: &str) -> Result<String, String> {
+    pub async fn purchase_qingwa_daily_bonus(
+        &self,
+        tab_id: &str,
+        progress: &CdpProgress,
+    ) -> Result<String, String> {
+        check_cancel(Some(progress))?;
         let websocket_url = self
             .websocket_url_for_tab(tab_id)?
             .ok_or_else(|| "未找到青蛙站点标签页".to_string())?;
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
         websocket.call("Page.enable", json!({}))?;
+        check_cancel(Some(progress))?;
         websocket.call("Page.navigate", json!({ "url": BONUS_URL }))?;
 
         // 等待商店脚本渲染商品。只在商品名称、兑换说明、限购和价格都匹配时才允许点击。
         let mut last_detail = String::new();
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            check_cancel(Some(progress))?;
             let state = match inspect_bonus(&mut websocket) {
                 Ok(state) => state,
                 Err(err) => {
@@ -46,7 +53,7 @@ impl CdpClient {
                 }
             };
             match state.status.as_str() {
-                "ready" => return complete_purchase(&mut websocket).await,
+                "ready" => return complete_purchase(&mut websocket, progress).await,
                 "already" => {
                     return Ok(format!(
                         "每日福利已领取或今日已尝试，跳过：{}",
@@ -61,7 +68,11 @@ impl CdpClient {
     }
 }
 
-async fn complete_purchase(websocket: &mut CdpWebSocket) -> Result<String, String> {
+async fn complete_purchase(
+    websocket: &mut CdpWebSocket,
+    progress: &CdpProgress,
+) -> Result<String, String> {
+    check_cancel(Some(progress))?;
     if evaluate(websocket, BONUS_OPEN_DIALOG_EXPRESSION)?.as_bool() != Some(true) {
         return Err("每日福利商品在打开确认弹窗前发生变化，已跳过".to_string());
     }
@@ -69,6 +80,7 @@ async fn complete_purchase(websocket: &mut CdpWebSocket) -> Result<String, Strin
     // 商店需要在商品卡片和确认弹窗中各点一次购买，提交前再次核对商品、价格和数量。
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(300)).await;
+        check_cancel(Some(progress))?;
         let modal = inspect_expression(websocket, BONUS_MODAL_EXPRESSION)?;
         match modal.status.as_str() {
             "ready" => break,
@@ -80,12 +92,15 @@ async fn complete_purchase(websocket: &mut CdpWebSocket) -> Result<String, Strin
     if modal.status != "ready" {
         return Err("未出现每日福利购买确认弹窗，已跳过提交".to_string());
     }
+    // 青蛙独立执行时也要响应整批任务的终止，确认购买前最后检查一次。
+    check_cancel(Some(progress))?;
     if evaluate(websocket, BONUS_CONFIRM_EXPRESSION)?.as_bool() != Some(true) {
         return Err("每日福利确认弹窗在提交前发生变化，已跳过".to_string());
     }
 
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(250)).await;
+        check_cancel(Some(progress))?;
         let result = match inspect_expression(websocket, BONUS_RESULT_EXPRESSION) {
             Ok(result) => result,
             Err(_) => continue,
