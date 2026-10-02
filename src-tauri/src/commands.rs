@@ -796,29 +796,6 @@ pub async fn check_cdp(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn ensure_cdp(state: State<'_, AppState>) -> Result<bool, String> {
-    let (cdp_port, browser, initial_urls) = {
-        let config = state.config.lock().await;
-        let urls = config
-            .sites
-            .iter()
-            .map(|site| site.url.clone())
-            .collect::<Vec<_>>();
-        (config.cdp_port, config.browser, urls)
-    };
-    let cdp = CdpClient::with_browser(cdp_port, browser);
-    let progress = CdpProgress::new(
-        Arc::clone(&state.logs),
-        Arc::clone(&state.task_cancel_requested),
-    );
-    let result = cdp
-        .ensure_available_with_progress(&initial_urls, &progress)
-        .await?;
-    push_log(&state.logs, LogEntry::info(result.message)).await;
-    Ok(true)
-}
-
-#[tauri::command]
 pub async fn sync_cookiecloud_cookies(
     state: State<'_, AppState>,
     cookies: serde_json::Value,

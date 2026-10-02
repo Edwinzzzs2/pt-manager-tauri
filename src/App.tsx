@@ -12,7 +12,6 @@ import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
   Activity,
-  BellDot,
   CheckCircle2,
   Clock3,
   Cookie,
@@ -41,6 +40,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import "./App.css";
+import { VersionCard, type UpdatePhase } from "./components/VersionCard";
 
 type Site = {
   id: string;
@@ -316,14 +316,16 @@ function App() {
     cookiecloud_upload: true,
   });
   const [busy, setBusy] = useState(false);
-  const [cdpBusy, setCdpBusy] = useState(false);
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
   const [cookieCloudClearBusy, setCookieCloudClearBusy] = useState(false);
   const [gotifyTestBusy, setGotifyTestBusy] = useState(false);
   const [barkTestBusy, setBarkTestBusy] = useState(false);
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
-  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updatePhase, setUpdatePhase] = useState<UpdatePhase>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateLastCheckedAt, setUpdateLastCheckedAt] = useState<number | null>(null);
+  const [updateCheckFailed, setUpdateCheckFailed] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
   const updateCheckPromise = useRef<Promise<AppUpdateInfo | null> | null>(null);
   const [testingSiteId, setTestingSiteId] = useState<string | null>(null);
@@ -373,7 +375,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // 自动检查只更新版本提示；安装确认仍由用户点击“检查更新”触发。
+    // 自动检查只更新版本提示；下载和安装仍由用户点击按钮确认。
     const checkSilently = () => {
       void fetchAvailableUpdate().catch(() => {
         // 后台网络失败不打断应用，下次定时检查会重试。
@@ -438,20 +440,6 @@ function App() {
       showError(err);
     } finally {
       setCancelBusy(false);
-    }
-  }
-
-  async function ensureCdp() {
-    setCdpBusy(true);
-    setError(null);
-    try {
-      await invoke("ensure_cdp");
-      await refreshStatus();
-      await refreshLogs();
-    } catch (err) {
-      showError(err);
-    } finally {
-      setCdpBusy(false);
     }
   }
 
@@ -980,20 +968,29 @@ function App() {
   function fetchAvailableUpdate(): Promise<AppUpdateInfo | null> {
     // 手动检查与整点自动检查重合时，复用同一次请求，避免并发弹窗或重复网络请求。
     if (!updateCheckPromise.current) {
+      setUpdateChecking(true);
       updateCheckPromise.current = invoke<AppUpdateInfo | null>("check_for_app_update")
         .then((update) => {
           setAvailableUpdate(update);
+          setUpdateLastCheckedAt(Date.now());
+          setUpdateCheckFailed(false);
           return update;
+        })
+        .catch((err: unknown) => {
+          // 网络失败时保留已发现的新版本，但明确标记本次检查失败。
+          setUpdateCheckFailed(true);
+          throw err;
         })
         .finally(() => {
           updateCheckPromise.current = null;
+          setUpdateChecking(false);
         });
     }
     return updateCheckPromise.current;
   }
 
   async function checkForUpdates() {
-    setUpdateBusy(true);
+    setUpdatePhase("checking");
     setError(null);
     try {
       const update = await fetchAvailableUpdate();
@@ -1005,19 +1002,22 @@ function App() {
         return;
       }
 
+      setUpdatePhase("confirming");
       const shouldInstall = await ask(
-        `发现新版本 ${formatVersion(update.version)}，是否现在下载并安装？`,
+        `当前版本：${appVersion ? formatVersion(appVersion) : "读取中"}\n新版本：${formatVersion(update.version)}\n\n是否下载并安装？安装完成后应用将自动重启。`,
         {
           kind: "info",
           okLabel: "立即更新",
-          cancelLabel: "稍后",
-          title: "发现新版本",
+          cancelLabel: "暂不更新",
+          title: "更新 PT Manager",
         },
       );
       if (!shouldInstall) {
         return;
       }
 
+      // 后端合并执行下载和安装，界面不显示未经事件确认的进度百分比。
+      setUpdatePhase("installing");
       await invoke("download_and_install_app_update", {
         expectedVersion: update.version,
       });
@@ -1026,7 +1026,7 @@ function App() {
       const message = err instanceof Error ? err.message : String(err);
       setError(`更新失败：${message}`);
     } finally {
-      setUpdateBusy(false);
+      setUpdatePhase(null);
     }
   }
 
@@ -1058,45 +1058,36 @@ function App() {
           })}
         </nav>
 
-        <div className="sidebar-status">
-          <span className={status?.cdp_connected ? "dot ok" : "dot standby"} />
-          <div>
-            <strong>
-              {status?.cdp_connected
-                ? `${browserName} 已连接`
-                : status?.browser_installed === false
-                  ? `需要安装 ${browserName}`
-                  : "自动模式待命"}
-            </strong>
-            <span>
-              {status?.cdp_connected
-                ? `localhost:${status.active_cdp_port ?? config.cdp_port}`
-                : status?.browser_installed === false
-                  ? "安装后自动接管"
-              : "运行时自动准备"}
-            </span>
+        <div className="sidebar-footer">
+          <div className="sidebar-status">
+            <span className={status?.cdp_connected ? "dot ok" : "dot standby"} />
+            <div>
+              <strong>
+                {status?.cdp_connected
+                  ? `${browserName} 已连接`
+                  : status?.browser_installed === false
+                    ? `需要安装 ${browserName}`
+                    : "自动模式待命"}
+              </strong>
+              <span>
+                {status?.cdp_connected
+                  ? `localhost:${status.active_cdp_port ?? config.cdp_port}`
+                  : status?.browser_installed === false
+                    ? "安装后自动接管"
+                    : "运行时自动准备"}
+              </span>
+            </div>
           </div>
-        </div>
 
-        <div className="version-card">
-          <div>
-            <span>当前版本</span>
-            <strong>{appVersion ? formatVersion(appVersion) : "读取中"}</strong>
-            {availableUpdate ? (
-              <div
-                className="update-available"
-                role="status"
-                title={`发现新版本 ${formatVersion(availableUpdate.version)}`}
-              >
-                <BellDot size={13} aria-hidden="true" />
-                <span>新版 {formatVersion(availableUpdate.version)}</span>
-              </div>
-            ) : null}
-          </div>
-          <button disabled={updateBusy} onClick={checkForUpdates} type="button">
-            <RefreshCw size={14} />
-            <span>{updateBusy ? "检查中" : availableUpdate ? "查看更新" : "检查更新"}</span>
-          </button>
+          <VersionCard
+            currentVersion={appVersion ? formatVersion(appVersion) : ""}
+            availableVersion={availableUpdate ? formatVersion(availableUpdate.version) : null}
+            checking={updateChecking}
+            phase={updatePhase}
+            lastCheckedAt={updateLastCheckedAt}
+            checkFailed={updateCheckFailed}
+            onCheck={checkForUpdates}
+          />
         </div>
       </aside>
 
@@ -1160,10 +1151,8 @@ function App() {
 
           {activeTab === "dashboard" ? (
             <Dashboard
-              cdpBusy={cdpBusy}
               config={config}
               lastLog={lastVisibleLog}
-              onEnsureCdp={ensureCdp}
               onOpenBrowserDownload={openBrowserDownload}
               recentLogs={logs.slice(-30).reverse()}
               status={status}
@@ -1349,19 +1338,15 @@ function parseCookieCloudPayload(text: string): Record<string, unknown> | null {
 }
 
 function Dashboard({
-  cdpBusy,
   config,
   lastLog,
-  onEnsureCdp,
   onOpenBrowserDownload,
   recentLogs,
   status,
   onRefresh,
 }: {
-  cdpBusy: boolean;
   config: AppConfig;
   lastLog?: LogEntry;
-  onEnsureCdp: () => void;
   onOpenBrowserDownload: () => void;
   recentLogs: LogEntry[];
   status: AppStatus | null;
@@ -1410,7 +1395,7 @@ function Dashboard({
               <h2>自动模式</h2>
             </div>
             <div className="row-actions">
-              {!browserInstalled ? (
+              {!browserInstalled && (
                 <button
                   className="ghost install-action"
                   onClick={onOpenBrowserDownload}
@@ -1419,17 +1404,7 @@ function Dashboard({
                   <Download size={16} />
                   <span>安装 {browserName}</span>
                 </button>
-              ) : !browserConnected ? (
-                <button
-                  className="ghost"
-                  disabled={cdpBusy || status?.is_running}
-                  onClick={onEnsureCdp}
-                  type="button"
-                >
-                  {cdpBusy ? <RefreshCw size={16} /> : <Play size={16} />}
-                  <span>{cdpBusy ? "准备中" : "预先准备"}</span>
-                </button>
-              ) : null}
+              )}
               <button className="icon-button" onClick={onRefresh} title="刷新状态" type="button">
                 <RefreshCw size={17} />
               </button>
@@ -1439,13 +1414,13 @@ function Dashboard({
             {browserConnected
               ? `CDP 已连接：localhost:${status?.active_cdp_port ?? config.cdp_port}`
               : browserInstalled
-                ? `自动模式待命：执行保活时会自动启动专用 ${browserName}`
+                ? `自动模式待命：保活或测试登录时自动准备 ${browserName}`
                 : `未检测到 ${browserName}：安装完成后即可自动启动专用浏览器`}
           </code>
           <div className="setup-steps">
-            <span>1. 默认自动模式，保活时自动启动专用 {browserName} Profile</span>
-            <span>2. 首次打开后登录站点，后续会复用同一个专用浏览器环境</span>
-            <span>3. 未安装 {browserName} 时先安装，安装完成后点刷新或立即保活</span>
+            <span>1. 在站点中配置账号与自动化开关</span>
+            <span>2. 立即保活执行已启用站点，测试登录仅运行本站</span>
+            <span>3. 两种入口都会自动准备专用 {browserName}，并复用已有登录状态</span>
           </div>
         </div>
 

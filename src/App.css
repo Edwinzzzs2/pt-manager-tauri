@@ -12,7 +12,7 @@
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: 28px;
+  gap: 24px;
   padding: 22px 16px;
   border-right: 1px solid var(--color-border);
   background: var(--sidebar-surface);
@@ -107,9 +107,15 @@ button span,
   box-shadow: inset 3px 0 0 var(--color-success);
 }
 
+.sidebar-footer {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin-top: auto;
+}
+
 .sidebar-status {
   gap: 10px;
-  margin-top: auto;
   padding: 12px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
@@ -119,55 +125,180 @@ button span,
 .version-card {
   display: grid;
   gap: 10px;
+  min-width: 0;
   padding: 12px;
   border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--subtle-surface-soft);
 }
 
-.version-card span {
+.version-card.has-update {
+  border-color: var(--accent-soft-border);
+  background: var(--accent-soft-bg);
+}
+
+.version-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.version-current {
+  min-width: 0;
+}
+
+.version-label {
+  display: block;
   color: var(--color-fg-muted);
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .version-card strong {
   display: block;
-  margin-top: 3px;
+  margin-top: 5px;
   color: var(--color-fg);
-  font-size: 14px;
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.4px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
-.version-card .update-available {
+.version-state {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  margin-top: 7px;
-  padding: 4px 7px;
+  flex: 0 0 auto;
+  gap: 4px;
+  padding: 4px 6px;
   border-radius: 999px;
-  background: var(--accent-soft-bg-hover);
-  color: var(--color-accent);
-}
-
-.version-card .update-available span {
-  color: inherit;
-  font-size: 11px;
+  background: var(--subtle-surface-strong);
+  color: var(--color-fg-muted);
+  font-size: 10px;
   font-weight: 600;
+  line-height: 1.2;
 }
 
-.version-card button {
+.version-state.latest {
+  background: var(--success-soft-bg);
+  color: var(--success-soft-fg);
+}
+
+.version-state.available,
+.version-state.pending {
+  background: var(--accent-soft-bg);
+  color: var(--accent-soft-fg);
+}
+
+.version-state.warning {
+  background: var(--warning-soft-bg);
+  color: var(--warning-soft-fg);
+}
+
+.version-release {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-top: 10px;
+  border-top: 1px solid var(--accent-soft-border);
+}
+
+.version-release > div {
+  min-width: 0;
+}
+
+.version-release-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--accent-soft-bg-hover);
+  color: var(--accent-soft-fg);
+}
+
+.version-release strong {
+  color: var(--accent-soft-fg);
+  font-size: 15px;
+}
+
+.version-card .version-action {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 7px;
   width: 100%;
-  height: 34px;
+  min-height: 36px;
+  padding: 8px;
   border-radius: 8px;
   background: var(--color-bg-hover);
+  color: var(--color-fg);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 150ms ease;
   cursor: pointer;
 }
 
-.version-card button:hover {
+.version-card .version-action:hover:not(:disabled) {
   background: var(--accent-soft-bg-hover);
+}
+
+.version-card.has-update .version-action {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+
+.version-card.has-update .version-action:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.version-action:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.version-footnote {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-fg-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.version-footnote svg {
+  flex: 0 0 auto;
+}
+
+.version-footnote time {
+  margin-left: auto;
+  color: inherit;
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.version-hint {
+  color: var(--color-fg-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.version-compact-dot {
+  display: none;
+}
+
+.version-spinning {
+  animation: spin 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .version-spinning {
+    animation: none;
+  }
 }
 
 .dot {
@@ -1399,9 +1530,40 @@ html[data-theme="light"] .log-level-filter select {
 
   .brand div,
   .nav-item span,
-  .sidebar-status div,
-  .version-card {
+  .sidebar-status div {
     display: none;
+  }
+
+  /* 侧栏收起后保留更新入口和提示点，避免窄窗口完全看不到新版本。 */
+  .version-card,
+  .version-card.has-update {
+    gap: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+
+  .version-card-header,
+  .version-release,
+  .version-footnote,
+  .version-hint,
+  .version-action > span {
+    display: none;
+  }
+
+  .version-card .version-action {
+    min-height: 40px;
+  }
+
+  .version-action .version-compact-dot {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    display: block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--color-on-accent);
   }
 
   .nav-item {

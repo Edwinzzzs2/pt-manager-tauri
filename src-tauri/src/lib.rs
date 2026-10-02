@@ -88,7 +88,6 @@ pub fn run() {
             commands::test_site_login,
             commands::recognize_site_captcha,
             commands::check_cdp,
-            commands::ensure_cdp,
             commands::sync_cookiecloud_cookies,
             commands::sync_cookiecloud_from_config,
             commands::get_status,
