@@ -1169,7 +1169,7 @@ select:focus {
   display: flex;
   height: 100%;
   min-height: 0;
-  width: min(1120px, 100%);
+  width: 100%;
   flex: 1;
   flex-direction: column;
 }
