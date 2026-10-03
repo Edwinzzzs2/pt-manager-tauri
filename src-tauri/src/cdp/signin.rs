@@ -2,6 +2,8 @@ use super::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+mod jying;
+
 const SIGNIN_WAIT_STEPS: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -81,6 +83,7 @@ struct PageState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigninAdapter {
     Dian115,
+    Jying,
     Hdarea,
     Audiences,
     Hdfans,
@@ -116,6 +119,8 @@ impl SigninAdapter {
     fn from_url(url: &str) -> Self {
         if host_from_url(url).as_deref() == Some("m.dian115.com") {
             Self::Dian115
+        } else if matches!(host_from_url(url).as_deref(), Some("jying.top" | "www.jying.top")) {
+            Self::Jying
         } else if matches!(host_from_url(url).as_deref(), Some("hdarea.club" | "www.hdarea.club")) {
             Self::Hdarea
         } else if url.to_ascii_lowercase().contains("audiences.me") {
@@ -143,6 +148,7 @@ impl SigninAdapter {
     fn label(self) -> &'static str {
         match self {
             Self::Dian115 => "癫影站点适配",
+            Self::Jying => "聚影页面签到适配",
             Self::Hdarea => "HDArea 首页签到适配",
             Self::Audiences => "观众站点适配",
             Self::Hdfans => "红豆饭站点适配",
@@ -223,6 +229,9 @@ impl CdpClient {
         progress: Option<&CdpProgress>,
     ) -> Result<SigninResult, String> {
         let adapter = SigninAdapter::from_url(site_url);
+        if adapter == SigninAdapter::Jying {
+            return self.signin_jying(tab_id, site_url, progress).await;
+        }
         if adapter == SigninAdapter::Hdarea {
             check_cancel(progress)?;
             if let Some(progress) = progress {
@@ -915,6 +924,15 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
 #[cfg(test)]
 mod tests {
     use super::{ApiSigninKind, SigninAdapter};
+
+    #[test]
+    fn selects_jying_page_without_api_fallback() {
+        assert_eq!(SigninAdapter::from_url("https://jying.top/"), SigninAdapter::Jying);
+        assert_eq!(SigninAdapter::from_url("https://www.jying.top/checkin"), SigninAdapter::Jying);
+        assert_eq!(SigninAdapter::from_url("https://jying.top.evil.example/"), SigninAdapter::Generic);
+        assert_eq!(SigninAdapter::from_url("https://example.com/?next=jying.top"), SigninAdapter::Generic);
+        assert!(SigninAdapter::Jying.api_fallback().is_none());
+    }
 
     #[test]
     fn selects_rousi_page_adapter() {

@@ -2856,7 +2856,7 @@ function SettingsPanel({
             <dl className="site-support-list">
               <div>
                 <dt>专门适配的自动登录</dt>
-                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing / 蜂巢（fengchao.chat，兼容旧域名 pting.club）、SixCloud（666clouds.com）、癫影（m.dian115.com）。</dd>
+                <dd>M-Team（kp.m-team.cc）、HDKylin（hdkyl.in）、PTing / 蜂巢（fengchao.chat，兼容旧域名 pting.club）、SixCloud（666clouds.com）、癫影（m.dian115.com）、聚影（jying.top，用户名或邮箱登录）。</dd>
               </div>
               <div>
                 <dt>NexusPHP 兼容登录</dt>
@@ -2864,7 +2864,7 @@ function SettingsPanel({
               </div>
               <div>
                 <dt>专门适配的自动签到</dt>
-                <dd>HDArea（好大，首页签到）、Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing / 蜂巢（fengchao.chat，兼容旧域名 pting.club）、癫影（m.dian115.com，普通签到）。青蛙、HDDolby（杜比）、UBits（U堡）使用通用签到流程，识别签到成功或今日已签到状态。</dd>
+                <dd>HDArea（好大，首页签到）、Audiences（audiences.me）、HDFans（hdfans.org）、PterClub（pterclub.*）、YemaPT（yemapt.org）、Hares（club.hares.top）、Rousi（rousi.pro）、PTing / 蜂巢（fengchao.chat，兼容旧域名 pting.club）、癫影（m.dian115.com，普通签到）、聚影（jying.top，每日签到）。青蛙、HDDolby（杜比）、UBits（U堡）使用通用签到流程，识别签到成功或今日已签到状态。</dd>
               </div>
               <div>
                 <dt>青蛙每日福利</dt>
