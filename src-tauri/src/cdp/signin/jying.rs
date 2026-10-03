@@ -1,6 +1,7 @@
 //! 聚影每日签到：只点击签到区的按钮，使用按钮和今日状态共同确认结果。
 
 use super::{check_cancel, CdpClient, CdpProgress, CdpWebSocket, SigninResult, SigninStatus};
+use crate::cdp::jying::dismiss_announcement;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -48,6 +49,7 @@ impl CdpClient {
                 return Ok(SigninResult::failure("聚影签到页跳转到其他域名，已停止操作"));
             }
             if !state.ready { continue; }
+            dismiss_announcement(&mut websocket, progress).await?;
             if state.has_login_form || state.path == "/login" {
                 return Ok(SigninResult::failure("聚影登录状态已失效，请先登录"));
             }

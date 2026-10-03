@@ -1,6 +1,7 @@
 //! 聚影 Vue 登录页：使用页面输入事件和登录按钮，等待真实账户入口出现。
 
 use super::common::{click_runtime_element, type_runtime_input};
+use crate::cdp::jying::dismiss_announcement;
 use crate::cdp::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
 use serde::Deserialize;
 use std::time::Duration;
@@ -78,6 +79,9 @@ impl CdpClient {
             tokio::time::sleep(Duration::from_millis(250)).await;
             let Some(state) = page_state(&mut websocket) else { continue };
             ensure_site(&state)?;
+            if state.ready {
+                dismiss_announcement(&mut websocket, progress).await?;
+            }
             if state.logged_in {
                 return Ok(true);
             }
@@ -101,6 +105,9 @@ async fn wait_for_page(
         check_cancel(progress)?;
         if let Some(state) = page_state(websocket) {
             ensure_site(&state)?;
+            if state.ready {
+                dismiss_announcement(websocket, progress).await?;
+            }
             // Vue 路由和表单会在 HTML 加载后挂载，不能只看 document.readyState。
             if state.ready && (state.logged_in || state.has_login_form || state.has_verification) {
                 return Ok(state);
