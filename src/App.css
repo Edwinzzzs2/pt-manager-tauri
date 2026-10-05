@@ -344,6 +344,13 @@ h2 {
   cursor: help;
 }
 
+.help-tip-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
 .help-tip::after {
   position: absolute;
   z-index: 1000;

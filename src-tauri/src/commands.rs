@@ -1188,6 +1188,13 @@ pub async fn open_browser_download(state: State<'_, AppState>) -> Result<(), Str
     open_url(url).map_err(|err| err.to_string())
 }
 
+/// 部署说明固定指向仓库公开文档，不接收配置里的代理地址。
+#[tauri::command]
+pub fn open_browser_proxy_guide() -> Result<(), String> {
+    open_url("https://github.com/Edwinzzzs2/pt-manager-tauri/blob/main/docs/browser-proxy-deployment.md")
+        .map_err(|err| err.to_string())
+}
+
 async fn restart_scheduler(state: &State<'_, AppState>, config: AppConfig) {
     state.scheduler.lock().await.start(
         config,

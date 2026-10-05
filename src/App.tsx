@@ -455,6 +455,15 @@ function App() {
     }
   }
 
+  async function openBrowserProxyGuide() {
+    setError(null);
+    try {
+      await invoke("open_browser_proxy_guide");
+    } catch (err) {
+      showError(err);
+    }
+  }
+
   async function syncCookieCloud() {
     setCookieSyncBusy(true);
     setError(null);
@@ -1181,6 +1190,7 @@ function App() {
               onChange={setSettingsDraft}
               onClearBrowserData={clearBrowserData}
               onClearCookieCloudData={clearCookieCloudData}
+              onOpenBrowserProxyGuide={openBrowserProxyGuide}
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               onTestGotify={testGotify}
@@ -2287,6 +2297,7 @@ function SettingsPanel({
   onChange,
   onClearBrowserData,
   onClearCookieCloudData,
+  onOpenBrowserProxyGuide,
   onSave,
   onSyncCookieCloud,
   onTestGotify,
@@ -2305,6 +2316,7 @@ function SettingsPanel({
   onChange: (config: AppConfig) => void;
   onClearBrowserData: () => void;
   onClearCookieCloudData: () => void;
+  onOpenBrowserProxyGuide: () => void;
   onSave: () => void;
   onSyncCookieCloud: () => void;
   onTestGotify: () => void;
@@ -2489,7 +2501,18 @@ function SettingsPanel({
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Browser Proxy</p>
-              <h2>浏览器代理</h2>
+              <div className="title-with-help">
+                <h2>浏览器代理</h2>
+                <button
+                  aria-label="查看浏览器代理部署说明"
+                  className="help-tip help-tip-button"
+                  data-tooltip="点击查看 GitHub 上的代理部署说明；HTTP 默认端口为 80，HTTPS 默认端口为 443，其他端口需明确填写。"
+                  onClick={onOpenBrowserProxyGuide}
+                  type="button"
+                >
+                  <HelpCircle size={16} />
+                </button>
+              </div>
             </div>
           </div>
           <div className="settings-form">
