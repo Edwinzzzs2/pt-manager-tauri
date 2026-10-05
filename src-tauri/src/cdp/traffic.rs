@@ -69,7 +69,9 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
     const downloadLabel = new RegExp('(?:^|\\s)(?:(?:下载|下載)(?:量)?|下行(?:流量)?|download(?:ed)?)\\s*[:：]?\\s*' + sizeSource, 'i');
     const uploadArrow = new RegExp('[↑⬆]\\s*' + sizeSource, 'i');
     const downloadArrow = new RegExp('[↓⬇]\\s*' + sizeSource, 'i');
-    const ratioLabel = /(?:分享率|分享比率|传输比率|傳輸比率|ratio)\s*[:：]?\s*(∞|inf(?:inity)?|---|[\d,.]+)/i;
+    // 憨憨账号面板使用“[分享率]: 数值”，闭括号不是数值的一部分。
+    const ratioLabel = /(?:分享率|分享比率|传输比率|傳輸比率|ratio)\s*[\]】]?\s*[:：]?\s*(∞|inf(?:inity)?|---|[\d,.]+)/i;
+    const ratioField = /^(?:(?:\[|【)?(?:分享率|分享比率|传输比率|傳輸比率|ratio)\s*[\]】]?\s*[:：]?\s*)?(∞|inf(?:inity)?|---|[\d,.]+)$/i;
     const markerValue = (selector, pattern) => {
         for (const marker of document.querySelectorAll(selector)) {
             let localText = clean(marker.textContent);
@@ -96,8 +98,8 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
         new RegExp(sizeSource, 'i')
     );
     const accountRatio = markerValue(
-        '.color_ratio, .top-nav__stats-ratio, .ratio-bar__ratio, [title="分享率"], [title="分享比率"]',
-        /(∞|inf(?:inity)?|---|[\d,.]+)/i
+        '.color_ratio, .top-nav__stats-ratio, .ratio-bar__ratio, [title="分享率"], [title="分享比率"], img[alt="分享率"], img[alt="分享比率"]',
+        ratioField
     );
     const directUpload = bodyText.match(uploadLabel)?.[1] || bodyText.match(uploadArrow)?.[1] || null;
     const directDownload = bodyText.match(downloadLabel)?.[1] || bodyText.match(downloadArrow)?.[1] || null;
@@ -129,7 +131,7 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
     };
     const uploadHint = /(upload|uploaded|traffic.?out|arrow.?up|fa.?up|icon.?up|上传|上傳|上行)/i;
     const downloadHint = /(download|downloaded|traffic.?in|arrow.?down|fa.?down|icon.?down|下载|下載|下行)/i;
-    const ratioHint = /(share.?ratio|ratio|icon.?chart|fa.?chart|分享率|分享比率|传输比率|傳輸比率)/i;
+    const ratioHint = /(share.?ratio|(?:^|[\s/_-])ratio(?:$|[\s/_.-])|分享率|分享比率|传输比率|傳輸比率)/i;
     const candidates = [];
     for (const element of document.querySelectorAll('span, strong, b, div, td, a')) {
         if (!visible(element)) continue;
@@ -156,8 +158,13 @@ const TRAFFIC_EXPRESSION: &str = r#"(() => {
         if (!visible(element)) continue;
         const text = clean(element.textContent);
         if (!exactRatio.test(text)) continue;
+        // 用户名可以是纯数字，账号链接及其子节点不能作为分享率候选。
+        if (element.closest('a[href*="userdetails.php"]')) continue;
         let score = 0;
         [element, element.parentElement, element.previousElementSibling].forEach((scope, index) => {
+            // 只查看单个字段的图标，避免从整个账号面板继承分享率标记。
+            const scopeText = clean(scope?.textContent);
+            if (scopeText && !ratioField.test(scopeText) && !/^(?:\[|【)?(?:分享率|分享比率|传输比率|傳輸比率|ratio)[\]】]?\s*[:：]?$/i.test(scopeText)) return;
             if (ratioHint.test(marker(scope))) score = Math.max(score, 12 - index * 3);
         });
         if (score > 0) ratioCandidates.push({ value: text, score });
