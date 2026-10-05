@@ -179,7 +179,16 @@ async fn run_keepalive_inner(
         }
     }
 
-    let mut cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let mut cdp = match CdpClient::with_config(config) {
+        Ok(cdp) => cdp,
+        Err(message) => {
+            push_log(logs, LogEntry::error(message)).await;
+            return false;
+        }
+    };
+    if config.browser_proxy.enabled {
+        push_log(logs, LogEntry::info("浏览器代理已启用，保活、登录、签到及每日福利将通过代理访问站点")).await;
+    }
     let had_cdp_before_sync = cdp.available_port().await.is_some();
 
     if !config.ocr_server_url.is_empty() {
@@ -330,7 +339,7 @@ async fn sync_cookiecloud_before_keepalive(
         return Err("CookieCloud 未解析到可同步的 Cookie 或 Local Storage".to_string());
     }
 
-    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let cdp = CdpClient::with_config(config)?;
     let active_port = match cdp.available_port().await {
         Some(port) => port,
         None => {

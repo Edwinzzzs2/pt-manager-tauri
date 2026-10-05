@@ -53,6 +53,8 @@ pub struct AppConfig {
     pub cdp_port: u16,
     #[serde(default)]
     pub browser: BrowserKind,
+    #[serde(default)]
+    pub browser_proxy: BrowserProxyConfig,
     pub visit_duration: u64,
     pub random_delay: bool,
     #[serde(default = "default_auto_launch")]
@@ -87,6 +89,24 @@ pub enum BrowserKind {
     #[default]
     Chrome,
     Edge,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserProxyConfig {
+    pub enabled: bool,
+    pub server_url: String,
+    pub username: String,
+    pub password: String,
+}
+
+// 配置可能包含代理密码；Debug 输出只保留开关，避免诊断日志泄漏凭据。
+impl std::fmt::Debug for BrowserProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("BrowserProxyConfig")
+            .field("enabled", &self.enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BrowserKind {
@@ -164,6 +184,7 @@ impl Default for AppConfig {
             cron_offset_minutes: 30,
             cdp_port: 9222,
             browser: BrowserKind::default(),
+            browser_proxy: BrowserProxyConfig::default(),
             visit_duration: 30,
             random_delay: true,
             auto_launch: default_auto_launch(),

@@ -84,6 +84,11 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
     config.update_proxy_url = updater::normalize_proxy_url(&config.update_proxy_url)?;
+    crate::browser_proxy::normalize_config(&mut config.browser_proxy)?;
+    let proxy_changed = state.config.lock().await.browser_proxy != config.browser_proxy;
+    if proxy_changed && *state.task_running.lock().await {
+        return Err("保活任务执行中，请等待任务结束后修改浏览器代理".to_string());
+    }
     config.gotify.server_url = config
         .gotify
         .server_url
@@ -273,7 +278,7 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         return Err("请先配置登录用户名和密码".to_string());
     }
 
-    let mut cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let mut cdp = CdpClient::with_config(&config)?;
     if let Some(active_port) = cdp.available_port().await {
         cdp = CdpClient::new(active_port);
     } else {
@@ -530,7 +535,7 @@ pub async fn recognize_site_captcha(
             return Err(message);
         }
     }
-    let mut cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let mut cdp = CdpClient::with_config(&config)?;
     let active_port = cdp.available_port().await.ok_or_else(|| {
         format!(
             "专用 {} 未连接，请先点击该站点的测试按钮",
@@ -687,12 +692,11 @@ pub async fn recognize_site_captcha(
 
 #[tauri::command]
 pub async fn check_cdp(state: State<'_, AppState>) -> Result<bool, String> {
-    let (cdp_port, browser) = {
-        let config = state.config.lock().await;
-        (config.cdp_port, config.browser)
-    };
-    let cdp = CdpClient::with_browser(cdp_port, browser);
-    Ok(cdp.available_port().await.is_some())
+    let config = state.config.lock().await.clone();
+    match CdpClient::for_status(&config) {
+        Some(cdp) => Ok(cdp.available_port().await.is_some()),
+        None => Ok(false),
+    }
 }
 
 #[tauri::command]
@@ -731,7 +735,7 @@ async fn import_cookiecloud_cookies(
         return Err(message);
     }
 
-    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let cdp = CdpClient::with_config(config)?;
     let mut launched_sync_browser = false;
     let active_port = match cdp.available_port().await {
         Some(port) => port,
@@ -1041,8 +1045,10 @@ fn is_connection_refused(message: &str) -> bool {
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let config = state.config.lock().await.clone();
-    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
-    let active_cdp_port = cdp.available_port().await;
+    let active_cdp_port = match CdpClient::for_status(&config) {
+        Some(cdp) => cdp.available_port().await,
+        None => None,
+    };
     let cdp_connected = active_cdp_port.is_some();
     let browser_installed = cdp::browser_installed(config.browser);
     let next_run = state.scheduler.lock().await.next_run().await;
@@ -1316,6 +1322,11 @@ pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<A
     let mut new_config: AppConfig = serde_json::from_str(&json_content)
         .map_err(|err| format!("解析配置文件失败（文件格式可能不正确）: {}", err))?;
     new_config.update_proxy_url = updater::normalize_proxy_url(&new_config.update_proxy_url)?;
+    crate::browser_proxy::normalize_config(&mut new_config.browser_proxy)?;
+    let proxy_changed = state.config.lock().await.browser_proxy != new_config.browser_proxy;
+    if proxy_changed && *state.task_running.lock().await {
+        return Err("保活任务执行中，请等待任务结束后导入不同的浏览器代理配置".to_string());
+    }
 
     let mut config = state.config.lock().await;
     *config = new_config.clone();

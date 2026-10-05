@@ -1,4 +1,4 @@
-use crate::store::{self, BrowserKind, LogEntry};
+use crate::store::{self, AppConfig, BrowserKind, LogEntry};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -43,6 +43,8 @@ struct HttpResponse {
 pub struct CdpClient {
     port: u16,
     browser: BrowserKind,
+    // 外层 None 表示只做 CDP 操作；Some 表示必须校验浏览器当前的代理参数。
+    proxy_address: Option<Option<String>>,
 }
 
 pub struct CdpLaunchResult {
@@ -116,7 +118,21 @@ impl CdpClient {
     }
 
     pub fn with_browser(port: u16, browser: BrowserKind) -> Self {
-        Self { port, browser }
+        Self { port, browser, proxy_address: None }
+    }
+
+    pub fn with_config(config: &AppConfig) -> Result<Self, String> {
+        let address = crate::browser_proxy::ensure_address(&config.browser_proxy)?;
+        Ok(Self { port: config.cdp_port, browser: config.browser, proxy_address: Some(address) })
+    }
+
+    pub fn for_status(config: &AppConfig) -> Option<Self> {
+        let address = if config.browser_proxy.enabled {
+            Some(crate::browser_proxy::active_address(&config.browser_proxy)?)
+        } else {
+            None
+        };
+        Some(Self { port: config.cdp_port, browser: config.browser, proxy_address: Some(address) })
     }
 
     pub fn port(&self) -> u16 {
@@ -139,7 +155,8 @@ impl CdpClient {
             let Some(port) = read_devtools_port(&profile_dir) else {
                 continue;
             };
-            if CdpClient::with_browser(port, self.browser)
+            let candidate = Self { port, browser: self.browser, proxy_address: self.proxy_address.clone() };
+            if candidate
                 .is_available_with_timeout(Duration::from_millis(600))
                 .await
             {
@@ -168,14 +185,58 @@ impl CdpClient {
                     .get("Browser")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                match self.browser {
+                let browser_matches = match self.browser {
                     BrowserKind::Chrome => {
                         product.starts_with("Chrome/") || product.starts_with("Chromium/")
                     }
                     BrowserKind::Edge => product.starts_with("Edg/"),
-                }
+                };
+                browser_matches && self.proxy_matches(&value, timeout).unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    fn proxy_matches(&self, version: &serde_json::Value, timeout: Duration) -> Result<bool, String> {
+        let Some(expected) = &self.proxy_address else { return Ok(true) };
+        let read_arguments = || -> Result<serde_json::Value, String> {
+            let url = version.get("webSocketDebuggerUrl").and_then(|value| value.as_str())
+                .ok_or_else(|| "浏览器没有提供调试连接".to_string())?;
+            CdpWebSocket::connect(url, timeout)?
+                .call("Browser.getBrowserCommandLine", serde_json::json!({}))
+        };
+        let response = match read_arguments() {
+            Ok(value) => value,
+            // 老版本启动的直连浏览器没有 --enable-automation，关闭代理时仍允许复用。
+            Err(_) if expected.is_none() => return Ok(true),
+            Err(err) => return Err(err),
+        };
+        let arguments = response.get("result").and_then(|value| value.get("arguments"))
+            .and_then(|value| value.as_array()).ok_or_else(|| "无法读取浏览器启动参数".to_string())?;
+        let actual = arguments.iter().filter_map(|value| value.as_str())
+            .find_map(|argument| argument.strip_prefix("--proxy-server="));
+        let forced_direct = arguments.iter().any(|value| value.as_str() == Some("--no-proxy-server"));
+        Ok(actual == expected.as_deref() && (expected.is_none() || !forced_direct))
+    }
+
+    /// 在复用前确认代理参数，不能因已有 CDP 连接而悄悄使用另一个网络出口。
+    async fn validate_existing_proxy(&self) -> Result<(), String> {
+        if self.proxy_address.is_none() { return Ok(()) }
+        let mut ports = vec![self.port];
+        for profile in [dedicated_profile_dir(self.browser), recovery_profile_dir(self.browser)] {
+            if let Some(port) = read_devtools_port(&profile) { ports.push(port); }
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        for port in ports {
+            let raw = Self::with_browser(port, self.browser);
+            if !raw.is_available_with_timeout(Duration::from_millis(600)).await { continue; }
+            let response = raw.request("GET", "/json/version", Duration::from_secs(2))?;
+            let version = serde_json::from_str(&response.body).map_err(|err| format!("读取浏览器信息失败：{err}"))?;
+            if !self.proxy_matches(&version, Duration::from_secs(2)).unwrap_or(false) {
+                return Err(format!("{} 已运行，但代理设置与当前配置不匹配。请关闭专用浏览器后重试，程序会按新代理设置启动", self.browser.name()));
+            }
+        }
+        Ok(())
     }
 
     /// 确保所选浏览器已开放 CDP 端口；端口冲突时退回随机端口。
@@ -193,6 +254,11 @@ impl CdpClient {
         initial_urls: &[String],
         progress: Option<&CdpProgress>,
     ) -> Result<CdpLaunchResult, String> {
+        self.validate_existing_proxy().await?;
+        let proxy_address = self.proxy_address.as_ref().and_then(|address| address.as_deref());
+        if proxy_address.is_some() {
+            log_progress(progress, "浏览器代理已启用，代理认证由程序自动处理").await;
+        }
         log_progress(
             progress,
             format!("检测配置端口 localhost:{} 是否已有 CDP 响应", self.port),
@@ -246,6 +312,7 @@ impl CdpClient {
                 false,
                 initial_urls,
                 Some(self.port),
+                proxy_address,
                 progress,
             )
             .await?
@@ -277,6 +344,7 @@ impl CdpClient {
                 false,
                 initial_urls,
                 None,
+                proxy_address,
                 progress,
             )
             .await?
@@ -295,6 +363,7 @@ impl CdpClient {
             true,
             initial_urls,
             None,
+            proxy_address,
             progress,
         )
         .await?
@@ -1394,6 +1463,7 @@ async fn launch_and_wait(
     recovery: bool,
     initial_urls: &[String],
     fixed_port: Option<u16>,
+    proxy_address: Option<&str>,
     progress: Option<&CdpProgress>,
 ) -> Result<Option<CdpLaunchResult>, String> {
     let launch_urls = launch_urls(initial_urls);
@@ -1416,7 +1486,7 @@ async fn launch_and_wait(
     )
     .await;
     let _ = fs::remove_file(devtools_port_path(profile_dir));
-    launch_browser(browser, profile_dir, &launch_urls, fixed_port)?;
+    launch_browser(browser, profile_dir, &launch_urls, fixed_port, proxy_address)?;
     log_progress(progress, format!("{} 进程已启动，等待 CDP 响应", mode)).await;
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1499,6 +1569,7 @@ fn launch_browser(
     profile_dir: &Path,
     urls: &[String],
     fixed_port: Option<u16>,
+    proxy_address: Option<&str>,
 ) -> Result<(), String> {
     let browser_path = find_browser_executable(browser).ok_or_else(|| {
         format!(
@@ -1517,10 +1588,18 @@ fn launch_browser(
             fixed_port.unwrap_or(0)
         ))
         .arg("--remote-debugging-address=127.0.0.1")
+        .arg("--enable-automation")
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--new-window");
+
+    if let Some(address) = proxy_address {
+        // 命令行只包含本地转发地址，上游代理密码不会进入进程参数或浏览器 Profile。
+        command.arg(format!("--proxy-server={address}"))
+            .arg("--disable-quic")
+            .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
+    }
 
     for url in urls {
         command.arg(url);

@@ -1,5 +1,6 @@
 mod auth;
 mod bark;
+mod browser_proxy;
 mod cdp;
 mod commands;
 mod cookiecloud;
@@ -44,6 +45,7 @@ pub fn run() {
             store::set_log_retention(config.log_retention);
             let _ = commands::apply_auto_launch(&app.handle(), config.auto_launch);
             let logs = Arc::new(Mutex::new(store::load_logs()));
+            browser_proxy::set_logs(Arc::clone(&logs));
             let task_running = Arc::new(Mutex::new(false));
             let task_cancel_requested = Arc::new(AtomicBool::new(false));
             let next_run: Arc<Mutex<Option<DateTime<Local>>>> = Arc::new(Mutex::new(None));

@@ -107,12 +107,20 @@ const automationFields: Array<{
   },
 ];
 
+type BrowserProxyConfig = {
+  enabled: boolean;
+  server_url: string;
+  username: string;
+  password: string;
+};
+
 type AppConfig = {
   sites: Site[];
   cron: string;
   cron_offset_minutes: number;
   cdp_port: number;
   browser: "chrome" | "edge";
+  browser_proxy: BrowserProxyConfig;
   visit_duration: number;
   random_delay: boolean;
   auto_launch: boolean;
@@ -189,6 +197,7 @@ const defaultConfig: AppConfig = {
   cron_offset_minutes: 30,
   cdp_port: 9222,
   browser: "chrome",
+  browser_proxy: { enabled: false, server_url: "", username: "", password: "" },
   visit_duration: 30,
   random_delay: true,
   auto_launch: false,
@@ -854,6 +863,11 @@ function App() {
       ),
       update_proxy_url: settingsDraft.update_proxy_url.trim().replace(/\/+$/, ""),
       update_proxy_password: settingsDraft.update_proxy_password,
+      browser_proxy: {
+        ...settingsDraft.browser_proxy,
+        server_url: settingsDraft.browser_proxy.server_url.trim().replace(/\/+$/, ""),
+        username: settingsDraft.browser_proxy.username.trim(),
+      },
       gotify: {
         ...settingsDraft.gotify,
         server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
@@ -2300,6 +2314,7 @@ function SettingsPanel({
   onExportConfig: () => void;
 }) {
   const [showProxyPassword, setShowProxyPassword] = useState(false);
+  const [showBrowserProxyPassword, setShowBrowserProxyPassword] = useState(false);
   const [showCookiePassword, setShowCookiePassword] = useState(false);
   const [showGotifyToken, setShowGotifyToken] = useState(false);
   const [showBarkKey, setShowBarkKey] = useState(false);
@@ -2468,6 +2483,67 @@ function SettingsPanel({
           </label>
           </details>
 
+        </section>
+
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Browser Proxy</p>
+              <h2>浏览器代理</h2>
+            </div>
+          </div>
+          <div className="settings-form">
+            <label className="switch-row">
+              <span>启用浏览器代理</span>
+              <input
+                checked={draft.browser_proxy.enabled}
+                disabled={taskRunning}
+                onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, enabled: event.target.checked } })}
+                type="checkbox"
+              />
+            </label>
+            <label>
+              <span>HTTP 代理地址</span>
+              <input
+                disabled={!draft.browser_proxy.enabled || taskRunning}
+                onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
+                placeholder="http://服务器地址:3128"
+                value={draft.browser_proxy.server_url}
+              />
+            </label>
+            <label>
+              <span>代理用户名（可选）</span>
+              <input
+                autoComplete="off"
+                disabled={!draft.browser_proxy.enabled || taskRunning}
+                onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, username: event.target.value } })}
+                value={draft.browser_proxy.username}
+              />
+            </label>
+            <label>
+              <span>代理密码（可选）</span>
+              <div className="password-field">
+                <input
+                  autoComplete="new-password"
+                  disabled={!draft.browser_proxy.enabled || taskRunning}
+                  onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, password: event.target.value } })}
+                  type={showBrowserProxyPassword ? "text" : "password"}
+                  value={draft.browser_proxy.password}
+                />
+                <button
+                  aria-label={showBrowserProxyPassword ? "隐藏浏览器代理密码" : "显示浏览器代理密码"}
+                  onClick={() => setShowBrowserProxyPassword((value) => !value)}
+                  type="button"
+                >
+                  {showBrowserProxyPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
+            <p className="field-hint">
+              Chrome 和 Edge 的保活、登录、签到及每日福利使用此代理，账号密码会自动认证。
+              修改后请关闭专用浏览器，再执行任务使新配置生效。HTTP 代理认证信息不加密。
+            </p>
+          </div>
         </section>
 
         <section className="panel settings-card cookiecloud-panel">
