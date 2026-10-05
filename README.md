@@ -212,7 +212,7 @@ URL：https://pt.example.com/
 | 最低剩余登录次数 | 5 | 达到该阈值时停止自动登录重试 |
 | 更新代理地址 | 空 | 留空直连 GitHub；填写后同时代理更新清单和安装包 |
 | 更新代理密码 | 空 | 代理启用鉴权时填写，与服务端 `PROXY_AUTH_TOKEN` 保持一致 |
-| 浏览器代理 | 关闭 | 支持 HTTP/HTTPS 正向代理；部署和端口说明见[浏览器代理部署说明](docs/browser-proxy-deployment.md) |
+| 浏览器代理 | 关闭 | 支持 HTTP/HTTPS 正向代理；先看[一份 Compose 启动 HTTP 代理](docs/browser-proxy-deployment.md)，HTTPS 配置见其中的可选章节 |
 
 ## 数据存储与安全
 

@@ -206,7 +206,10 @@ impl CdpClient {
     async fn validate_existing_proxy(&self) -> Result<(), String> {
         if self.proxy_address.is_none() { return Ok(()) }
         let mut ports = vec![self.port];
-        for profile in [dedicated_profile_dir(self.browser), recovery_profile_dir(self.browser)] {
+        for profile in [
+            dedicated_profile_dir(self.browser),
+            recovery_profile_dir(self.browser),
+        ] {
             if let Some(port) = read_devtools_port(&profile) { ports.push(port); }
         }
         ports.sort_unstable();
@@ -731,7 +734,7 @@ impl CdpClient {
         }
     }
 
-    /// 关闭当前 CDP 浏览器实例。仅用于本次任务自动启动的专用浏览器。
+    /// 关闭当前 CDP 浏览器实例；调用方需先确认它属于程序的专用 Profile。
     pub async fn close_browser(&self) -> Result<(), String> {
         #[derive(Deserialize)]
         struct CdpVersion {
@@ -749,6 +752,68 @@ impl CdpClient {
             CdpWebSocket::connect(&version.web_socket_debugger_url, Duration::from_secs(10))?;
         websocket.call("Browser.close", serde_json::json!({}))?;
         Ok(())
+    }
+
+    /// 收尾时重新检查配置端口和两个专用 Profile 的端口，只关闭确认为程序 Profile 的实例。
+    pub async fn close_running_dedicated_browsers(&self) -> Vec<Result<u16, String>> {
+        let mut ports = vec![self.port];
+        for profile in [dedicated_profile_dir(self.browser), recovery_profile_dir(self.browser)] {
+            if let Some(port) = read_devtools_port(&profile) {
+                ports.push(port);
+            }
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        let mut results = Vec::new();
+        for port in ports.into_iter().filter(|port| *port > 0) {
+            let candidate = Self::with_browser(port, self.browser);
+            if !candidate
+                .is_available_with_timeout(Duration::from_millis(600))
+                .await
+            {
+                continue;
+            }
+            let managed = (|| {
+                let response = candidate.request("GET", "/json/version", Duration::from_secs(2))?;
+                let version = serde_json::from_str(&response.body)
+                    .map_err(|err| format!("读取浏览器信息失败：{err}"))?;
+                proxy_check::uses_managed_profile(&version, self.browser, Duration::from_secs(2))
+            })();
+            match managed {
+                Ok(true) => {
+                    let close_result = candidate.close_browser().await;
+                    // Browser.close 的应答可能早于进程退出；等 CDP 端口实际消失后才报告已关闭。
+                    let mut closed = false;
+                    for _ in 0..10 {
+                        if !candidate
+                            .is_available_with_timeout(Duration::from_millis(300))
+                            .await
+                        {
+                            closed = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    if closed {
+                        results.push(Ok(port));
+                    } else {
+                        results.push(Err(format!(
+                            "专用 {} localhost:{port} 仍在运行：{}",
+                            self.browser.name(),
+                            close_result
+                                .err()
+                                .unwrap_or_else(|| "关闭指令已发送，但浏览器没有退出".to_string())
+                        )));
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => results.push(Err(format!(
+                    "检查 {} localhost:{port} 是否为专用浏览器失败：{err}",
+                    self.browser.name()
+                ))),
+            }
+        }
+        results
     }
 
     fn request(&self, method: &str, path: &str, timeout: Duration) -> Result<HttpResponse, String> {

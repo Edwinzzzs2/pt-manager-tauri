@@ -128,6 +128,32 @@ pub async fn run_with_flag(
         config_state,
     )
     .await;
+
+    // 正常完成、提前退出和终止都在这里收尾；复用的专用浏览器也必须真正退出。
+    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let close_results = cdp.close_running_dedicated_browsers().await;
+    let mut close_failed = false;
+    for result in close_results {
+        match result {
+            Ok(port) => {
+                push_log(
+                    logs,
+                    LogEntry::info(format!(
+                        "保活结束，已关闭专用 {} localhost:{port}",
+                        config.browser.name()
+                    )),
+                )
+                .await;
+            }
+            Err(err) => {
+                close_failed = true;
+                push_log(logs, LogEntry::error(err)).await;
+            }
+        }
+    }
+    if !close_failed {
+        push_log(logs, LogEntry::info("保活结束，已确认专用浏览器关闭")).await;
+    }
     if canceled {
         push_log(logs, LogEntry::info("保活任务已终止")).await;
     }

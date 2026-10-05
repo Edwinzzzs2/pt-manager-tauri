@@ -1,17 +1,19 @@
 use crate::store::{self, BrowserProxyConfig, LogEntry};
 use base64::Engine;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod https;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 static RELAY: OnceLock<Mutex<Option<Relay>>> = OnceLock::new();
 static LOGS: OnceLock<Arc<tokio::sync::Mutex<Vec<LogEntry>>>> = OnceLock::new();
 static LAST_ERROR_AT: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +116,89 @@ pub fn active_address(config: &BrowserProxyConfig) -> Option<String> {
         .map(|relay| relay.address.clone())
 }
 
+/// 用独立的回环监听器走实际浏览器转发路径，测试草稿配置时不替换正在使用的代理。
+pub fn test_connection(mut config: BrowserProxyConfig) -> Result<String, String> {
+    config.enabled = true;
+    normalize_config(&mut config)?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|err| format!("创建代理测试通道失败：{err}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("设置代理测试通道失败：{err}"))?;
+    let address = format!(
+        "http://{}",
+        listener.local_addr().map_err(|err| err.to_string())?
+    );
+    let proxy = reqwest::Proxy::all(&address).map_err(|err| err.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| format!("创建代理测试请求失败：{err}"))?;
+    let (result_sender, result_receiver) = mpsc::channel();
+    let (accepted_sender, accepted_receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("proxy-test".to_string())
+        .spawn(move || {
+            // 测试请求可能在连接前失败；限时等待可避免后台线程永久卡在 accept。
+            let deadline = Instant::now() + Duration::from_secs(22);
+            let result = loop {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        let _ = accepted_sender.send(());
+                        let result = forward_request(&mut connection, &config);
+                        if result.is_err() {
+                            send_error(&mut connection);
+                        }
+                        break result;
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(err) => break Err(format!("接收代理测试请求失败：{err}")),
+                }
+            };
+            let _ = result_sender.send(result);
+        })
+        .map_err(|err| format!("启动代理测试失败：{err}"))?;
+
+    let response = client
+        .get("https://ifconfig.me/ip")
+        .send()
+        .map_err(|err| test_request_error(err, &result_receiver))?;
+    // 显式确认请求进入回环转发器，避免系统直连产生看似成功的结果。
+    if accepted_receiver.try_recv().is_err() {
+        return Err("测试请求没有经过程序的浏览器代理".to_string());
+    }
+    if !response.status().is_success() {
+        if let Ok(Err(message)) = result_receiver.recv_timeout(Duration::from_millis(200)) {
+            return Err(message);
+        }
+        return Err(format!("代理出口检测失败：HTTP {}", response.status()));
+    }
+    let ip = response
+        .text()
+        .map_err(|err| test_request_error(err, &result_receiver))?
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| "代理出口检测服务未返回有效 IP".to_string())?;
+    Ok(format!("代理连接成功，出口 IP：{ip}"))
+}
+
+fn test_request_error(
+    error: reqwest::Error,
+    result_receiver: &mpsc::Receiver<Result<(), String>>,
+) -> String {
+    if let Ok(Err(message)) = result_receiver.recv_timeout(Duration::from_millis(200)) {
+        return message;
+    }
+    format!("代理出口检测失败：{error}")
+}
+
 fn accept_connections(listener: TcpListener, config: BrowserProxyConfig, stopped: Arc<AtomicBool>) {
     let active = Arc::new(AtomicUsize::new(0));
     while !stopped.load(Ordering::Relaxed) {
@@ -207,6 +292,44 @@ fn read_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
     }
 }
 
+fn browser_closed(client: &mut TcpStream) -> bool {
+    // 只窥视连接是否已关闭，不消费浏览器可能紧接着发送的 TLS 数据。
+    if client.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0_u8; 1];
+    let result = client.peek(&mut byte);
+    let restored = client.set_nonblocking(false).is_ok();
+    restored
+        && match result {
+            Ok(0) => true,
+            Err(err) => is_browser_disconnect(err.kind()),
+            _ => false,
+        }
+}
+
+fn is_browser_disconnect(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
+fn write_browser_response(
+    client: &mut TcpStream,
+    data: &[u8],
+    stage: &str,
+) -> Result<bool, String> {
+    match client.write_all(data) {
+        Ok(()) => Ok(true),
+        Err(err) if is_browser_disconnect(err.kind()) => Ok(false),
+        Err(err) => Err(format!("{stage}：{err}（{:?}）", err.kind())),
+    }
+}
+
 fn upstream_headers(headers: &str, config: &BrowserProxyConfig, tunnel: bool) -> String {
     let mut lines = headers.split("\r\n");
     let mut result = format!("{}\r\n", lines.next().unwrap_or_default());
@@ -250,6 +373,7 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
         read_headers(client).map_err(|err| format!("接收浏览器代理请求失败：{err}"))?;
     let first_line = headers.lines().next().unwrap_or_default();
     let tunnel = first_line.starts_with("CONNECT ");
+    let target = first_line.split_whitespace().nth(1).unwrap_or("未知目标");
     let mut upstream = connect_upstream(config)?;
     upstream
         .write_all(upstream_headers(&headers, config, tunnel).as_bytes())
@@ -260,8 +384,18 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
     if !tunnel {
         return forward_http_response(client, upstream);
     }
-    let (response_headers, response_tail) =
-        read_headers(&mut upstream).map_err(|err| format!("读取上游代理隧道响应失败：{err}"))?;
+    // CONNECT 只需等待代理建立目标连接；后续隧道读写仍沿用较长的普通超时。
+    upstream
+        .set_read_timeout(Some(CONNECT_RESPONSE_TIMEOUT))
+        .map_err(|err| err.to_string())?;
+    let (response_headers, response_tail) = match read_headers(&mut upstream) {
+        Ok(response) => response,
+        Err(_) if browser_closed(client) => return Ok(()),
+        Err(err) => return Err(format!("代理隧道 {target} 等待上游响应失败：{err}")),
+    };
+    upstream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|err| err.to_string())?;
     let status = response_headers
         .lines()
         .next()
@@ -269,15 +403,17 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
     if status == Some("407") {
         return Err("浏览器代理认证失败，请检查代理用户名和密码".to_string());
     }
-    client
-        .write_all(response_headers.as_bytes())
-        .map_err(|_| "返回浏览器代理响应失败".to_string())?;
-    client
-        .write_all(&response_tail)
-        .map_err(|_| "返回浏览器代理数据失败".to_string())?;
+    if !write_browser_response(
+        client,
+        response_headers.as_bytes(),
+        "返回浏览器代理响应失败",
+    )? || !write_browser_response(client, &response_tail, "返回浏览器代理数据失败")?
+    {
+        return Ok(());
+    }
     if tunnel && status != Some("200") {
         log_error(format!(
-            "浏览器代理隧道建立失败，上游返回 HTTP {}",
+            "浏览器代理隧道 {target} 建立失败，上游返回 HTTP {}",
             status.unwrap_or("未知状态")
         ));
         let _ = std::io::copy(&mut upstream, client);
@@ -306,12 +442,11 @@ fn forward_http_response(client: &mut TcpStream, mut upstream: TcpStream) -> Res
             if status == Some("407") {
                 return Err("浏览器代理认证失败，请检查代理用户名和密码".to_string());
             }
-            client
-                .write_all(headers.as_bytes())
-                .map_err(|_| "返回浏览器代理响应失败".to_string())?;
-            client
-                .write_all(&tail)
-                .map_err(|_| "返回浏览器代理数据失败".to_string())?;
+            if !write_browser_response(client, headers.as_bytes(), "返回浏览器代理响应失败")?
+                || !write_browser_response(client, &tail, "返回浏览器代理数据失败")?
+            {
+                return Ok(());
+            }
             let _ = std::io::copy(&mut upstream, client);
             Ok(())
         })();

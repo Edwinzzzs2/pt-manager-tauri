@@ -323,6 +323,8 @@ function App() {
   const [cookieCloudClearBusy, setCookieCloudClearBusy] = useState(false);
   const [gotifyTestBusy, setGotifyTestBusy] = useState(false);
   const [barkTestBusy, setBarkTestBusy] = useState(false);
+  const [browserProxyTestBusy, setBrowserProxyTestBusy] = useState(false);
+  const [browserProxyTestResult, setBrowserProxyTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase>(null);
@@ -339,6 +341,15 @@ function App() {
 
   const browserName = config.browser === "edge" ? "Edge" : "Chrome";
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
+
+  useEffect(() => {
+    setBrowserProxyTestResult(null);
+  }, [
+    settingsDraft.browser_proxy.enabled,
+    settingsDraft.browser_proxy.server_url,
+    settingsDraft.browser_proxy.username,
+    settingsDraft.browser_proxy.password,
+  ]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = colorMode;
@@ -944,6 +955,22 @@ function App() {
     }
   }
 
+  async function testBrowserProxy() {
+    setBrowserProxyTestBusy(true);
+    setBrowserProxyTestResult(null);
+    setError(null);
+    try {
+      const message = await invoke<string>("test_browser_proxy", {
+        config: settingsDraft.browser_proxy,
+      });
+      setBrowserProxyTestResult({ ok: true, message });
+    } catch (err) {
+      setBrowserProxyTestResult({ ok: false, message: String(err) });
+    } finally {
+      setBrowserProxyTestBusy(false);
+    }
+  }
+
   async function clearLogs() {
     setError(null);
     try {
@@ -1186,6 +1213,8 @@ function App() {
               cookieSyncBusy={cookieSyncBusy}
               gotifyTestBusy={gotifyTestBusy}
               barkTestBusy={barkTestBusy}
+              browserProxyTestBusy={browserProxyTestBusy}
+              browserProxyTestResult={browserProxyTestResult}
               draft={settingsDraft}
               onChange={setSettingsDraft}
               onClearBrowserData={clearBrowserData}
@@ -1195,6 +1224,7 @@ function App() {
               onSyncCookieCloud={syncCookieCloud}
               onTestGotify={testGotify}
               onTestBark={testBark}
+              onTestBrowserProxy={testBrowserProxy}
               taskRunning={!!status?.is_running}
               onImportConfig={importConfig}
               onExportConfig={exportConfig}
@@ -2293,6 +2323,8 @@ function SettingsPanel({
   cookieSyncBusy,
   gotifyTestBusy,
   barkTestBusy,
+  browserProxyTestBusy,
+  browserProxyTestResult,
   draft,
   onChange,
   onClearBrowserData,
@@ -2302,6 +2334,7 @@ function SettingsPanel({
   onSyncCookieCloud,
   onTestGotify,
   onTestBark,
+  onTestBrowserProxy,
   taskRunning,
   onImportConfig,
   onExportConfig,
@@ -2312,6 +2345,8 @@ function SettingsPanel({
   cookieSyncBusy: boolean;
   gotifyTestBusy: boolean;
   barkTestBusy: boolean;
+  browserProxyTestBusy: boolean;
+  browserProxyTestResult: { ok: boolean; message: string } | null;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
   onClearBrowserData: () => void;
@@ -2321,6 +2356,7 @@ function SettingsPanel({
   onSyncCookieCloud: () => void;
   onTestGotify: () => void;
   onTestBark: () => void;
+  onTestBrowserProxy: () => void;
   taskRunning: boolean;
   onImportConfig: () => void;
   onExportConfig: () => void;
@@ -2506,7 +2542,7 @@ function SettingsPanel({
                 <button
                   aria-label="查看浏览器代理部署说明"
                   className="help-tip help-tip-button"
-                  data-tooltip="点击查看 GitHub 上的代理部署说明；HTTP 默认端口为 80，HTTPS 默认端口为 443，其他端口需明确填写。"
+                  data-tooltip="点击查看部署说明：HTTP 代理只需一份 Compose；HTTP 默认 80、HTTPS 默认 443，其他端口需明确填写。"
                   onClick={onOpenBrowserProxyGuide}
                   type="button"
                 >
@@ -2514,13 +2550,24 @@ function SettingsPanel({
                 </button>
               </div>
             </div>
+            <div className="row-actions">
+              <button
+                className="ghost"
+                disabled={browserProxyTestBusy || taskRunning || !draft.browser_proxy.enabled || !draft.browser_proxy.server_url.trim()}
+                onClick={onTestBrowserProxy}
+                type="button"
+              >
+                <RefreshCw size={16} />
+                <span>{browserProxyTestBusy ? "测试中" : "测试连接"}</span>
+              </button>
+            </div>
           </div>
           <div className="settings-form">
             <label className="switch-row">
               <span>启用浏览器代理</span>
               <input
                 checked={draft.browser_proxy.enabled}
-                disabled={taskRunning}
+                disabled={taskRunning || browserProxyTestBusy}
                 onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, enabled: event.target.checked } })}
                 type="checkbox"
               />
@@ -2528,9 +2575,9 @@ function SettingsPanel({
             <label>
               <span>HTTP / HTTPS 代理地址</span>
               <input
-                disabled={!draft.browser_proxy.enabled || taskRunning}
+                disabled={!draft.browser_proxy.enabled || taskRunning || browserProxyTestBusy}
                 onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
-                placeholder="https://服务器地址:端口"
+                placeholder="http://服务器IP:3128"
                 value={draft.browser_proxy.server_url}
               />
             </label>
@@ -2538,7 +2585,7 @@ function SettingsPanel({
               <span>代理用户名（可选）</span>
               <input
                 autoComplete="off"
-                disabled={!draft.browser_proxy.enabled || taskRunning}
+                disabled={!draft.browser_proxy.enabled || taskRunning || browserProxyTestBusy}
                 onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, username: event.target.value } })}
                 value={draft.browser_proxy.username}
               />
@@ -2548,7 +2595,7 @@ function SettingsPanel({
               <div className="password-field">
                 <input
                   autoComplete="new-password"
-                  disabled={!draft.browser_proxy.enabled || taskRunning}
+                  disabled={!draft.browser_proxy.enabled || taskRunning || browserProxyTestBusy}
                   onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, password: event.target.value } })}
                   type={showBrowserProxyPassword ? "text" : "password"}
                   value={draft.browser_proxy.password}
@@ -2565,8 +2612,17 @@ function SettingsPanel({
             <p className="field-hint">
               Chrome 和 Edge 的保活、登录、签到及每日福利使用此代理，账号密码会自动认证。
               支持 HTTP 和 HTTPS 代理；HTTPS 会加密到代理服务器的连接并校验证书。
-              修改后请关闭专用浏览器，再执行任务使新配置生效。
+              可先测试当前填写的配置，无需保存；测试会单独发送代理请求。保存后请关闭专用浏览器，再执行任务使新配置生效。
             </p>
+            {browserProxyTestResult ? (
+              <p
+                className={`proxy-test-result ${browserProxyTestResult.ok ? "success" : "error"}`}
+                role={browserProxyTestResult.ok ? "status" : "alert"}
+              >
+                {browserProxyTestResult.ok ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+                <span>{browserProxyTestResult.message}</span>
+              </p>
+            ) : null}
           </div>
         </section>
 

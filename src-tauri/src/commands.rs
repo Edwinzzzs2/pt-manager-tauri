@@ -1191,8 +1191,23 @@ pub async fn open_browser_download(state: State<'_, AppState>) -> Result<(), Str
 /// 部署说明固定指向仓库公开文档，不接收配置里的代理地址。
 #[tauri::command]
 pub fn open_browser_proxy_guide() -> Result<(), String> {
-    open_url("https://github.com/Edwinzzzs2/pt-manager-tauri/blob/main/docs/browser-proxy-deployment.md")
-        .map_err(|err| err.to_string())
+    open_url(
+        "https://github.com/Edwinzzzs2/pt-manager-tauri/blob/main/docs/browser-proxy-deployment.md",
+    )
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn test_browser_proxy(
+    state: State<'_, AppState>,
+    config: store::BrowserProxyConfig,
+) -> Result<String, String> {
+    if *state.task_running.lock().await {
+        return Err("保活任务执行中，请结束后再测试代理".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || crate::browser_proxy::test_connection(config))
+        .await
+        .map_err(|err| format!("代理测试未能完成：{err}"))?
 }
 
 async fn restart_scheduler(state: &State<'_, AppState>, config: AppConfig) {
