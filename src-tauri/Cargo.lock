@@ -3586,6 +3586,7 @@ dependencies = [
  "md-5",
  "rand 0.8.5",
  "reqwest",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha1",
@@ -3597,6 +3598,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
+ "tokio-rustls",
  "uuid",
  "winreg 0.55.0",
 ]

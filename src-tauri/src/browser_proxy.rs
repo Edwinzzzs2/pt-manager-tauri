@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod https;
+
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
@@ -37,9 +39,14 @@ pub fn normalize_config(config: &mut BrowserProxyConfig) -> Result<(), String> {
         return Ok(());
     }
     let url = reqwest::Url::parse(&config.server_url)
-        .map_err(|_| "浏览器代理地址格式错误，请填写 http://地址:端口".to_string())?;
-    if url.scheme() != "http" || url.host_str().is_none() || url.port_or_known_default().is_none() {
-        return Err("浏览器代理目前支持 HTTP 代理，请填写 http://地址:端口".to_string());
+        .map_err(|_| "浏览器代理地址格式错误，请填写 http:// 或 https://地址:端口".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.port_or_known_default().is_none()
+    {
+        return Err(
+            "浏览器代理支持 HTTP 和 HTTPS，请填写 http:// 或 https://地址:端口".to_string(),
+        );
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("请将代理用户名和密码填写到独立的认证输入框".to_string());
@@ -162,7 +169,11 @@ fn connect_upstream(config: &BrowserProxyConfig) -> Result<TcpStream, String> {
             stream
                 .set_write_timeout(Some(IO_TIMEOUT))
                 .map_err(|err| err.to_string())?;
-            return Ok(stream);
+            return if url.scheme() == "https" {
+                https::connect(stream, host)
+            } else {
+                Ok(stream)
+            };
         }
     }
     Err("无法连接浏览器代理服务器，请检查代理地址、端口和服务器状态".to_string())
@@ -175,7 +186,7 @@ fn read_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
     loop {
         let read = stream
             .read(&mut buffer)
-            .map_err(|_| "读取浏览器代理请求或响应超时".to_string())?;
+            .map_err(|err| format!("读取浏览器代理请求或响应失败：{err}（{:?}）", err.kind()))?;
         if read == 0 {
             return Err("浏览器代理连接提前关闭".to_string());
         }
@@ -224,13 +235,19 @@ fn upstream_headers(headers: &str, config: &BrowserProxyConfig, tunnel: bool) ->
 }
 
 fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Result<(), String> {
+    // Windows 接收的连接会继承监听器的非阻塞模式；转发使用阻塞读写，必须显式恢复。
+    // 否则请求尚未到达或 TLS 数据分批到达时，会立即报 WouldBlock 并断开连接。
+    client
+        .set_nonblocking(false)
+        .map_err(|err| format!("设置浏览器代理连接模式失败：{err}"))?;
     client
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|err| err.to_string())?;
     client
         .set_write_timeout(Some(IO_TIMEOUT))
         .map_err(|err| err.to_string())?;
-    let (headers, tail) = read_headers(client)?;
+    let (headers, tail) =
+        read_headers(client).map_err(|err| format!("接收浏览器代理请求失败：{err}"))?;
     let first_line = headers.lines().next().unwrap_or_default();
     let tunnel = first_line.starts_with("CONNECT ");
     let mut upstream = connect_upstream(config)?;
@@ -243,7 +260,8 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
     if !tunnel {
         return forward_http_response(client, upstream);
     }
-    let (response_headers, response_tail) = read_headers(&mut upstream)?;
+    let (response_headers, response_tail) =
+        read_headers(&mut upstream).map_err(|err| format!("读取上游代理隧道响应失败：{err}"))?;
     let status = response_headers
         .lines()
         .next()
@@ -279,7 +297,8 @@ fn forward_http_response(client: &mut TcpStream, mut upstream: TcpStream) -> Res
             let _ = request_upstream.shutdown(Shutdown::Write);
         });
         let result = (|| {
-            let (headers, tail) = read_headers(&mut upstream)?;
+            let (headers, tail) = read_headers(&mut upstream)
+                .map_err(|err| format!("读取上游 HTTP 代理响应失败：{err}"))?;
             let status = headers
                 .lines()
                 .next()
@@ -367,13 +386,16 @@ mod tests {
         let mut config = test_config(3128);
         normalize_config(&mut config).unwrap();
         for invalid in [
-            "https://proxy.example:3128",
+            "socks5://proxy.example:3128",
             "http://user:secret@proxy.example:3128",
             "http://proxy.example:3128/path",
         ] {
             config.server_url = invalid.to_string();
             assert!(normalize_config(&mut config).is_err());
         }
+        config.server_url = "https://proxy.example:443/".to_string();
+        normalize_config(&mut config).unwrap();
+        assert_eq!(config.server_url, "https://proxy.example");
     }
 
     #[test]
@@ -443,15 +465,22 @@ mod tests {
             stream.write_all(b"pong").unwrap();
         });
         let local = TcpListener::bind("127.0.0.1:0").unwrap();
+        // 与正式监听器保持一致，覆盖 Windows 继承非阻塞模式后误断开请求的情况。
+        local.set_nonblocking(true).unwrap();
         let local_address = local.local_addr().unwrap();
+        let mut browser = TcpStream::connect(local_address).unwrap();
+        let (accepted, ready) = std::sync::mpsc::sync_channel(1);
         let proxy_worker = thread::spawn(move || {
             let (mut stream, _) = local.accept().unwrap();
+            accepted.send(()).unwrap();
             forward_request(&mut stream, &config).unwrap();
         });
-        let mut browser = TcpStream::connect(local_address).unwrap();
         browser
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
+        // 确保先接收连接，再发送请求，避免数据提前到达掩盖 WouldBlock 问题。
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(Duration::from_millis(50));
         browser
             .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
             .unwrap();

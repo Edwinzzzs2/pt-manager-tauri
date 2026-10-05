@@ -2503,11 +2503,11 @@ function SettingsPanel({
               />
             </label>
             <label>
-              <span>HTTP 代理地址</span>
+              <span>HTTP / HTTPS 代理地址</span>
               <input
                 disabled={!draft.browser_proxy.enabled || taskRunning}
                 onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
-                placeholder="http://服务器地址:3128"
+                placeholder="https://服务器地址:端口"
                 value={draft.browser_proxy.server_url}
               />
             </label>
@@ -2541,7 +2541,8 @@ function SettingsPanel({
             </label>
             <p className="field-hint">
               Chrome 和 Edge 的保活、登录、签到及每日福利使用此代理，账号密码会自动认证。
-              修改后请关闭专用浏览器，再执行任务使新配置生效。HTTP 代理认证信息不加密。
+              支持 HTTP 和 HTTPS 代理；HTTPS 会加密到代理服务器的连接并校验证书。
+              修改后请关闭专用浏览器，再执行任务使新配置生效。
             </p>
           </div>
         </section>

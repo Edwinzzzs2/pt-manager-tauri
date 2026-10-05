@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 mod login;
 mod jying;
 mod qingwa_bonus;
+mod proxy_check;
 mod signin;
 mod traffic;
 
@@ -198,24 +199,7 @@ impl CdpClient {
 
     fn proxy_matches(&self, version: &serde_json::Value, timeout: Duration) -> Result<bool, String> {
         let Some(expected) = &self.proxy_address else { return Ok(true) };
-        let read_arguments = || -> Result<serde_json::Value, String> {
-            let url = version.get("webSocketDebuggerUrl").and_then(|value| value.as_str())
-                .ok_or_else(|| "浏览器没有提供调试连接".to_string())?;
-            CdpWebSocket::connect(url, timeout)?
-                .call("Browser.getBrowserCommandLine", serde_json::json!({}))
-        };
-        let response = match read_arguments() {
-            Ok(value) => value,
-            // 老版本启动的直连浏览器没有 --enable-automation，关闭代理时仍允许复用。
-            Err(_) if expected.is_none() => return Ok(true),
-            Err(err) => return Err(err),
-        };
-        let arguments = response.get("result").and_then(|value| value.get("arguments"))
-            .and_then(|value| value.as_array()).ok_or_else(|| "无法读取浏览器启动参数".to_string())?;
-        let actual = arguments.iter().filter_map(|value| value.as_str())
-            .find_map(|argument| argument.strip_prefix("--proxy-server="));
-        let forced_direct = arguments.iter().any(|value| value.as_str() == Some("--no-proxy-server"));
-        Ok(actual == expected.as_deref() && (expected.is_none() || !forced_direct))
+        proxy_check::matches(version, expected.as_deref(), timeout)
     }
 
     /// 在复用前确认代理参数，不能因已有 CDP 连接而悄悄使用另一个网络出口。
@@ -232,7 +216,9 @@ impl CdpClient {
             if !raw.is_available_with_timeout(Duration::from_millis(600)).await { continue; }
             let response = raw.request("GET", "/json/version", Duration::from_secs(2))?;
             let version = serde_json::from_str(&response.body).map_err(|err| format!("读取浏览器信息失败：{err}"))?;
-            if !self.proxy_matches(&version, Duration::from_secs(2)).unwrap_or(false) {
+            let matches = self.proxy_matches(&version, Duration::from_secs(2))
+                .map_err(|err| format!("{} 代理配置检查失败：{err}", self.browser.name()))?;
+            if !matches {
                 return Err(format!("{} 已运行，但代理设置与当前配置不匹配。请关闭专用浏览器后重试，程序会按新代理设置启动", self.browser.name()));
             }
         }
@@ -1588,7 +1574,7 @@ fn launch_browser(
             fixed_port.unwrap_or(0)
         ))
         .arg("--remote-debugging-address=127.0.0.1")
-        .arg("--enable-automation")
+        // CDP 保活不需要 --enable-automation；代理参数改从进程读取，避免显示控制提示条。
         .arg(format!("--user-data-dir={}", profile_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
