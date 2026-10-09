@@ -1,10 +1,13 @@
 import {
+  memo,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { getVersion, setTheme as setTauriTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -1525,6 +1528,422 @@ function MetricCard({
   );
 }
 
+type BatchDragLayout = {
+  siteIds: string[];
+  rowTops: number[];
+  rowHeights: number[];
+  sourceIndex: number;
+  gap: number;
+  width: number;
+  height: number;
+  listLeft: number;
+  initialLeft: number;
+  initialTop: number;
+  pointerOffsetX: number;
+  pointerOffsetY: number;
+};
+
+const BatchSiteRow = memo(function BatchSiteRow({
+  site,
+  settings,
+  busy,
+  dragging,
+  shift,
+  onPointerDown,
+  onSettingChange,
+}: {
+  site: Site;
+  settings: SiteAutomationSettings;
+  busy: boolean;
+  dragging: boolean;
+  shift: number;
+  onPointerDown: (event: ReactPointerEvent<HTMLElement>, siteId: string) => void;
+  onSettingChange: (siteId: string, key: AutomationSettingKey, value: boolean) => void;
+}) {
+  return (
+    <div
+      className={`batch-site-row${dragging ? " dragging" : ""}`}
+      data-batch-site-id={site.id}
+      style={shift ? { transform: `translate3d(0, ${shift}px, 0)` } : undefined}
+    >
+      <div
+        aria-label={`拖动调整 ${site.name} 顺序`}
+        aria-disabled={busy}
+        className="batch-site-drag-handle"
+        onPointerDown={(event) => onPointerDown(event, site.id)}
+        title="拖动调整站点顺序"
+        role="button"
+        tabIndex={0}
+      >
+        <GripVertical size={17} />
+      </div>
+      <div className="batch-site-meta">
+        <strong>{site.name}</strong>
+        <span>{site.url}</span>
+      </div>
+      <div className="batch-site-switches">
+        {automationFields.map((field) => (
+          <label className="batch-switch" key={field.key} title={field.description}>
+            <span>{field.label}</span>
+            <input
+              checked={settings[field.key]}
+              onChange={(event) => onSettingChange(site.id, field.key, event.target.checked)}
+              type="checkbox"
+            />
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+function BatchSettingsModal({
+  sites,
+  allSites,
+  busy,
+  onClose,
+  onBatchUpdateAutomation,
+  onReorderSites,
+}: {
+  sites: Site[];
+  allSites: Site[];
+  busy: boolean;
+  onClose: () => void;
+  onBatchUpdateAutomation: (
+    updates: Record<string, SiteAutomationSettings>,
+  ) => Promise<boolean>;
+  onReorderSites: (siteIds: string[]) => Promise<boolean>;
+}) {
+  const [batchSettings, setBatchSettings] = useState<Record<string, SiteAutomationSettings>>(
+    () => Object.fromEntries(sites.map((site) => [site.id, {
+      auto_login: site.auto_login,
+      auto_keepalive: site.auto_keepalive,
+      auto_signin: site.auto_signin,
+      cookiecloud_upload: site.cookiecloud_upload,
+    }])),
+  );
+  const [batchDraggingSiteId, setBatchDraggingSiteId] = useState<string | null>(null);
+  const [batchDragLayout, setBatchDragLayout] = useState<BatchDragLayout | null>(null);
+  const [batchDropIndex, setBatchDropIndex] = useState<number | null>(null);
+  const [pendingSiteIds, setPendingSiteIds] = useState<string[] | null>(null);
+  const batchDropIndexRef = useRef<number | null>(null);
+  const batchDragPreviewRef = useRef<HTMLDivElement | null>(null);
+  const batchSettingsListRef = useRef<HTMLDivElement | null>(null);
+  const batchPointerPositionRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const latestReorderRef = useRef({ allSites, sites, onReorderSites });
+
+  useEffect(() => {
+    latestReorderRef.current = { allSites, sites, onReorderSites };
+  }, [allSites, sites, onReorderSites]);
+
+  const displayedSites = useMemo(() => {
+    if (!pendingSiteIds) return sites;
+    const sitesById = new Map(sites.map((site) => [site.id, site]));
+    return pendingSiteIds.flatMap((id) => {
+      const site = sitesById.get(id);
+      return site ? [site] : [];
+    });
+  }, [sites, pendingSiteIds]);
+
+  const updateBatchSetting = useCallback((siteId: string, key: AutomationSettingKey, value: boolean) => {
+    setBatchSettings((current) => ({
+      ...current,
+      [siteId]: { ...current[siteId], [key]: value },
+    }));
+  }, []);
+
+  function setAllBatchSettings(value: boolean) {
+    setBatchSettings((current) => Object.fromEntries(
+      Object.entries(current).map(([siteId, settings]) => [siteId, {
+        ...settings,
+        auto_login: value,
+        auto_keepalive: value,
+        auto_signin: value,
+        cookiecloud_upload: value,
+      }]),
+    ));
+  }
+
+  async function saveBatchSettings() {
+    if (await onBatchUpdateAutomation(batchSettings)) onClose();
+  }
+
+  const handleBatchPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>, siteId: string) => {
+    const list = batchSettingsListRef.current;
+    if (busy || pendingSiteIds || !list || event.button !== 0) return;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>("[data-batch-site-id]"));
+    const sourceIndex = rows.findIndex((row) => row.dataset.batchSiteId === siteId);
+    if (sourceIndex < 0) return;
+    const listRect = list.getBoundingClientRect();
+    const rects = rows.map((row) => row.getBoundingClientRect());
+    const sourceRect = rects[sourceIndex];
+    const layout: BatchDragLayout = {
+      siteIds: rows.map((row) => row.dataset.batchSiteId!),
+      rowTops: rects.map((rect) => rect.top - listRect.top + list.scrollTop),
+      rowHeights: rects.map((rect) => rect.height),
+      sourceIndex,
+      gap: Number.parseFloat(window.getComputedStyle(list).rowGap) || 0,
+      width: sourceRect.width,
+      height: sourceRect.height,
+      listLeft: sourceRect.left - listRect.left,
+      initialLeft: sourceRect.left,
+      initialTop: sourceRect.top,
+      pointerOffsetX: event.clientX - sourceRect.left,
+      pointerOffsetY: event.clientY - sourceRect.top,
+    };
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    batchPointerPositionRef.current = { clientX: event.clientX, clientY: event.clientY };
+    batchDropIndexRef.current = sourceIndex;
+    setBatchDragLayout(layout);
+    setBatchDraggingSiteId(siteId);
+    setBatchDropIndex(sourceIndex);
+  }, [busy, pendingSiteIds]);
+
+  useEffect(() => {
+    if (!batchDraggingSiteId || !batchDragLayout) return;
+
+    const list = batchSettingsListRef.current;
+    if (!list) return;
+    const layout = batchDragLayout;
+    const setDropIndex = (index: number | null) => {
+      if (batchDropIndexRef.current === index) return;
+      batchDropIndexRef.current = index;
+      setBatchDropIndex(index);
+    };
+
+    const updateDragTarget = (clientX: number, clientY: number) => {
+      const rect = list.getBoundingClientRect();
+      if (clientX < rect.left || clientX > rect.right) {
+        setDropIndex(null);
+        return;
+      }
+      // Use the original slots so animated rows cannot change the drop target.
+      const cardCenterY = clientY - layout.pointerOffsetY + layout.height / 2;
+      const contentY = Math.max(rect.top, Math.min(cardCenterY, rect.bottom)) - rect.top + list.scrollTop;
+      let start = 0;
+      let end = layout.siteIds.length;
+      while (start < end) {
+        const middle = Math.floor((start + end) / 2);
+        if (contentY < layout.rowTops[middle] + layout.rowHeights[middle] / 2) end = middle;
+        else start = middle + 1;
+      }
+      setDropIndex(start > layout.sourceIndex ? start - 1 : start);
+    };
+
+    let pointerMoved = true;
+    let autoScrolling = false;
+    let dragFinished = false;
+    const handlePointerMove = (event: PointerEvent) => {
+      batchPointerPositionRef.current = { clientX: event.clientX, clientY: event.clientY };
+      pointerMoved = true;
+    };
+
+    let autoScrollFrame = 0;
+    const autoScroll = () => {
+      if (dragFinished) return;
+      const pointer = batchPointerPositionRef.current;
+      if (pointer && list && (pointerMoved || autoScrolling)) {
+        pointerMoved = false;
+        const rect = list.getBoundingClientRect();
+        const edge = 72;
+        let scrollDelta = 0;
+        const insideHorizontally = pointer.clientX >= rect.left && pointer.clientX <= rect.right;
+        if (insideHorizontally && pointer.clientY < rect.top + edge) {
+          scrollDelta = -Math.max(3, Math.round((rect.top + edge - pointer.clientY) / 8));
+        } else if (insideHorizontally && pointer.clientY > rect.bottom - edge) {
+          scrollDelta = Math.max(3, Math.round((pointer.clientY - (rect.bottom - edge)) / 8));
+        }
+        const previousScrollTop = list.scrollTop;
+        if (scrollDelta !== 0) list.scrollTop += scrollDelta;
+        autoScrolling = list.scrollTop !== previousScrollTop;
+        if (batchDragPreviewRef.current) {
+          batchDragPreviewRef.current.style.transform = `translate3d(${pointer.clientX - layout.pointerOffsetX}px, ${pointer.clientY - layout.pointerOffsetY}px, 0)`;
+        }
+        updateDragTarget(pointer.clientX, pointer.clientY);
+      }
+      autoScrollFrame = window.requestAnimationFrame(autoScroll);
+    };
+    autoScrollFrame = window.requestAnimationFrame(autoScroll);
+
+    const finishDrag = (commit: boolean, event?: PointerEvent) => {
+      if (dragFinished) return;
+      dragFinished = true;
+      window.cancelAnimationFrame(autoScrollFrame);
+      if (commit && event) updateDragTarget(event.clientX, event.clientY);
+      const targetIndex = batchDropIndexRef.current;
+      batchDropIndexRef.current = null;
+      batchPointerPositionRef.current = null;
+      setBatchDraggingSiteId(null);
+      setBatchDragLayout(null);
+      setBatchDropIndex(null);
+      if (!commit || targetIndex === null || targetIndex === layout.sourceIndex) return;
+
+      const { allSites, onReorderSites } = latestReorderRef.current;
+      const selectedIds = [...layout.siteIds];
+      selectedIds.splice(layout.sourceIndex, 1);
+      selectedIds.splice(targetIndex, 0, batchDraggingSiteId);
+      const selectedSet = new Set(selectedIds);
+      let selectedIndex = 0;
+      const nextIds = allSites.map((site) =>
+        selectedSet.has(site.id) ? selectedIds[selectedIndex++] : site.id,
+      );
+      setPendingSiteIds(selectedIds);
+      onReorderSites(nextIds).catch(() => undefined).finally(() => setPendingSiteIds(null));
+    };
+    const handlePointerUp = (event: PointerEvent) => finishDrag(true, event);
+    const handlePointerCancel = () => finishDrag(false);
+    const handleScroll = () => { pointerMoved = true; };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") finishDrag(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp, { once: true });
+    window.addEventListener("pointercancel", handlePointerCancel, { once: true });
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", handlePointerCancel);
+    list.addEventListener("scroll", handleScroll, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerCancel);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", handlePointerCancel);
+      list.removeEventListener("scroll", handleScroll);
+      window.cancelAnimationFrame(autoScrollFrame);
+    };
+  }, [batchDraggingSiteId, batchDragLayout]);
+
+  const draggingSite = sites.find((site) => site.id === batchDraggingSiteId);
+  const previewIndex = batchDropIndex ?? batchDragLayout?.sourceIndex ?? 0;
+  const placeholderTop = batchDragLayout
+    ? previewIndex > batchDragLayout.sourceIndex
+      ? batchDragLayout.rowTops[previewIndex] + batchDragLayout.rowHeights[previewIndex] - batchDragLayout.height
+      : batchDragLayout.rowTops[previewIndex]
+    : 0;
+  const dragStatus = draggingSite
+    ? batchDropIndex !== null
+      ? `松手将「${draggingSite.name}」放在第 ${batchDropIndex + 1} 位；Esc 取消`
+      : "已移出列表，松手取消排序"
+    : "保存后立即应用到这些站点。";
+
+  return (
+    <div
+      className="batch-settings-overlay"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      role="presentation"
+    >
+      <div
+        aria-labelledby="batch-settings-title"
+        aria-modal="true"
+        className="batch-settings-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="batch-settings-heading">
+          <div>
+            <span className="eyebrow">批量设置</span>
+            <h2 id="batch-settings-title">批量操作站点</h2>
+            <p>已选择 {sites.length} 个站点，可逐站调整四项自动化开关。</p>
+          </div>
+          <button aria-label="关闭批量设置" className="icon-button" onClick={onClose} type="button">
+            <XCircle size={18} />
+          </button>
+        </div>
+
+        <div className="batch-settings-toolbar">
+          <span>快速设置所选站点</span>
+          <div className="batch-settings-quick-actions">
+            <button className="ghost" onClick={() => setAllBatchSettings(true)} type="button">
+              <CheckCircle2 size={15} />
+              <span>全部开启</span>
+            </button>
+            <button className="ghost" onClick={() => setAllBatchSettings(false)} type="button">
+              <PauseCircle size={15} />
+              <span>全部关闭</span>
+            </button>
+          </div>
+        </div>
+
+        <div className={`batch-settings-list${batchDraggingSiteId ? " is-dragging" : ""}`} ref={batchSettingsListRef}>
+          {displayedSites.map((site, index) => {
+            let shift = 0;
+            if (batchDragLayout) {
+              const { sourceIndex, height, gap } = batchDragLayout;
+              if (index > sourceIndex && index <= previewIndex) shift = -(height + gap);
+              else if (index >= previewIndex && index < sourceIndex) shift = height + gap;
+            }
+            return (
+              <BatchSiteRow
+                busy={busy || pendingSiteIds !== null}
+                dragging={batchDraggingSiteId === site.id}
+                key={site.id}
+                onPointerDown={handleBatchPointerDown}
+                onSettingChange={updateBatchSetting}
+                settings={batchSettings[site.id]}
+                shift={shift}
+                site={site}
+              />
+            );
+          })}
+          {batchDragLayout && draggingSite ? (
+            <div
+              aria-hidden="true"
+              className={`batch-drop-placeholder${batchDropIndex === null ? " cancelled" : ""}`}
+              style={{
+                top: placeholderTop,
+                left: batchDragLayout.listLeft,
+                width: batchDragLayout.width,
+                height: batchDragLayout.height,
+              }}
+            >
+              <span>松手放到这里 · 第 {previewIndex + 1} 位</span>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="batch-settings-footer">
+          <span className={draggingSite ? "batch-drag-status" : undefined} role="status" title={dragStatus}>{dragStatus}</span>
+          <div className="row-actions">
+            <button className="ghost" onClick={onClose} type="button">取消</button>
+            <button disabled={busy || batchDraggingSiteId !== null || pendingSiteIds !== null} onClick={saveBatchSettings} type="button">
+              <Save size={16} />
+              <span>保存设置</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      {batchDragLayout && draggingSite ? createPortal(
+        <div
+          aria-hidden="true"
+          className="batch-site-drag-preview"
+          inert
+          ref={batchDragPreviewRef}
+          style={{
+            width: batchDragLayout.width,
+            height: batchDragLayout.height,
+            transform: `translate3d(${batchDragLayout.initialLeft}px, ${batchDragLayout.initialTop}px, 0)`,
+          }}
+        >
+          <BatchSiteRow
+            busy={false}
+            dragging={false}
+            onPointerDown={handleBatchPointerDown}
+            onSettingChange={updateBatchSetting}
+            settings={batchSettings[draggingSite.id]}
+            shift={0}
+            site={draggingSite}
+          />
+        </div>,
+        document.body,
+      ) : null}
+    </div>
+  );
+}
+
 function SitesPanel({
   busy,
   config,
@@ -1577,14 +1996,6 @@ function SitesPanel({
   const [showSitePassword, setShowSitePassword] = useState(false);
   const [showTotpSecret, setShowTotpSecret] = useState(false);
   const [batchSettingsOpen, setBatchSettingsOpen] = useState(false);
-  const [batchSettings, setBatchSettings] = useState<
-    Record<string, SiteAutomationSettings>
-  >({});
-  const [batchDraggingSiteId, setBatchDraggingSiteId] = useState<string | null>(null);
-  const [batchDragOverSiteId, setBatchDragOverSiteId] = useState<string | null>(null);
-  const batchDragOverSiteRef = useRef<string | null>(null);
-  const batchSettingsListRef = useRef<HTMLDivElement | null>(null);
-  const batchPointerPositionRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const visibleSites = useMemo(() => {
     const keyword = siteSearch.trim().toLowerCase();
     if (!keyword) return config.sites;
@@ -1649,154 +2060,8 @@ function SitesPanel({
 
   function openBatchSettings() {
     if (selectedSiteIds.size === 0) return;
-    const next: Record<string, SiteAutomationSettings> = {};
-    config.sites.forEach((site) => {
-      if (!selectedSiteIds.has(site.id)) return;
-      next[site.id] = {
-        auto_login: site.auto_login,
-        auto_keepalive: site.auto_keepalive,
-        auto_signin: site.auto_signin,
-        cookiecloud_upload: site.cookiecloud_upload,
-      };
-    });
-    setBatchSettings(next);
     setBatchSettingsOpen(true);
   }
-
-  function updateBatchSetting(
-    siteId: string,
-    key: AutomationSettingKey,
-    value: boolean,
-  ) {
-    setBatchSettings((current) => ({
-      ...current,
-      [siteId]: {
-        ...current[siteId],
-        [key]: value,
-      },
-    }));
-  }
-
-  function setAllBatchSettings(value: boolean) {
-    setBatchSettings((current) =>
-      Object.fromEntries(
-        Object.entries(current).map(([siteId, settings]) => [
-          siteId,
-          {
-            ...settings,
-            auto_login: value,
-            auto_keepalive: value,
-            auto_signin: value,
-            cookiecloud_upload: value,
-          },
-        ]),
-      ) as Record<string, SiteAutomationSettings>,
-    );
-  }
-
-  async function saveBatchSettings() {
-    const success = await onBatchUpdateAutomation(batchSettings);
-    if (success) {
-      setBatchSettingsOpen(false);
-    }
-  }
-
-  async function reorderBatchSites(sourceSiteId: string, targetSiteId: string) {
-    if (sourceSiteId === targetSiteId) return;
-    const selectedIds = config.sites
-      .filter((site) => batchSettings[site.id])
-      .map((site) => site.id);
-    const sourceIndex = selectedIds.indexOf(sourceSiteId);
-    const targetIndex = selectedIds.indexOf(targetSiteId);
-    if (sourceIndex < 0 || targetIndex < 0) return;
-    selectedIds.splice(sourceIndex, 1);
-    const insertIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex;
-    selectedIds.splice(insertIndex, 0, sourceSiteId);
-
-    const selectedSet = new Set(selectedIds);
-    let selectedIndex = 0;
-    const nextIds = config.sites.map((site) =>
-      selectedSet.has(site.id) ? selectedIds[selectedIndex++] : site.id,
-    );
-    await onReorderSites(nextIds);
-  }
-
-  function handleBatchPointerDown(event: ReactPointerEvent<HTMLElement>, siteId: string) {
-    if (busy) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    batchPointerPositionRef.current = {
-      clientX: event.clientX,
-      clientY: event.clientY,
-    };
-    batchDragOverSiteRef.current = siteId;
-    setBatchDraggingSiteId(siteId);
-    setBatchDragOverSiteId(siteId);
-  }
-
-  useEffect(() => {
-    if (!batchDraggingSiteId) return;
-
-    const updateDragTarget = (clientX: number, clientY: number) => {
-      const element = document.elementFromPoint(clientX, clientY);
-      const row = element?.closest<HTMLElement>("[data-batch-site-id]");
-      const targetSiteId = row?.dataset.batchSiteId;
-      if (targetSiteId && targetSiteId !== batchDraggingSiteId) {
-        batchDragOverSiteRef.current = targetSiteId;
-        setBatchDragOverSiteId(targetSiteId);
-      }
-    };
-
-    const handlePointerMove = (event: PointerEvent) => {
-      batchPointerPositionRef.current = {
-        clientX: event.clientX,
-        clientY: event.clientY,
-      };
-      updateDragTarget(event.clientX, event.clientY);
-    };
-
-    let autoScrollFrame = 0;
-    const autoScroll = () => {
-      const pointer = batchPointerPositionRef.current;
-      const list = batchSettingsListRef.current;
-      if (pointer && list) {
-        const rect = list.getBoundingClientRect();
-        const edge = 72;
-        let scrollDelta = 0;
-        if (pointer.clientY < rect.top + edge) {
-          scrollDelta = -Math.max(3, Math.round((rect.top + edge - pointer.clientY) / 8));
-        } else if (pointer.clientY > rect.bottom - edge) {
-          scrollDelta = Math.max(3, Math.round((pointer.clientY - (rect.bottom - edge)) / 8));
-        }
-        if (scrollDelta !== 0) list.scrollTop += scrollDelta;
-        updateDragTarget(pointer.clientX, pointer.clientY);
-      }
-      autoScrollFrame = window.requestAnimationFrame(autoScroll);
-    };
-    autoScrollFrame = window.requestAnimationFrame(autoScroll);
-
-    const handlePointerUp = () => {
-      const sourceSiteId = batchDraggingSiteId;
-      const targetSiteId = batchDragOverSiteRef.current;
-      batchDragOverSiteRef.current = null;
-      batchPointerPositionRef.current = null;
-      setBatchDraggingSiteId(null);
-      setBatchDragOverSiteId(null);
-      if (targetSiteId && targetSiteId !== sourceSiteId) {
-        reorderBatchSites(sourceSiteId, targetSiteId).catch(() => undefined);
-      }
-    };
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp, { once: true });
-    window.addEventListener("pointercancel", handlePointerUp, { once: true });
-    return () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", handlePointerUp);
-      window.cancelAnimationFrame(autoScrollFrame);
-    };
-  }, [batchDraggingSiteId, config.sites, batchSettings, onReorderSites]);
 
   async function removeSingleSite(site: Site) {
     const confirmed = await ask(`确定删除站点“${site.name}”吗？此操作无法撤销。`, {
@@ -2204,113 +2469,14 @@ function SitesPanel({
       </section>
 
       {batchSettingsOpen ? (
-        <div
-          className="batch-settings-overlay"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setBatchSettingsOpen(false);
-          }}
-          role="presentation"
-        >
-          <div
-            aria-labelledby="batch-settings-title"
-            aria-modal="true"
-            className="batch-settings-modal"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
-            <div className="batch-settings-heading">
-              <div>
-                <span className="eyebrow">批量设置</span>
-                <h2 id="batch-settings-title">批量操作站点</h2>
-                <p>已选择 {Object.keys(batchSettings).length} 个站点，可逐站调整四项自动化开关。</p>
-              </div>
-              <button
-                aria-label="关闭批量设置"
-                className="icon-button"
-                onClick={() => setBatchSettingsOpen(false)}
-                type="button"
-              >
-                <XCircle size={18} />
-              </button>
-            </div>
-
-            <div className="batch-settings-toolbar">
-              <span>快速设置所选站点</span>
-              <div className="batch-settings-quick-actions">
-                <button className="ghost" onClick={() => setAllBatchSettings(true)} type="button">
-                  <CheckCircle2 size={15} />
-                  <span>全部开启</span>
-                </button>
-                <button className="ghost" onClick={() => setAllBatchSettings(false)} type="button">
-                  <PauseCircle size={15} />
-                  <span>全部关闭</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="batch-settings-list" ref={batchSettingsListRef}>
-              {config.sites
-                .filter((site) => batchSettings[site.id])
-                .map((site) => {
-                  const settings = batchSettings[site.id];
-                  return (
-                    <div
-                      className={`batch-site-row${batchDraggingSiteId === site.id ? " dragging" : ""}${batchDragOverSiteId === site.id ? " drag-over" : ""}`}
-                      data-batch-site-id={site.id}
-                      key={site.id}
-                    >
-                      <div
-                        aria-label={`拖动调整 ${site.name} 顺序`}
-                        aria-disabled={busy}
-                        className="batch-site-drag-handle"
-                        onPointerDown={(event) => handleBatchPointerDown(event, site.id)}
-                        title="拖动调整站点顺序"
-                        role="button"
-                        tabIndex={0}
-                      >
-                        <GripVertical size={17} />
-                      </div>
-                      <div className="batch-site-meta">
-                        <strong>{site.name}</strong>
-                        <span>{site.url}</span>
-                      </div>
-                      <div className="batch-site-switches">
-                        {automationFields.map((field) => (
-                          <label
-                            className="batch-switch"
-                            key={field.key}
-                            title={field.description}
-                          >
-                            <span>{field.label}</span>
-                            <input
-                              checked={settings[field.key]}
-                              onChange={(event) =>
-                                updateBatchSetting(site.id, field.key, event.target.checked)
-                              }
-                              type="checkbox"
-                            />
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })}
-            </div>
-
-            <div className="batch-settings-footer">
-              <span>保存后立即应用到这些站点。</span>
-              <div className="row-actions">
-                <button className="ghost" onClick={() => setBatchSettingsOpen(false)} type="button">
-                  取消
-                </button>
-                <button disabled={busy} onClick={saveBatchSettings} type="button">
-                  <Save size={16} />
-                  <span>保存设置</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <BatchSettingsModal
+          allSites={config.sites}
+          busy={busy}
+          onBatchUpdateAutomation={onBatchUpdateAutomation}
+          onClose={() => setBatchSettingsOpen(false)}
+          onReorderSites={onReorderSites}
+          sites={config.sites.filter((site) => selectedSiteIds.has(site.id))}
+        />
       ) : null}
     </div>
   );

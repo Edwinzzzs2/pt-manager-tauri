@@ -1795,7 +1795,6 @@ html[data-theme="light"] .log-level-filter select {
   place-items: center;
   padding: 24px;
   background: rgba(0, 0, 0, 0.62);
-  backdrop-filter: blur(6px);
 }
 
 .batch-settings-modal {
@@ -1861,14 +1860,18 @@ html[data-theme="light"] .log-level-filter select {
 }
 
 .batch-settings-list {
+  position: relative;
   display: grid;
   min-height: 0;
   gap: 10px;
   overflow: auto;
+  overscroll-behavior: contain;
+  contain: layout paint;
   padding: 14px 22px 18px;
 }
 
 .batch-site-row {
+  position: relative;
   display: grid;
   grid-template-columns: 20px minmax(180px, 0.6fr) minmax(0, 1.4fr);
   align-items: center;
@@ -1880,12 +1883,75 @@ html[data-theme="light"] .log-level-filter select {
 }
 
 .batch-site-row.dragging {
-  opacity: 0.5;
+  visibility: hidden;
 }
 
-.batch-site-row.drag-over {
+.batch-settings-list.is-dragging .batch-site-row {
+  transition: transform 140ms ease;
+}
+
+.batch-settings-list.is-dragging,
+.batch-settings-list.is-dragging * {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.batch-drop-placeholder {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--color-accent);
+  border-radius: 8px;
+  background: var(--accent-soft-bg);
+  color: var(--color-accent);
+  pointer-events: none;
+}
+
+.batch-drop-placeholder span {
+  padding: 4px 10px;
+  border-radius: 5px;
+  background: var(--panel-surface);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.batch-drop-placeholder.cancelled {
+  opacity: 0.35;
+}
+
+.batch-site-drag-preview {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 950;
+  opacity: 0.94;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.batch-site-drag-preview .batch-site-row {
+  height: 100%;
   border-color: var(--color-accent);
-  box-shadow: 0 0 0 2px var(--accent-soft-bg);
+  background: var(--panel-surface);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .batch-settings-list.is-dragging .batch-site-row {
+    transition: none;
+  }
+}
+
+.batch-settings-footer > .batch-drag-status {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-accent);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-settings-footer .row-actions {
+  flex-shrink: 0;
 }
 
 .batch-site-drag-handle {
