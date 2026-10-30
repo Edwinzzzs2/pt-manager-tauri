@@ -71,6 +71,10 @@ pub struct AppConfig {
     pub ocr_retry_count: u8,
     #[serde(default = "default_min_login_attempts_remaining")]
     pub min_login_attempts_remaining: u8,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+    #[serde(default = "default_update_check_interval_hours")]
+    pub update_check_interval_hours: u16,
     #[serde(default)]
     pub update_proxy_url: String,
     #[serde(default)]
@@ -194,6 +198,8 @@ impl Default for AppConfig {
             ocr_server_url: default_ocr_server_url(),
             ocr_retry_count: default_ocr_retry_count(),
             min_login_attempts_remaining: default_min_login_attempts_remaining(),
+            auto_check_updates: default_auto_check_updates(),
+            update_check_interval_hours: default_update_check_interval_hours(),
             update_proxy_url: String::new(),
             update_proxy_password: String::new(),
             cookiecloud: CookieCloudConfig::default(),
@@ -217,6 +223,14 @@ fn default_ocr_retry_count() -> u8 {
 
 fn default_min_login_attempts_remaining() -> u8 {
     5
+}
+
+fn default_auto_check_updates() -> bool {
+    true
+}
+
+fn default_update_check_interval_hours() -> u16 {
+    1
 }
 
 fn default_auto_keepalive() -> bool {
@@ -499,6 +513,7 @@ pub fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
         config.log_retention = normalize_log_retention(config.log_retention);
         config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
         config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
+        config.update_check_interval_hours = config.update_check_interval_hours.clamp(1, 168);
         if refresh_login_attempt_resets(&mut config) {
             save_config(app_handle, &config);
         }

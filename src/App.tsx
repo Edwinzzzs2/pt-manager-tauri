@@ -133,6 +133,8 @@ type AppConfig = {
   ocr_server_url: string;
   ocr_retry_count: number;
   min_login_attempts_remaining: number;
+  auto_check_updates: boolean;
+  update_check_interval_hours: number;
   update_proxy_url: string;
   update_proxy_password: string;
   cookiecloud: CookieCloudConfig;
@@ -191,7 +193,6 @@ type TabKey = "dashboard" | "sites" | "settings" | "logs";
 type ColorMode = "dark" | "light";
 
 const themeStorageKey = "pt-manager-theme";
-const updateCheckIntervalMs = 60 * 60 * 1000;
 const releaseTag = import.meta.env.VITE_RELEASE_TAG as string | undefined;
 
 const defaultConfig: AppConfig = {
@@ -210,6 +211,8 @@ const defaultConfig: AppConfig = {
   ocr_server_url: "https://ocr-read.decoffee.top",
   ocr_retry_count: 2,
   min_login_attempts_remaining: 5,
+  auto_check_updates: true,
+  update_check_interval_hours: 1,
   update_proxy_url: "",
   update_proxy_password: "",
   cookiecloud: {
@@ -293,6 +296,7 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
   const [colorMode, setColorMode] = useState<ColorMode>(() => readStoredTheme());
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
+  const [configLoaded, setConfigLoaded] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppConfig>(defaultConfig);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -365,6 +369,7 @@ function App() {
     const next = await invoke<AppConfig>("get_config");
     setConfig(next);
     setSettingsDraft(next);
+    setConfigLoaded(true);
   }
 
   async function refreshStatus() {
@@ -392,6 +397,8 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // 必须先读取已保存的开关，永久关闭时启动也不发起自动检测。
+    if (!configLoaded || !config.auto_check_updates) return;
     // 自动检查只更新版本提示；下载和安装仍由用户点击按钮确认。
     const checkSilently = () => {
       void fetchAvailableUpdate().catch(() => {
@@ -399,9 +406,12 @@ function App() {
       });
     };
     checkSilently();
-    const timer = window.setInterval(checkSilently, updateCheckIntervalMs);
+    const timer = window.setInterval(
+      checkSilently,
+      config.update_check_interval_hours * 60 * 60 * 1000,
+    );
     return () => window.clearInterval(timer);
-  }, []);
+  }, [configLoaded, config.auto_check_updates, config.update_check_interval_hours]);
 
   useEffect(() => {
     if (activeTab !== "sites") return;
@@ -668,6 +678,7 @@ function App() {
       const result = await invoke<AppConfig>("import_config", { path });
       setConfig(result);
       setSettingsDraft(result);
+      setConfigLoaded(true);
       await refreshStatus();
       await message("整个配置（包含站点和系统选项）已成功导入！", {
         kind: "info",
@@ -884,6 +895,11 @@ function App() {
         1,
         20,
       ),
+      update_check_interval_hours: clampNumber(
+        Math.trunc(Number(settingsDraft.update_check_interval_hours)) || 1,
+        1,
+        168,
+      ),
       update_proxy_url: settingsDraft.update_proxy_url.trim().replace(/\/+$/, ""),
       update_proxy_password: settingsDraft.update_proxy_password,
       browser_proxy: {
@@ -911,6 +927,7 @@ function App() {
       await invoke("save_config", { config: next });
       setConfig(next);
       setSettingsDraft(next);
+      setConfigLoaded(true);
       await refreshStatus();
       setNotice(next.ocr_server_url ? "设置已保存，OCR 服务已就绪" : "设置已保存");
     } catch (err) {
@@ -985,7 +1002,7 @@ function App() {
   }
 
   function fetchAvailableUpdate(): Promise<AppUpdateInfo | null> {
-    // 手动检查与整点自动检查重合时，复用同一次请求，避免并发弹窗或重复网络请求。
+    // 手动检查与定时自动检查重合时，复用同一次请求，避免并发弹窗或重复网络请求。
     if (!updateCheckPromise.current) {
       setUpdateChecking(true);
       updateCheckPromise.current = invoke<AppUpdateInfo | null>("check_for_app_update")
@@ -2553,6 +2570,33 @@ function SettingsPanel({
             </div>
           </div>
           <div className="settings-form">
+            <label className="switch-row">
+              <span>自动检测更新</span>
+              <input
+                checked={draft.auto_check_updates}
+                onChange={(event) => onChange({ ...draft, auto_check_updates: event.target.checked })}
+                type="checkbox"
+              />
+            </label>
+            <label>
+              <span>检测间隔（小时）</span>
+              <input
+                disabled={!draft.auto_check_updates}
+                min={1}
+                max={168}
+                step={1}
+                onChange={(event) =>
+                  onChange({ ...draft, update_check_interval_hours: Number(event.target.value) })
+                }
+                type="number"
+                value={draft.update_check_interval_hours}
+              />
+            </label>
+            <p className="field-hint">
+              {draft.auto_check_updates
+                ? "默认每 1 小时检测一次，可设置为 1–168 小时。启动时会先检测一次，设置保存后生效。"
+                : "保存后永久关闭自动检测，重启后仍保持关闭。你仍可点击左下角版本卡片手动检查更新。"}
+            </p>
             <label>
               <span className="label-with-help">
                 更新代理地址

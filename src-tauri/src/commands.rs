@@ -83,6 +83,7 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
         .to_string();
     config.ocr_retry_count = config.ocr_retry_count.clamp(1, 5);
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
+    config.update_check_interval_hours = config.update_check_interval_hours.clamp(1, 168);
     config.update_proxy_url = updater::normalize_proxy_url(&config.update_proxy_url)?;
     crate::browser_proxy::normalize_config(&mut config.browser_proxy)?;
     let proxy_changed = state.config.lock().await.browser_proxy != config.browser_proxy;
@@ -1343,6 +1344,7 @@ pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<A
         std::fs::read_to_string(&path).map_err(|err| format!("读取配置文件失败: {}", err))?;
     let mut new_config: AppConfig = serde_json::from_str(&json_content)
         .map_err(|err| format!("解析配置文件失败（文件格式可能不正确）: {}", err))?;
+    new_config.update_check_interval_hours = new_config.update_check_interval_hours.clamp(1, 168);
     new_config.update_proxy_url = updater::normalize_proxy_url(&new_config.update_proxy_url)?;
     crate::browser_proxy::normalize_config(&mut new_config.browser_proxy)?;
     let proxy_changed = state.config.lock().await.browser_proxy != new_config.browser_proxy;
