@@ -26,11 +26,7 @@ pub fn run() {
         // Prevent launching multiple desktop instances. A second launch reuses
         // and focuses the existing main window instead.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
@@ -106,8 +102,32 @@ pub fn run() {
             updater::check_for_app_update,
             updater::download_and_install_app_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| match event {
+            // macOS sends Reopen to the running app when its Dock/Finder icon
+            // is clicked. This does not launch a second process, so the
+            // single-instance callback cannot restore our hidden window.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_main_window(_app),
+            _ => {}
+        });
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    // Restore the application as well as its window after macOS Hide (Cmd+H).
+    #[cfg(target_os = "macos")]
+    if let Err(error) = app.show() {
+        eprintln!("Failed to show application: {error}");
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        for result in [window.show(), window.unminimize(), window.set_focus()] {
+            if let Err(error) = result {
+                eprintln!("Failed to restore main window: {error}");
+            }
+        }
+    }
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -127,10 +147,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .tooltip("PT Manager — 保活运行中")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                show_main_window(app);
             }
             "run" => {
                 let app = app.clone();
@@ -166,11 +183,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
+                show_main_window(tray.app_handle());
             }
         })
         .build(app)?;
