@@ -1259,6 +1259,42 @@ select:focus {
   grid-template-rows: auto 38px;
 }
 
+.settings-form.updater-settings-form > label {
+  grid-template-rows: 20px 38px;
+  gap: 8px;
+}
+
+.updater-settings-form > label > span:first-child {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.updater-settings-form .update-check-control {
+  display: flex;
+  box-sizing: border-box;
+  height: 38px;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 11px;
+  background: var(--color-bg-input);
+}
+
+.updater-settings-form .update-check-control > span {
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.updater-settings-form .update-check-control > input {
+  flex: 0 0 auto;
+}
+
+.updater-settings-form input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .field-hint {
   grid-column: 1 / -1;
   margin: 0;

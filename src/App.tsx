@@ -2569,14 +2569,18 @@ function SettingsPanel({
               </div>
             </div>
           </div>
-          <div className="settings-form">
-            <label className="switch-row">
+          <div className="settings-form updater-settings-form">
+            <label>
               <span>自动检测更新</span>
-              <input
-                checked={draft.auto_check_updates}
-                onChange={(event) => onChange({ ...draft, auto_check_updates: event.target.checked })}
-                type="checkbox"
-              />
+              <span className="switch-row update-check-control">
+                <span>{draft.auto_check_updates ? "已开启" : "已关闭"}</span>
+                <input
+                  aria-label="自动检测更新"
+                  checked={draft.auto_check_updates}
+                  onChange={(event) => onChange({ ...draft, auto_check_updates: event.target.checked })}
+                  type="checkbox"
+                />
+              </span>
             </label>
             <label>
               <span>检测间隔（小时）</span>
@@ -2594,8 +2598,8 @@ function SettingsPanel({
             </label>
             <p className="field-hint">
               {draft.auto_check_updates
-                ? "默认每 1 小时检测一次，可设置为 1–168 小时。启动时会先检测一次，设置保存后生效。"
-                : "保存后永久关闭自动检测，重启后仍保持关闭。你仍可点击左下角版本卡片手动检查更新。"}
+                ? "启动时检测一次，之后按设置的间隔检测，支持 1–168 小时。修改后请保存。"
+                : "保存后永久关闭自动检测，重启后仍保持关闭。可点击左下角版本卡片手动检测。"}
             </p>
             <label>
               <span className="label-with-help">
@@ -2639,8 +2643,7 @@ function SettingsPanel({
               </div>
             </label>
             <p className="field-hint">
-              填写 URL 前缀型代理地址；如代理启用了鉴权，请填写与服务端
-              PROXY_AUTH_TOKEN 一致的密码。检查更新和安装包下载都会使用该配置。
+              代理留空时直连 GitHub；填写后，检测更新和下载安装包都会通过该地址。密码按代理服务配置填写。
             </p>
           </div>
         </section>
