@@ -2,12 +2,15 @@ use super::{dedicated_profile_dir, recovery_profile_dir, BrowserKind, CdpWebSock
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::time::Instant;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[derive(Clone, Deserialize)]
 struct ProxySettings {
@@ -157,41 +160,54 @@ if ($profileMatch.Success) {{
 
 #[cfg(not(target_os = "windows"))]
 fn read_process_settings(process_id: u32) -> Result<ProxySettings, String> {
+    #[cfg(target_os = "macos")]
+    let arguments = macos::process_arguments(process_id)?;
     #[cfg(target_os = "linux")]
-    let arguments = std::fs::read(format!("/proc/{process_id}/cmdline"))
-        .map_err(|_| "无法读取浏览器进程参数".to_string())?;
-    #[cfg(not(target_os = "linux"))]
-    let arguments = query_process(Command::new("/bin/ps").args([
-        "-ww",
-        "-p",
-        &process_id.to_string(),
-        "-o",
-        "command=",
-    ]))?;
-    let line = String::from_utf8(arguments).map_err(|_| "浏览器进程参数编码无效".to_string())?;
-    #[cfg(target_os = "linux")]
-    let arguments: Vec<&str> = line.split('\0').collect();
-    #[cfg(not(target_os = "linux"))]
-    let arguments: Vec<&str> = line
-        .split_whitespace()
-        .map(|value| value.trim_matches('"'))
-        .collect();
-    Ok(ProxySettings {
+    let arguments: Vec<String> = {
+        let raw = std::fs::read(format!("/proc/{process_id}/cmdline"))
+            .map_err(|_| "无法读取浏览器进程参数".to_string())?;
+        String::from_utf8(raw)
+            .map_err(|_| "浏览器进程参数编码无效".to_string())?
+            .split('\0')
+            .map(str::to_string)
+            .collect()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let arguments: Vec<String> = {
+        let raw = query_process(Command::new("/bin/ps").args([
+            "-ww",
+            "-p",
+            &process_id.to_string(),
+            "-o",
+            "command=",
+        ]))?;
+        String::from_utf8(raw)
+            .map_err(|_| "浏览器进程参数编码无效".to_string())?
+            .split_whitespace()
+            .map(|value| value.trim_matches('"').to_string())
+            .collect()
+    };
+    Ok(settings_from_arguments(&arguments))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn settings_from_arguments(arguments: &[String]) -> ProxySettings {
+    ProxySettings {
         server: arguments
             .iter()
             .find_map(|value| value.strip_prefix("--proxy-server=").map(str::to_string)),
-        forced_direct: arguments.contains(&"--no-proxy-server"),
+        forced_direct: arguments.iter().any(|value| value == "--no-proxy-server"),
         other_proxy: arguments
             .iter()
             .any(|value| value.starts_with("--proxy-pac-url=") || *value == "--proxy-auto-detect"),
         user_data_dir: arguments
             .iter()
             .find_map(|value| value.strip_prefix("--user-data-dir=").map(str::to_string)),
-    })
+    }
 }
 
 /// 查询进程参数设置等待上限，避免系统查询卡住后阻塞保活；错误日志不包含完整命令行。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn query_process(command: &mut Command) -> Result<Vec<u8>, String> {
     let mut child = command
         .stdin(Stdio::null())
@@ -225,5 +241,38 @@ fn query_process(command: &mut Command) -> Result<Vec<u8>, String> {
                 });
             }
         }
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::settings_from_arguments;
+
+    #[test]
+    fn preserves_profile_spaces_and_proxy_flags() {
+        let profile = "/Users/test user/Library/Application Support/com.ptmanager.app/chrome-cdp-profile-auto";
+        let settings = settings_from_arguments(&[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+            format!("--user-data-dir={profile}"),
+            "--proxy-server=http://127.0.0.1:1234".to_string(),
+            "--no-proxy-server".to_string(),
+            "--proxy-auto-detect".to_string(),
+        ]);
+        assert_eq!(settings.user_data_dir.as_deref(), Some(profile));
+        assert_eq!(settings.server.as_deref(), Some("http://127.0.0.1:1234"));
+        assert!(settings.forced_direct);
+        assert!(settings.other_proxy);
+    }
+
+    #[test]
+    fn does_not_treat_url_text_as_browser_arguments() {
+        let settings = settings_from_arguments(&[
+            "chrome".to_string(),
+            "https://example.com/?value=--user-data-dir=/tmp/pt-manager".to_string(),
+        ]);
+        assert!(settings.user_data_dir.is_none());
+        assert!(settings.server.is_none());
+        assert!(!settings.forced_direct);
+        assert!(!settings.other_proxy);
     }
 }
