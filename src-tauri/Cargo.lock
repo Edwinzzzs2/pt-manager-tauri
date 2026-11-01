@@ -3584,6 +3584,8 @@ dependencies = [
  "hmac",
  "image",
  "md-5",
+ "objc2",
+ "plist",
  "rand 0.8.5",
  "reqwest",
  "rustls-native-certs",

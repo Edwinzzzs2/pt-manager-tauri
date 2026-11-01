@@ -5,6 +5,8 @@ mod cdp;
 mod commands;
 mod cookiecloud;
 mod gotify;
+#[cfg(target_os = "macos")]
+mod macos_autostart;
 mod ocr;
 mod scheduler;
 mod store;
@@ -37,10 +39,27 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // 加载配置
-            let config = store::load_config(&app.handle());
+            let mut config = store::load_config(&app.handle());
             store::set_log_retention(config.log_retention);
-            let _ = commands::apply_auto_launch(&app.handle(), config.auto_launch);
+            #[cfg(all(target_os = "macos", not(debug_assertions)))]
+            let auto_launch_result = macos_autostart::reconcile(app.handle(), config.auto_launch)
+                .map(|enabled| {
+                    if config.auto_launch != enabled {
+                        config.auto_launch = enabled;
+                        store::save_config(app.handle(), &config);
+                    }
+                });
+            #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
+            let auto_launch_result = commands::apply_auto_launch(app.handle(), config.auto_launch);
             let logs = Arc::new(Mutex::new(store::load_logs()));
+            if let Err(error) = auto_launch_result {
+                // 自启失败不阻止手动使用，但不能悄悄吞掉注册或迁移错误。
+                eprintln!("应用自启设置失败：{error}");
+                let logs = Arc::clone(&logs);
+                tauri::async_runtime::spawn(async move {
+                    store::push_log(&logs, store::LogEntry::error(format!("应用自启设置失败：{error}"))).await;
+                });
+            }
             browser_proxy::set_logs(Arc::clone(&logs));
             let task_running = Arc::new(Mutex::new(false));
             let task_cancel_requested = Arc::new(AtomicBool::new(false));

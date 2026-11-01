@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(target_os = "macos")))]
 use tauri_plugin_autostart::ManagerExt;
 use tokio::sync::Mutex;
 #[cfg(all(windows, debug_assertions))]
@@ -56,7 +56,15 @@ pub struct CookieCloudSyncResult {
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
-    if store::refresh_login_attempt_resets(&mut config) {
+    let mut changed = store::refresh_login_attempt_resets(&mut config);
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    if let Some(enabled) = crate::macos_autostart::native_enabled()? {
+        if config.auto_launch != enabled {
+            config.auto_launch = enabled;
+            changed = true;
+        }
+    }
+    if changed {
         store::save_config(&state.app_handle, &config);
     }
     Ok(config.clone())
@@ -133,7 +141,11 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
             .await
             .map_err(|err| err.to_string())??;
     }
-    let auto_launch_changed = state.config.lock().await.auto_launch != config.auto_launch;
+    let mut auto_launch_changed = state.config.lock().await.auto_launch != config.auto_launch;
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    if let Some(enabled) = crate::macos_autostart::native_enabled()? {
+        auto_launch_changed |= enabled != config.auto_launch;
+    }
     if auto_launch_changed {
         apply_auto_launch(&state.app_handle, config.auto_launch)?;
     }
@@ -1240,7 +1252,12 @@ pub fn apply_auto_launch(_app_handle: &tauri::AppHandle, enabled: bool) -> Resul
         return Ok(());
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    {
+        crate::macos_autostart::apply(_app_handle, enabled)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
     {
         let manager = _app_handle.autolaunch();
         if manager.is_enabled().map_err(|err| err.to_string()).ok() == Some(enabled) {
@@ -1295,7 +1312,7 @@ fn remove_current_debug_auto_launch() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(target_os = "macos")))]
 fn is_auto_launch_entry_missing(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("os error 2")
@@ -1351,6 +1368,7 @@ pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<A
     if proxy_changed && *state.task_running.lock().await {
         return Err("保活任务执行中，请等待任务结束后导入不同的浏览器代理配置".to_string());
     }
+    apply_auto_launch(&state.app_handle, new_config.auto_launch)?;
 
     let mut config = state.config.lock().await;
     *config = new_config.clone();
@@ -1358,7 +1376,6 @@ pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<A
     store::save_config(&state.app_handle, &config);
 
     store::set_log_retention(config.log_retention);
-    let _ = apply_auto_launch(&state.app_handle, config.auto_launch);
 
     restart_scheduler(&state, config.clone()).await;
 
