@@ -62,6 +62,7 @@ pub fn run() {
             }
             browser_proxy::set_logs(Arc::clone(&logs));
             let task_running = Arc::new(Mutex::new(false));
+            let browser_operation = Arc::new(Mutex::new(()));
             let task_cancel_requested = Arc::new(AtomicBool::new(false));
             let next_run: Arc<Mutex<Option<DateTime<Local>>>> = Arc::new(Mutex::new(None));
             let mut scheduler = scheduler::Scheduler::new(Arc::clone(&next_run));
@@ -70,6 +71,7 @@ pub fn run() {
                 config.clone(),
                 Arc::clone(&logs),
                 Arc::clone(&task_running),
+                Arc::clone(&browser_operation),
                 Arc::clone(&task_cancel_requested),
                 Some(app.handle().clone()),
                 Some(Arc::clone(&config_state)),
@@ -81,6 +83,7 @@ pub fn run() {
                 logs,
                 scheduler: Arc::new(Mutex::new(scheduler)),
                 task_running,
+                browser_operation,
                 task_cancel_requested,
                 app_handle: app.handle().clone(),
             };
@@ -101,6 +104,9 @@ pub fn run() {
             commands::remove_site,
             commands::remove_sites,
             commands::update_site,
+            commands::batch_update_sites,
+            commands::save_site_group,
+            commands::remove_site_group,
             commands::test_site_login,
             commands::recognize_site_captcha,
             commands::check_cdp,
@@ -177,6 +183,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                         &config,
                         &state.logs,
                         &state.task_running,
+                        &state.browser_operation,
                         &state.task_cancel_requested,
                         false,
                         Some(&state.app_handle),

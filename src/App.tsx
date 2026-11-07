@@ -48,11 +48,13 @@ import {
 } from "lucide-react";
 import "./App.css";
 import { VersionCard, type UpdatePhase } from "./components/VersionCard";
+import { SiteGroupDialog, SiteGroupOptions, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup } from "./components/SiteGroups";
 
 type Site = {
   id: string;
   name: string;
   url: string;
+  group_id: string | null;
   username: string;
   password: string;
   totp_secret: string;
@@ -70,6 +72,7 @@ type SiteDraft = Pick<
   Site,
   | "name"
   | "url"
+  | "group_id"
   | "username"
   | "password"
   | "totp_secret"
@@ -83,6 +86,7 @@ type SiteDraft = Pick<
 const emptySiteDraft: SiteDraft = {
   name: "",
   url: "",
+  group_id: null,
   username: "",
   password: "",
   totp_secret: "",
@@ -99,6 +103,7 @@ type SiteAutomationSettings = Pick<
 >;
 
 type AutomationSettingKey = keyof SiteAutomationSettings;
+type BatchGroupMove = { group_id: string | null };
 
 const automationFields: Array<{
   key: AutomationSettingKey;
@@ -123,19 +128,14 @@ const automationFields: Array<{
   {
     key: "cookiecloud_upload",
     label: "自动上传 Cookie",
-    description: "本站纳入自动上传范围，还需开启设置页的总开关。",
+    description: "本站纳入自动上传范围，还需开启所属分组的自动同步。",
   },
 ];
 
-type BrowserProxyConfig = {
-  enabled: boolean;
-  server_url: string;
-  username: string;
-  password: string;
-};
-
 type AppConfig = {
   sites: Site[];
+  site_groups: SiteGroup[];
+  startup_group_id: string | null;
   cron: string;
   cron_offset_minutes: number;
   cdp_port: number;
@@ -157,12 +157,6 @@ type AppConfig = {
   cookiecloud: CookieCloudConfig;
   gotify: GotifyConfig;
   bark: BarkConfig;
-};
-
-type CookieCloudConfig = {
-  server_url: string;
-  uuid: string;
-  password: string;
 };
 
 type GotifyConfig = {
@@ -196,10 +190,8 @@ type AppStatus = {
 };
 
 type CookieCloudSyncResult = {
-  matched_cookies: number;
-  imported_cookies: number;
-  matched_local_storages: number;
-  imported_local_storages: number;
+  synced_groups: number;
+  failed_groups: number;
 };
 
 type AppUpdateInfo = {
@@ -217,6 +209,8 @@ const releaseTag = import.meta.env.VITE_RELEASE_TAG as string | undefined;
 
 const defaultConfig: AppConfig = {
   sites: [],
+  site_groups: [],
+  startup_group_id: null,
   cron: "0 9 * * *",
   cron_offset_minutes: 30,
   cdp_port: 9222,
@@ -314,6 +308,9 @@ function isQingwaSite(siteUrl: string): boolean {
 
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
+  const [siteDialog, setSiteDialog] = useState<"add" | "groups" | null>(null);
+  const [selectedSiteGroup, setSelectedSiteGroup] = useState("all");
+  const startupNavigationHandled = useRef(false);
   const [colorMode, setColorMode] = useState<ColorMode>(() => readStoredTheme());
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [configLoaded, setConfigLoaded] = useState(false);
@@ -349,6 +346,9 @@ function App() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const browserName = config.browser === "edge" ? "Edge" : "Chrome";
+  const siteGroupBusy = busy || !!status?.is_running || cookieSyncBusy
+    || testingSiteId !== null || recognizingSiteId !== null;
+  const editingSelectedGroup = config.site_groups.some((group) => group.id === selectedSiteGroup);
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
 
   useEffect(() => {
@@ -372,6 +372,14 @@ function App() {
     setConfig(next);
     setSettingsDraft(next);
     setConfigLoaded(true);
+    if (!startupNavigationHandled.current) {
+      startupNavigationHandled.current = true;
+      const startupGroup = next.site_groups.find((group) => group.id === next.startup_group_id);
+      if (startupGroup) {
+        setSelectedSiteGroup(startupGroup.id);
+        setActiveTab("sites");
+      }
+    }
   }
 
   async function refreshStatus() {
@@ -494,28 +502,25 @@ function App() {
     setCookieSyncBusy(true);
     setError(null);
     try {
-      await invoke<CookieCloudSyncResult>("sync_cookiecloud_from_config", {
-        config: settingsDraft,
-      });
+      let result: CookieCloudSyncResult;
+      try {
+        result = await invoke("sync_cookiecloud_from_config", { config: settingsDraft });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!message.includes("仅支持 http://")) throw err;
+        const cookies = await fetchCookieCloudData(settingsDraft.cookiecloud);
+        result = await invoke("sync_cookiecloud_cookies", {
+          cookies,
+          cookiecloud: settingsDraft.cookiecloud,
+        });
+      }
       await refreshStatus();
       await refreshLogs();
+      setNotice(result.failed_groups > 0
+        ? `已同步 ${result.synced_groups} 个分组，另有 ${result.failed_groups} 个未同步，详情见日志`
+        : `已同步 ${result.synced_groups} 个分组的 CookieCloud 登录数据`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes("仅支持 http://")) {
-        try {
-          const cookieData = await fetchCookieCloudData(settingsDraft.cookiecloud);
-          await invoke<CookieCloudSyncResult>("sync_cookiecloud_cookies", {
-            cookies: cookieData,
-          });
-          await refreshStatus();
-          await refreshLogs();
-          return;
-        } catch (fallbackErr) {
-          showError(fallbackErr);
-        }
-      } else {
-        showError(err);
-      }
+      showError(err);
     } finally {
       setCookieSyncBusy(false);
     }
@@ -523,7 +528,7 @@ function App() {
 
   async function clearBrowserData() {
     const confirmed = await ask(
-      `将清除专用 ${browserName} 的 Cookie、Local Storage 和缓存。清除后可重新同步 CookieCloud，确定继续？`,
+      `将清除未分组站点使用的专用 ${browserName} 中的 Cookie、Local Storage 和缓存。清除后可重新同步 CookieCloud，确定继续？`,
       {
         kind: "warning",
         okLabel: "清除",
@@ -563,7 +568,7 @@ function App() {
       return;
     }
     const confirmed = await ask(
-      `将永久清空 ${serverUrl || "当前 CookieCloud 服务器"} 上保存的全部 Cookie 和 Local Storage 数据，确定继续？`,
+      `将永久清空 ${serverUrl} 上当前 UUID 对应的 Cookie 和 Local Storage 数据，确定继续？`,
       {
         kind: "warning",
         okLabel: "清空云端数据",
@@ -605,6 +610,7 @@ function App() {
     const next = await invoke<AppConfig>("add_site", {
       name,
       url,
+      groupId: newSite.group_id,
       username: newSite.username.trim(),
       password: newSite.password,
       totpSecret: newSite.totp_secret.trim(),
@@ -687,6 +693,7 @@ function App() {
     setEditingSite({
       name: site.name,
       url: site.url,
+      group_id: site.group_id,
       username: site.username,
       password: site.password,
       totp_secret: site.totp_secret,
@@ -713,6 +720,7 @@ function App() {
         id,
         name,
         url,
+        groupId: editingSite.group_id,
         username: editingSite.username.trim(),
         password: editingSite.password,
         totpSecret: editingSite.totp_secret.trim(),
@@ -731,6 +739,18 @@ function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function saveSiteGroup(group: SiteGroup, showOnStartup: boolean) {
+    const next = await invoke<AppConfig>("save_site_group", { group, showOnStartup });
+    setConfig(next);
+    setSettingsDraft(next);
+  }
+
+  async function removeSiteGroup(id: string) {
+    const next = await invoke<AppConfig>("remove_site_group", { id });
+    setConfig(next);
+    setSettingsDraft(next);
   }
 
   async function removeSite(id: string) {
@@ -774,6 +794,7 @@ function App() {
         id: site.id,
         name: site.name,
         url: site.url,
+        groupId: site.group_id,
         username: site.username,
         password: site.password,
         totpSecret: site.totp_secret,
@@ -793,25 +814,21 @@ function App() {
     }
   }
 
-  async function batchUpdateSiteAutomation(
+  async function batchUpdateSites(
     updates: Record<string, SiteAutomationSettings>,
+    groupMove: BatchGroupMove | null,
   ) {
-    if (Object.keys(updates).length === 0) return false;
     setBusy(true);
     setError(null);
     try {
-      const nextSites = config.sites.map((site) =>
-        updates[site.id] ? { ...site, ...updates[site.id] } : site,
-      );
-      const nextConfig = { ...config, sites: nextSites };
-      await invoke("save_config", { config: nextConfig });
-      setConfig(nextConfig);
-      setSettingsDraft(nextConfig);
-      await refreshStatus();
-      return true;
-    } catch (err) {
-      showError(err);
-      return false;
+      const next = await invoke<AppConfig>("batch_update_sites", { updates, groupMove });
+      setConfig(next);
+      setSettingsDraft(next);
+      if (groupMove) {
+        const groupName = next.site_groups.find((group) => group.id === groupMove.group_id)?.name;
+        setNotice(groupName ? `已将所选站点归入「${groupName}」` : "已取消所选站点的分组");
+      }
+      void refreshStatus().catch(showError);
     } finally {
       setBusy(false);
     }
@@ -1082,7 +1099,11 @@ function App() {
               <button
                 key={item.key}
                 className={activeTab === item.key ? "nav-item active" : "nav-item"}
-                onClick={() => setActiveTab(item.key)}
+                onClick={() => {
+                  startupNavigationHandled.current = true;
+                  setSiteDialog(null);
+                  setActiveTab(item.key);
+                }}
                 type="button"
               >
                 <Icon size={18} />
@@ -1141,6 +1162,30 @@ function App() {
             >
               {colorMode === "dark" ? <Sun size={17} /> : <Moon size={17} />}
             </button>
+            {activeTab === "sites" && (
+              <>
+                <button
+                  aria-haspopup="dialog"
+                  className="ghost"
+                  disabled={siteGroupBusy}
+                  onClick={() => setSiteDialog("groups")}
+                  type="button"
+                >
+                  {editingSelectedGroup ? <Pencil size={16} aria-hidden="true" /> : <Settings2 size={16} aria-hidden="true" />}
+                  <span>{editingSelectedGroup ? "编辑分组" : "分组管理"}</span>
+                </button>
+                <button
+                  aria-haspopup="dialog"
+                  className="primary-action"
+                  disabled={siteGroupBusy}
+                  onClick={() => setSiteDialog("add")}
+                  type="button"
+                >
+                  <Plus size={16} aria-hidden="true" />
+                  <span>新增站点</span>
+                </button>
+              </>
+            )}
             <button
               className="primary-action"
               disabled={busy || status?.is_running}
@@ -1201,23 +1246,30 @@ function App() {
           {activeTab === "sites" ? (
             <SitesPanel
               busy={busy}
+              groupBusy={siteGroupBusy}
               config={config}
+              siteDialog={siteDialog}
+              selectedGroup={selectedSiteGroup}
+              onSelectGroup={setSelectedSiteGroup}
               editingSite={editingSite}
               editingSiteId={editingSiteId}
               onAdd={addSite}
               onCancelEdit={() => setEditingSiteId(null)}
+              onCloseSiteDialog={() => setSiteDialog(null)}
               onEditChange={setEditingSite}
               onRemove={removeSite}
               onRemoveSelected={removeSites}
+              onRemoveGroup={removeSiteGroup}
               onRecognizeCaptcha={recognizeSiteCaptcha}
               onSave={saveSite}
+              onSaveGroup={saveSiteGroup}
               onStartEdit={startEdit}
               onTestLogin={testSiteLogin}
               onStopTest={stopTask}
               testingSiteId={testingSiteId}
               recognizingSiteId={recognizingSiteId}
               onToggleKeepalive={toggleSiteKeepalive}
-              onBatchUpdateAutomation={batchUpdateSiteAutomation}
+              onBatchUpdateSites={batchUpdateSites}
               onReorderSites={reorderSites}
             />
           ) : null}
@@ -1625,18 +1677,21 @@ const BatchSiteRow = memo(function BatchSiteRow({
 function BatchSettingsModal({
   sites,
   allSites,
+  groups,
   busy,
   onClose,
-  onBatchUpdateAutomation,
+  onBatchUpdateSites,
   onReorderSites,
 }: {
   sites: Site[];
   allSites: Site[];
+  groups: SiteGroup[];
   busy: boolean;
   onClose: () => void;
-  onBatchUpdateAutomation: (
+  onBatchUpdateSites: (
     updates: Record<string, SiteAutomationSettings>,
-  ) => Promise<boolean>;
+    groupMove: BatchGroupMove | null,
+  ) => Promise<void>;
   onReorderSites: (siteIds: string[]) => Promise<boolean>;
 }) {
   const [batchSettings, setBatchSettings] = useState<Record<string, SiteAutomationSettings>>(
@@ -1648,6 +1703,8 @@ function BatchSettingsModal({
     }])),
   );
   const [batchDraggingSiteId, setBatchDraggingSiteId] = useState<string | null>(null);
+  const [destination, setDestination] = useState("keep");
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [batchDragLayout, setBatchDragLayout] = useState<BatchDragLayout | null>(null);
   const [batchDropIndex, setBatchDropIndex] = useState<number | null>(null);
   const [pendingSiteIds, setPendingSiteIds] = useState<string[] | null>(null);
@@ -1690,7 +1747,14 @@ function BatchSettingsModal({
   }
 
   async function saveBatchSettings() {
-    if (await onBatchUpdateAutomation(batchSettings)) onClose();
+    setSaveError(null);
+    try {
+      const groupMove = destination === "keep" ? null : { group_id: destination || null };
+      await onBatchUpdateSites(batchSettings, groupMove);
+      onClose();
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   const handleBatchPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>, siteId: string) => {
@@ -1881,6 +1945,18 @@ function BatchSettingsModal({
 
         <div className="batch-settings-toolbar">
           <span>快速设置所选站点</span>
+          {groups.length > 0 && (
+            <label className="batch-group-field">
+              <span>移到分组</span>
+              <select disabled={busy} value={destination} onChange={(event) => {
+                setDestination(event.target.value);
+                setSaveError(null);
+              }}>
+                <option value="keep">保持原分组</option>
+                <SiteGroupOptions groups={groups} />
+              </select>
+            </label>
+          )}
           <div className="batch-settings-quick-actions">
             <button className="ghost" onClick={() => setAllBatchSettings(true)} type="button">
               <CheckCircle2 size={15} />
@@ -1931,12 +2007,16 @@ function BatchSettingsModal({
         </div>
 
         <div className="batch-settings-footer">
-          <span className={draggingSite ? "batch-drag-status" : undefined} role="status" title={dragStatus}>{dragStatus}</span>
+          {saveError ? (
+            <p className="app-dialog-error" role="alert">{saveError}</p>
+          ) : (
+            <span className={draggingSite ? "batch-drag-status" : undefined} role="status" title={dragStatus}>{dragStatus}</span>
+          )}
           <div className="row-actions">
             <button className="ghost" onClick={onClose} type="button">取消</button>
             <button disabled={busy || batchDraggingSiteId !== null || pendingSiteIds !== null} onClick={saveBatchSettings} type="button">
               <Save size={16} />
-              <span>保存设置</span>
+              <span>{destination === "keep" ? "保存设置" : "保存并移动"}</span>
             </button>
           </div>
         </div>
@@ -1970,15 +2050,19 @@ function BatchSettingsModal({
 }
 
 function AddSiteDialog({
+  groups,
+  initialGroupId,
   onAdd,
   onClose,
 }: {
+  groups: SiteGroup[];
+  initialGroupId: string | null;
   onAdd: (site: SiteDraft) => Promise<void>;
   onClose: () => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
-  const [draft, setDraft] = useState<SiteDraft>(emptySiteDraft);
+  const [draft, setDraft] = useState<SiteDraft>(() => ({ ...emptySiteDraft, group_id: initialGroupId }));
   const [showPassword, setShowPassword] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2055,6 +2139,16 @@ function AddSiteDialog({
                 value={draft.url}
               />
             </label>
+            {groups.length > 0 && (
+              <label className="site-secret-field">
+                <span>站点分组</span>
+                <select value={draft.group_id ?? ""} onChange={(event) => setDraft({
+                  ...draft, group_id: event.target.value || null,
+                })}>
+                  <SiteGroupOptions groups={groups} />
+                </select>
+              </label>
+            )}
             <label>
               <span>登录用户名 <small>选填</small></span>
               <input
@@ -2128,66 +2222,90 @@ function AddSiteDialog({
 
 function SitesPanel({
   busy,
+  groupBusy,
   config,
+  siteDialog,
+  selectedGroup,
+  onSelectGroup,
   editingSite,
   editingSiteId,
   onAdd,
   onCancelEdit,
+  onCloseSiteDialog,
   onEditChange,
   onRecognizeCaptcha,
   onRemove,
+  onRemoveGroup,
   onRemoveSelected,
   onSave,
+  onSaveGroup,
   onStartEdit,
   onTestLogin,
   onStopTest,
   recognizingSiteId,
   testingSiteId,
   onToggleKeepalive,
-  onBatchUpdateAutomation,
+  onBatchUpdateSites,
   onReorderSites,
 }: {
   busy: boolean;
+  groupBusy: boolean;
   config: AppConfig;
+  siteDialog: "add" | "groups" | null;
+  selectedGroup: string;
+  onSelectGroup: (group: string) => void;
   editingSite: SiteDraft;
   editingSiteId: string | null;
   onAdd: (site: SiteDraft) => Promise<void>;
   onCancelEdit: () => void;
+  onCloseSiteDialog: () => void;
   onEditChange: (site: SiteDraft) => void;
   onRecognizeCaptcha: (site: Site) => void;
   onRemove: (id: string) => Promise<void>;
+  onRemoveGroup: (id: string) => Promise<void>;
   onRemoveSelected: (ids: string[]) => Promise<boolean>;
   onSave: (id: string) => void;
+  onSaveGroup: (group: SiteGroup, showOnStartup: boolean) => Promise<void>;
   onStartEdit: (site: Site) => void;
   onTestLogin: (site: Site) => void;
   onStopTest?: () => void;
   recognizingSiteId: string | null;
   testingSiteId: string | null;
   onToggleKeepalive: (site: Site) => void;
-  onBatchUpdateAutomation: (
+  onBatchUpdateSites: (
     updates: Record<string, SiteAutomationSettings>,
-  ) => Promise<boolean>;
+    groupMove: BatchGroupMove | null,
+  ) => Promise<void>;
   onReorderSites: (siteIds: string[]) => Promise<boolean>;
 }) {
   const [siteSearch, setSiteSearch] = useState("");
-  const [addSiteOpen, setAddSiteOpen] = useState(false);
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
   const [showSitePassword, setShowSitePassword] = useState(false);
   const [showTotpSecret, setShowTotpSecret] = useState(false);
   const [batchSettingsOpen, setBatchSettingsOpen] = useState(false);
+  const hasUngroupedSites = config.sites.some((site) => site.group_id == null);
+  const groupFilter = (selectedGroup === "" && hasUngroupedSites) || config.site_groups.some((group) => group.id === selectedGroup)
+    ? selectedGroup : "all";
+  const currentGroup = config.site_groups.find((group) => group.id === groupFilter);
+  const groupSites = useMemo(
+    () => groupFilter === "all"
+      ? config.sites
+      : config.sites.filter((site) => (site.group_id ?? "") === groupFilter),
+    [config.sites, groupFilter],
+  );
   const visibleSites = useMemo(() => {
     const keyword = siteSearch.trim().toLowerCase();
-    if (!keyword) return config.sites;
-    return config.sites.filter((site) =>
+    if (!keyword) return groupSites;
+    return groupSites.filter((site) =>
       site.name.toLowerCase().includes(keyword) || site.url.toLowerCase().includes(keyword),
     );
-  }, [config.sites, siteSearch]);
+  }, [groupSites, siteSearch]);
   const allSelected = visibleSites.length > 0 && visibleSites.every((site) => selectedSiteIds.has(site.id));
   const selectAllLabel = siteSearch.trim() ? "全选搜索结果" : "全选";
   const siteCountLabel = siteSearch.trim()
-    ? `匹配 ${visibleSites.length} / ${config.sites.length} 个站点`
-    : `共 ${config.sites.length} 个站点`;
-  const emptySiteLabel = config.sites.length === 0 ? "暂无站点" : "未找到匹配的站点";
+    ? `匹配 ${visibleSites.length} / ${groupSites.length} 个站点`
+    : `共 ${groupSites.length} 个站点`;
+  const emptySiteLabel = groupSites.length === 0 ? "暂无站点" : "未找到匹配的站点";
 
   useEffect(() => {
     // 保存编辑后站点也可能不再匹配搜索，只保留当前可见站点的勾选。
@@ -2252,9 +2370,42 @@ function SitesPanel({
 
   return (
     <div className="content-stack sites-stack">
-      {addSiteOpen && <AddSiteDialog onAdd={onAdd} onClose={() => setAddSiteOpen(false)} />}
+      {siteDialog === "add" && (
+        <AddSiteDialog
+          groups={config.site_groups}
+          initialGroupId={currentGroup?.id ?? null}
+          onAdd={onAdd}
+          onClose={onCloseSiteDialog}
+        />
+      )}
+      {siteDialog === "groups" && (
+        <SiteGroupDialog
+          groups={config.site_groups}
+          initialId={currentGroup?.id ?? ""}
+          startupGroupId={config.startup_group_id}
+          defaultPort={config.cdp_port}
+          countSites={(id) => config.sites.filter((site) => site.group_id === id).length}
+          onSave={onSaveGroup}
+          onRemove={onRemoveGroup}
+          onClose={onCloseSiteDialog}
+        />
+      )}
 
       <div className="site-selection-bar">
+        {config.site_groups.length > 0 && (
+          <select
+            aria-label="筛选站点分组"
+            className="site-group-filter"
+            value={groupFilter}
+            onChange={(event) => {
+              onSelectGroup(event.target.value);
+              setSelectedSiteIds(new Set());
+            }}
+          >
+            <option value="all">全部分组</option>
+            <SiteGroupOptions groups={config.site_groups} includeUngrouped={hasUngroupedSites} />
+          </select>
+        )}
         {visibleSites.length > 0 && (
           <div className="site-batch-actions">
             <label>
@@ -2315,16 +2466,6 @@ function SitesPanel({
           </div>
           <span className="site-search-count" role="status">{siteCountLabel}</span>
         </div>
-        <button
-          aria-haspopup="dialog"
-          className="primary-action site-add-button"
-          disabled={busy}
-          onClick={() => setAddSiteOpen(true)}
-          type="button"
-        >
-          <Plus size={16} aria-hidden="true" />
-          <span>新增站点</span>
-        </button>
       </div>
 
       <section className="site-list site-list-scroll">
@@ -2333,6 +2474,7 @@ function SitesPanel({
         ) : (
           visibleSites.map((site) => {
             const editing = editingSiteId === site.id;
+            const groupName = config.site_groups.find((group) => group.id === site.group_id)?.name;
             return (
               <article
                 className={`site-row${editing ? " editing" : ""}`}
@@ -2361,6 +2503,13 @@ function SitesPanel({
                       placeholder="站点 URL"
                       value={editingSite.url}
                     />
+                    {config.site_groups.length > 0 && (
+                      <select aria-label="站点分组" className="site-secret-field" value={editingSite.group_id ?? ""} onChange={(event) =>
+                        onEditChange({ ...editingSite, group_id: event.target.value || null })
+                      }>
+                        <SiteGroupOptions groups={config.site_groups} />
+                      </select>
+                    )}
                     <input
                       autoComplete="username"
                       onChange={(event) =>
@@ -2492,7 +2641,7 @@ function SitesPanel({
                         自动上传 Cookie
                         <span
                           className="help-tip"
-                          data-tooltip="本站是否纳入自动上传范围；还需开启设置页的自动上传总开关。关闭不影响手动同步和云端导入。"
+                          data-tooltip="本站是否纳入自动上传范围；还需开启所属分组的自动同步。关闭不影响手动同步和云端导入。"
                           tabIndex={0}
                         >
                           <HelpCircle size={14} />
@@ -2514,6 +2663,7 @@ function SitesPanel({
                   <div className="site-main">
                     <div className="site-title-line">
                       <strong>{site.name}</strong>
+                      {config.site_groups.length > 0 && <span className="site-login-badge">{groupName ?? "未分组"}</span>}
                       {!site.auto_keepalive ? (
                         <span className="site-login-badge disabled">
                           未启用
@@ -2642,8 +2792,9 @@ function SitesPanel({
       {batchSettingsOpen ? (
         <BatchSettingsModal
           allSites={config.sites}
-          busy={busy}
-          onBatchUpdateAutomation={onBatchUpdateAutomation}
+          busy={groupBusy}
+          groups={config.site_groups}
+          onBatchUpdateSites={onBatchUpdateSites}
           onClose={() => setBatchSettingsOpen(false)}
           onReorderSites={onReorderSites}
           sites={config.sites.filter((site) => selectedSiteIds.has(site.id))}
@@ -2703,6 +2854,12 @@ function SettingsPanel({
   const [showCookiePassword, setShowCookiePassword] = useState(false);
   const [showGotifyToken, setShowGotifyToken] = useState(false);
   const [showBarkKey, setShowBarkKey] = useState(false);
+  const inheritedCookieGroups = new Set(draft.site_groups
+    .filter((group) => group.cookie_mode === "inherit")
+    .map((group) => group.id));
+  const globalCookieSites = draft.sites.filter((site) =>
+    site.group_id == null || inheritedCookieGroups.has(site.group_id),
+  );
 
   return (
     <div className="settings-stack">
@@ -3001,7 +3158,7 @@ function SettingsPanel({
               <h2>Cookie 同步</h2>
               <span
                 className="help-tip"
-                data-tooltip="填写与 CookieCloud 插件相同的服务地址、UUID 和密码；“同步 Cookie”会把云端 Cookie 与 Local Storage 导入所选专用浏览器。"
+                data-tooltip="此处的同步和自动同步开关适用于未分组站点，以及 CookieCloud 选择「默认（跟随设置）」的分组。"
                 tabIndex={0}
               >
                 <HelpCircle size={16} />
@@ -3013,7 +3170,7 @@ function SettingsPanel({
               className="danger-action cookie-clear-action"
               disabled={cookieCloudClearBusy || cookieSyncBusy || taskRunning}
               onClick={onClearCookieCloudData}
-              title="永久清空当前配置的 CookieCloud 服务器上的 Cookie 和 Local Storage；不会删除本地浏览器数据"
+              title="永久清空设置页当前 UUID 对应的云端 Cookie 和 Local Storage"
               type="button"
             >
               {cookieCloudClearBusy ? <RefreshCw size={16} /> : <Cookie size={16} />}
@@ -3086,7 +3243,7 @@ function SettingsPanel({
               保活前自动同步
               <span
                 className="help-tip"
-                data-tooltip="每次保活开始前，从 CookieCloud 下载 Cookie 和 Local Storage 到所选专用浏览器；不会上传本地数据。"
+                data-tooltip="保活开始前，向使用此设置的分组导入 Cookie 和 Local Storage。"
                 tabIndex={0}
               >
                 <HelpCircle size={14} />
@@ -3121,7 +3278,7 @@ function SettingsPanel({
             />
           </label>
           <p className="field-hint cookiecloud-upload-summary">
-            自动上传范围：已选择 {draft.sites.filter((site) => site.cookiecloud_upload).length} / {draft.sites.length} 个站点。可在“站点”页编辑每个站点的上传开关。
+            使用此设置的站点中，{globalCookieSites.filter((site) => site.cookiecloud_upload).length} / {globalCookieSites.length} 个已开启自动上传。
           </p>
         </div>
         </section>

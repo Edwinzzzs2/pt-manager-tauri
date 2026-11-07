@@ -41,11 +41,14 @@ struct HttpResponse {
     body: String,
 }
 
+#[derive(Clone)]
 pub struct CdpClient {
     port: u16,
     browser: BrowserKind,
     // 外层 None 表示只做 CDP 操作；Some 表示必须校验浏览器当前的代理参数。
     proxy_address: Option<Option<String>>,
+    profile_group: Option<String>,
+    require_managed_profile: bool,
 }
 
 pub struct CdpLaunchResult {
@@ -119,25 +122,53 @@ impl CdpClient {
     }
 
     pub fn with_browser(port: u16, browser: BrowserKind) -> Self {
-        Self { port, browser, proxy_address: None }
+        Self { port, browser, proxy_address: None, profile_group: None, require_managed_profile: false }
+    }
+
+    pub fn for_profile(config: &AppConfig) -> Self {
+        Self {
+            profile_group: config.profile_group.clone(),
+            require_managed_profile: config.profile_group.is_some() || !config.site_groups.is_empty(),
+            ..Self::with_browser(config.cdp_port, config.browser)
+        }
     }
 
     pub fn with_config(config: &AppConfig) -> Result<Self, String> {
-        let address = crate::browser_proxy::ensure_address(&config.browser_proxy)?;
-        Ok(Self { port: config.cdp_port, browser: config.browser, proxy_address: Some(address) })
+        let address = crate::browser_proxy::ensure_address(&config.browser_proxy, config.profile_group.as_deref())?;
+        Ok(Self { proxy_address: Some(address), ..Self::for_profile(config) })
     }
 
     pub fn for_status(config: &AppConfig) -> Option<Self> {
         let address = if config.browser_proxy.enabled {
-            Some(crate::browser_proxy::active_address(&config.browser_proxy)?)
+            Some(crate::browser_proxy::active_address(&config.browser_proxy, config.profile_group.as_deref())?)
         } else {
             None
         };
-        Some(Self { port: config.cdp_port, browser: config.browser, proxy_address: Some(address) })
+        Some(Self { proxy_address: Some(address), ..Self::for_profile(config) })
     }
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    fn primary_profile(&self) -> PathBuf {
+        let default = dedicated_profile_dir(self.browser);
+        if let Some(id) = &self.profile_group {
+            let mut name = default.file_name().unwrap_or_default().to_os_string();
+            name.push(format!("-group-{id}"));
+            default.with_file_name(name)
+        } else {
+            default
+        }
+    }
+
+    fn profiles(&self) -> Vec<PathBuf> {
+        let primary = self.primary_profile();
+        if self.profile_group.is_some() {
+            vec![primary]
+        } else {
+            vec![primary, recovery_profile_dir(self.browser)]
+        }
     }
 
     /// 只复用所选浏览器的 CDP，避免端口相同时接入另一种浏览器。
@@ -149,14 +180,14 @@ impl CdpClient {
             return Some(self.port);
         }
 
-        for profile_dir in [
-            dedicated_profile_dir(self.browser),
-            recovery_profile_dir(self.browser),
-        ] {
+        if self.profile_group.is_some() {
+            return None;
+        }
+        for profile_dir in self.profiles() {
             let Some(port) = read_devtools_port(&profile_dir) else {
                 continue;
             };
-            let candidate = Self { port, browser: self.browser, proxy_address: self.proxy_address.clone() };
+            let candidate = Self { port, ..self.clone() };
             if candidate
                 .is_available_with_timeout(Duration::from_millis(600))
                 .await
@@ -192,24 +223,25 @@ impl CdpClient {
                     }
                     BrowserKind::Edge => product.starts_with("Edg/"),
                 };
-                browser_matches && self.proxy_matches(&value, timeout).unwrap_or(false)
+                browser_matches
+                    && (!self.require_managed_profile
+                        || proxy_check::uses_managed_profile(&value, &self.profiles(), timeout).unwrap_or(false))
+                    && self.proxy_matches(&value, timeout).unwrap_or(false)
             })
             .unwrap_or(false)
     }
 
     fn proxy_matches(&self, version: &serde_json::Value, timeout: Duration) -> Result<bool, String> {
         let Some(expected) = &self.proxy_address else { return Ok(true) };
-        proxy_check::matches(version, expected.as_deref(), timeout)
+        let require_direct = self.profile_group.is_some() && expected.is_none();
+        proxy_check::matches(version, expected.as_deref(), require_direct, timeout)
     }
 
     /// 在复用前确认代理参数，不能因已有 CDP 连接而悄悄使用另一个网络出口。
     async fn validate_existing_proxy(&self) -> Result<(), String> {
         if self.proxy_address.is_none() { return Ok(()) }
         let mut ports = vec![self.port];
-        for profile in [
-            dedicated_profile_dir(self.browser),
-            recovery_profile_dir(self.browser),
-        ] {
+        for profile in self.profiles() {
             if let Some(port) = read_devtools_port(&profile) { ports.push(port); }
         }
         ports.sort_unstable();
@@ -219,6 +251,11 @@ impl CdpClient {
             if !raw.is_available_with_timeout(Duration::from_millis(600)).await { continue; }
             let response = raw.request("GET", "/json/version", Duration::from_secs(2))?;
             let version = serde_json::from_str(&response.body).map_err(|err| format!("读取浏览器信息失败：{err}"))?;
+            if self.require_managed_profile
+                && !proxy_check::uses_managed_profile(&version, &self.profiles(), Duration::from_secs(2))?
+            {
+                continue;
+            }
             let matches = self.proxy_matches(&version, Duration::from_secs(2))
                 .map_err(|err| format!("{} 代理配置检查失败：{err}", self.browser.name()))?;
             if !matches {
@@ -270,6 +307,19 @@ impl CdpClient {
         }
         check_cancel(progress)?;
 
+        if self.profile_group.is_some() {
+            let profile_dir = self.primary_profile();
+            if profile_dir_in_use(&profile_dir) || !port_is_free(self.port) {
+                return Err(format!(
+                    "分组浏览器正在运行或端口 {} 已被占用，请关闭该组浏览器或更换端口",
+                    self.port
+                ));
+            }
+            return launch_and_wait(self, &profile_dir, false, initial_urls, Some(self.port), proxy_address, progress)
+                .await?
+                .ok_or_else(|| format!("未能连接分组浏览器 localhost:{}", self.port));
+        }
+
         let profile_dir = dedicated_profile_dir(self.browser);
         log_progress(
             progress,
@@ -296,7 +346,7 @@ impl CdpClient {
             )
             .await;
             if let Some(result) = launch_and_wait(
-                self.browser,
+                self,
                 &profile_dir,
                 false,
                 initial_urls,
@@ -328,7 +378,7 @@ impl CdpClient {
             )
             .await;
             if let Some(result) = launch_and_wait(
-                self.browser,
+                self,
                 &profile_dir,
                 false,
                 initial_urls,
@@ -347,7 +397,7 @@ impl CdpClient {
 
         let recovery_dir = recovery_profile_dir(self.browser);
         if let Some(result) = launch_and_wait(
-            self.browser,
+            self,
             &recovery_dir,
             true,
             initial_urls,
@@ -736,6 +786,13 @@ impl CdpClient {
 
     /// 关闭当前 CDP 浏览器实例；调用方需先确认它属于程序的专用 Profile。
     pub async fn close_browser(&self) -> Result<(), String> {
+        let mut websocket = CdpWebSocket::connect(&self.browser_session()?, Duration::from_secs(10))?;
+        websocket.call("Browser.close", serde_json::json!({}))?;
+        Ok(())
+    }
+
+    /// 同一个调试端口可能被下次启动复用，延时收尾需确认仍是原来的浏览器。
+    pub fn browser_session(&self) -> Result<String, String> {
         #[derive(Deserialize)]
         struct CdpVersion {
             #[serde(rename = "webSocketDebuggerUrl")]
@@ -748,16 +805,14 @@ impl CdpClient {
         }
         let version = serde_json::from_str::<CdpVersion>(&response.body)
             .map_err(|err| format!("解析浏览器版本信息失败: {}", err))?;
-        let mut websocket =
-            CdpWebSocket::connect(&version.web_socket_debugger_url, Duration::from_secs(10))?;
-        websocket.call("Browser.close", serde_json::json!({}))?;
-        Ok(())
+        Ok(version.web_socket_debugger_url)
     }
 
     /// 收尾时重新检查配置端口和两个专用 Profile 的端口，只关闭确认为程序 Profile 的实例。
     pub async fn close_running_dedicated_browsers(&self) -> Vec<Result<u16, String>> {
         let mut ports = vec![self.port];
-        for profile in [dedicated_profile_dir(self.browser), recovery_profile_dir(self.browser)] {
+        let profiles = self.profiles();
+        for profile in &profiles {
             if let Some(port) = read_devtools_port(&profile) {
                 ports.push(port);
             }
@@ -777,7 +832,7 @@ impl CdpClient {
                 let response = candidate.request("GET", "/json/version", Duration::from_secs(2))?;
                 let version = serde_json::from_str(&response.body)
                     .map_err(|err| format!("读取浏览器信息失败：{err}"))?;
-                proxy_check::uses_managed_profile(&version, self.browser, Duration::from_secs(2))
+                proxy_check::uses_managed_profile(&version, &profiles, Duration::from_secs(2))
             })();
             match managed {
                 Ok(true) => {
@@ -1516,7 +1571,7 @@ fn launch_urls(urls: &[String]) -> Vec<String> {
 }
 
 async fn launch_and_wait(
-    browser: BrowserKind,
+    client: &CdpClient,
     profile_dir: &Path,
     recovery: bool,
     initial_urls: &[String],
@@ -1524,6 +1579,7 @@ async fn launch_and_wait(
     proxy_address: Option<&str>,
     progress: Option<&CdpProgress>,
 ) -> Result<Option<CdpLaunchResult>, String> {
+    let browser = client.browser;
     let launch_urls = launch_urls(initial_urls);
     let mode = if recovery {
         format!("备用专用 {}", browser.name())
@@ -1544,7 +1600,7 @@ async fn launch_and_wait(
     )
     .await;
     let _ = fs::remove_file(devtools_port_path(profile_dir));
-    launch_browser(browser, profile_dir, &launch_urls, fixed_port, proxy_address)?;
+    launch_browser(browser, profile_dir, &launch_urls, fixed_port, proxy_address, client.profile_group.is_some())?;
     log_progress(progress, format!("{} 进程已启动，等待 CDP 响应", mode)).await;
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1580,7 +1636,11 @@ async fn launch_and_wait(
             )
             .await;
         }
-        let cdp = CdpClient::with_browser(port, browser);
+        let cdp = if client.require_managed_profile {
+            CdpClient { port, ..client.clone() }
+        } else {
+            CdpClient::with_browser(port, browser)
+        };
         if cdp
             .is_available_with_timeout(Duration::from_millis(800))
             .await
@@ -1628,6 +1688,7 @@ fn launch_browser(
     urls: &[String],
     fixed_port: Option<u16>,
     proxy_address: Option<&str>,
+    force_direct: bool,
 ) -> Result<(), String> {
     let browser_path = find_browser_executable(browser).ok_or_else(|| {
         format!(
@@ -1657,6 +1718,8 @@ fn launch_browser(
         command.arg(format!("--proxy-server={address}"))
             .arg("--disable-quic")
             .arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
+    } else if force_direct {
+        command.arg("--no-proxy-server");
     }
 
     for url in urls {

@@ -1,5 +1,6 @@
 use crate::store::{self, BrowserProxyConfig, LogEntry};
 use base64::Engine;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,7 +15,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
-static RELAY: OnceLock<Mutex<Option<Relay>>> = OnceLock::new();
+static RELAYS: OnceLock<Mutex<HashMap<Option<String>, Relay>>> = OnceLock::new();
 static LOGS: OnceLock<Arc<tokio::sync::Mutex<Vec<LogEntry>>>> = OnceLock::new();
 static LAST_ERROR_AT: AtomicU64 = AtomicU64::new(0);
 
@@ -65,18 +66,19 @@ pub fn normalize_config(config: &mut BrowserProxyConfig) -> Result<(), String> {
 }
 
 /// Chromium 启动参数不能直接提供代理密码。只在回环地址转发，并为上游请求补认证。
-pub fn ensure_address(config: &BrowserProxyConfig) -> Result<Option<String>, String> {
+pub fn ensure_address(config: &BrowserProxyConfig, group: Option<&str>) -> Result<Option<String>, String> {
     if !config.enabled {
         return Ok(None);
     }
     let mut config = config.clone();
     normalize_config(&mut config)?;
-    let mut current = RELAY
-        .get_or_init(|| Mutex::new(None))
+    let key = group.map(str::to_owned);
+    let mut relays = RELAYS
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| "浏览器代理状态不可用".to_string())?;
-    if let Some(relay) = current
-        .as_ref()
+    if let Some(relay) = relays
+        .get(&key)
         .filter(|relay| relay.config == config && !relay.stopped.load(Ordering::Relaxed))
     {
         return Ok(Some(relay.address.clone()));
@@ -97,7 +99,7 @@ pub fn ensure_address(config: &BrowserProxyConfig) -> Result<Option<String>, Str
         .name("browser-proxy".to_string())
         .spawn(move || accept_connections(listener, upstream_config, stop_signal))
         .map_err(|err| format!("启动浏览器代理线程失败：{err}"))?;
-    *current = Some(Relay {
+    relays.insert(key, Relay {
         config,
         address: address.clone(),
         stopped,
@@ -106,14 +108,20 @@ pub fn ensure_address(config: &BrowserProxyConfig) -> Result<Option<String>, Str
 }
 
 /// 总览状态轮询只读当前转发地址，不能重建监听器或切换其他流程正在使用的代理。
-pub fn active_address(config: &BrowserProxyConfig) -> Option<String> {
+pub fn active_address(config: &BrowserProxyConfig, group: Option<&str>) -> Option<String> {
     let mut normalized = config.clone();
     normalize_config(&mut normalized).ok()?;
-    let current = RELAY.get()?.lock().ok()?;
-    current
-        .as_ref()
+    let relays = RELAYS.get()?.lock().ok()?;
+    relays
+        .get(&group.map(str::to_owned))
         .filter(|relay| relay.config == normalized && !relay.stopped.load(Ordering::Relaxed))
         .map(|relay| relay.address.clone())
+}
+
+pub fn remove_group_relay(group: &str) {
+    if let Some(mut relays) = RELAYS.get().and_then(|relays| relays.lock().ok()) {
+        relays.remove(&Some(group.to_owned()));
+    }
 }
 
 /// 用独立的回环监听器走实际浏览器转发路径，测试草稿配置时不替换正在使用的代理。
@@ -531,6 +539,20 @@ mod tests {
         config.server_url = "https://proxy.example:443/".to_string();
         normalize_config(&mut config).unwrap();
         assert_eq!(config.server_url, "https://proxy.example");
+    }
+
+    #[test]
+    fn creating_or_removing_a_group_relay_does_not_replace_another_groups_relay() {
+        let first = test_config(3128);
+        let second = test_config(3129);
+        let first_address = ensure_address(&first, Some("test-first")).unwrap().unwrap();
+        let second_address = ensure_address(&second, Some("test-second")).unwrap().unwrap();
+        assert_ne!(first_address, second_address);
+        assert_eq!(active_address(&first, Some("test-first")), Some(first_address.clone()));
+        remove_group_relay("test-second");
+        assert!(active_address(&second, Some("test-second")).is_none());
+        assert_eq!(active_address(&first, Some("test-first")), Some(first_address));
+        remove_group_relay("test-first");
     }
 
     #[test]

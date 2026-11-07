@@ -44,6 +44,7 @@ impl Scheduler {
         config: AppConfig,
         logs: Arc<Mutex<Vec<LogEntry>>>,
         task_running: Arc<Mutex<bool>>,
+        browser_operation: Arc<Mutex<()>>,
         task_cancel_requested: Arc<AtomicBool>,
         app_handle: Option<AppHandle>,
         config_state: Option<Arc<Mutex<AppConfig>>>,
@@ -80,16 +81,27 @@ impl Scheduler {
                     .unwrap_or_else(|_| Duration::from_secs(0));
                 tokio::time::sleep(wait).await;
 
-                run_with_flag(
-                    &config,
-                    &logs,
-                    &task_running,
-                    &task_cancel_requested,
-                    true,
-                    app_handle_clone.as_ref(),
-                    config_state_clone.as_ref(),
-                )
-                .await;
+                // 重建定时器不能中断已经开始的保活或跳过浏览器收尾。
+                let config = config.clone();
+                let logs = Arc::clone(&logs);
+                let task_running = Arc::clone(&task_running);
+                let browser_operation = Arc::clone(&browser_operation);
+                let task_cancel_requested = Arc::clone(&task_cancel_requested);
+                let app_handle = app_handle_clone.clone();
+                let config_state = config_state_clone.clone();
+                let _ = tauri::async_runtime::spawn(async move {
+                    run_with_flag(
+                        &config,
+                        &logs,
+                        &task_running,
+                        &browser_operation,
+                        &task_cancel_requested,
+                        true,
+                        app_handle.as_ref(),
+                        config_state.as_ref(),
+                    )
+                    .await;
+                }).await;
             }
         });
 
@@ -105,11 +117,16 @@ pub async fn run_with_flag(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     task_running: &Arc<Mutex<bool>>,
+    browser_operation: &Arc<Mutex<()>>,
     task_cancel_requested: &Arc<AtomicBool>,
     apply_random_delay: bool,
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) {
+    let Ok(_operation) = browser_operation.try_lock() else {
+        push_log(logs, LogEntry::info("已有浏览器任务正在执行，跳过本次保活")).await;
+        return;
+    };
     {
         let mut running = task_running.lock().await;
         if *running {
@@ -131,31 +148,6 @@ pub async fn run_with_flag(
     )
     .await;
 
-    // 正常完成、提前退出和终止都在这里收尾；复用的专用浏览器也必须真正退出。
-    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
-    let close_results = cdp.close_running_dedicated_browsers().await;
-    let mut close_failed = false;
-    for result in close_results {
-        match result {
-            Ok(port) => {
-                push_log(
-                    logs,
-                    LogEntry::info(format!(
-                        "保活结束，已关闭专用 {} localhost:{port}",
-                        config.browser.name()
-                    )),
-                )
-                .await;
-            }
-            Err(err) => {
-                close_failed = true;
-                push_log(logs, LogEntry::error(err)).await;
-            }
-        }
-    }
-    if !close_failed {
-        push_log(logs, LogEntry::info("保活结束，已确认专用浏览器关闭")).await;
-    }
     if canceled {
         push_log(logs, LogEntry::info("保活任务已终止")).await;
     }
@@ -207,18 +199,6 @@ async fn run_keepalive_inner(
         }
     }
 
-    let mut cdp = match CdpClient::with_config(config) {
-        Ok(cdp) => cdp,
-        Err(message) => {
-            push_log(logs, LogEntry::error(message)).await;
-            return false;
-        }
-    };
-    if config.browser_proxy.enabled {
-        push_log(logs, LogEntry::info("浏览器代理已启用，保活、登录、签到及每日福利将通过代理访问站点")).await;
-    }
-    let had_cdp_before_sync = cdp.available_port().await.is_some();
-
     if !config.ocr_server_url.is_empty() {
         push_log(logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;
         let ocr_server_url = config.ocr_server_url.clone();
@@ -240,6 +220,98 @@ async fn run_keepalive_inner(
             }
         }
     }
+
+    let mut validated = config.clone();
+    if let Err(err) = store::normalize_site_groups(&mut validated) {
+        push_log(logs, LogEntry::error(format!("分组配置无效，未执行保活：{err}"))).await;
+        return false;
+    }
+    let config = &validated;
+    let mut summary = KeepaliveSummary::default();
+    for id in config.group_ids() {
+        if task_cancel_requested.load(Ordering::SeqCst) {
+            return true;
+        }
+        let scoped = match config.for_group(id) {
+            Ok(scoped) => scoped,
+            Err(err) => {
+                push_log(logs, LogEntry::error(err)).await;
+                continue;
+            }
+        };
+        if scoped.sites.is_empty() || (id.is_some() && !scoped.sites.iter().any(|site| site.auto_keepalive)) {
+            continue;
+        }
+        if !config.site_groups.is_empty() {
+            let message = match id.and_then(|id| config.group(id).ok()) {
+                Some(group) => format!("开始执行分组「{}」", group.name),
+                None => "开始执行未分组站点".to_string(),
+            };
+            push_log(logs, LogEntry::info(message)).await;
+        }
+        let canceled = run_keepalive_group(&scoped, logs, task_cancel_requested, app_handle, config_state, &mut summary).await;
+        // 只清理参与本轮执行的分组，不关闭尚未执行分组的浏览器。
+        close_group_browsers(&scoped, logs).await;
+        if canceled {
+            return true;
+        }
+    }
+    if summary.completed {
+        send_notification_summary(config, logs, &summary.successful_logins, &summary.failed_logins, &summary.signin, &summary.traffic).await;
+    }
+    false
+}
+
+#[derive(Default)]
+struct KeepaliveSummary {
+    completed: bool,
+    successful_logins: Vec<String>,
+    failed_logins: Vec<(String, String)>,
+    signin: Vec<(String, SigninResult)>,
+    traffic: Vec<(String, SiteTraffic)>,
+}
+
+impl KeepaliveSummary {
+    fn record(
+        &mut self,
+        config: &AppConfig,
+        successful: Vec<String>,
+        failed: Vec<(String, String)>,
+        signin: Vec<(String, SigninResult)>,
+        traffic: Vec<(String, SiteTraffic)>,
+    ) {
+        let group = config.profile_group.as_deref().and_then(|id| config.group(id).ok());
+        let label = |site: String| match group {
+            Some(group) => format!("{} · {site}", group.name),
+            None => site,
+        };
+        self.completed = true;
+        self.successful_logins.extend(successful.into_iter().map(label));
+        self.failed_logins.extend(failed.into_iter().map(|(site, error)| (label(site), error)));
+        self.signin.extend(signin.into_iter().map(|(site, result)| (label(site), result)));
+        self.traffic.extend(traffic.into_iter().map(|(site, result)| (label(site), result)));
+    }
+}
+
+async fn run_keepalive_group(
+    config: &AppConfig,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    task_cancel_requested: &Arc<AtomicBool>,
+    app_handle: Option<&AppHandle>,
+    config_state: Option<&Arc<Mutex<AppConfig>>>,
+    summary: &mut KeepaliveSummary,
+) -> bool {
+    let mut cdp = match CdpClient::with_config(config) {
+        Ok(cdp) => cdp,
+        Err(message) => {
+            push_log(logs, LogEntry::error(message)).await;
+            return false;
+        }
+    };
+    if config.browser_proxy.enabled {
+        push_log(logs, LogEntry::info("浏览器代理已启用，保活、登录、签到及每日福利将通过代理访问站点")).await;
+    }
+    let had_cdp_before_sync = cdp.available_port().await.is_some();
 
     if config.auto_sync_cookie {
         match sync_cookiecloud_before_keepalive(config, logs, task_cancel_requested).await {
@@ -345,6 +417,7 @@ async fn run_keepalive_inner(
         launched_browser,
         app_handle,
         config_state,
+        summary,
     )
     .await
 }
@@ -354,15 +427,14 @@ async fn sync_cookiecloud_before_keepalive(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     task_cancel_requested: &Arc<AtomicBool>,
 ) -> Result<(usize, usize), String> {
+    let sites: Vec<Site> = config.sites.iter().filter(|site| config.can_sync_site(site)).cloned().collect();
+    if sites.is_empty() {
+        return Err("同域名的账号共用全局 CookieCloud，已跳过导入；可为本组配置独立 UUID".to_string());
+    }
     push_log(logs, LogEntry::info("保活前自动同步 CookieCloud")).await;
 
-    let cookiecloud_config = config.cookiecloud.clone();
-    let payload = tauri::async_runtime::spawn_blocking(move || {
-        cookiecloud::fetch_sync_payload(&cookiecloud_config)
-    })
-    .await
-    .map_err(|err| err.to_string())??;
-    let sync_data = cookiecloud::sync_data_from_cookiecloud(payload, &config.sites)?;
+    let payload = cookiecloud::fetch_for_import(&config.cookiecloud).await?;
+    let sync_data = cookiecloud::sync_data_from_cookiecloud(payload, &sites)?;
     if sync_data.cookies.is_empty() && sync_data.local_storages.is_empty() {
         return Err("CookieCloud 未解析到可同步的 Cookie 或 Local Storage".to_string());
     }
@@ -388,8 +460,7 @@ async fn sync_cookiecloud_before_keepalive(
         .sum::<usize>();
 
     // Cookie/Local Storage 写入后刷新已打开的站点页面，使新登录态在保活执行前立即生效。
-    let site_urls: Vec<String> = config
-        .sites
+    let site_urls: Vec<String> = sites
         .iter()
         .filter(|s| s.auto_keepalive)
         .map(|s| s.url.clone())
@@ -400,12 +471,16 @@ async fn sync_cookiecloud_before_keepalive(
 
     if !opened_sync_tabs.is_empty() {
         let logs = Arc::clone(logs);
+        let cdp = CdpClient::new(active_port);
+        let session = cdp.browser_session().ok();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(
                 cookiecloud::SYNC_BROWSER_CLOSE_DELAY_SECONDS,
             ))
             .await;
-            let cdp = CdpClient::new(active_port);
+            if session.is_none() || cdp.browser_session().ok() != session {
+                return;
+            }
             let mut closed = 0usize;
             for tab_id in opened_sync_tabs {
                 if cdp.close_tab(&tab_id).await.is_ok() {
@@ -463,7 +538,7 @@ async fn sync_cookiecloud_after_keepalive(
     let upload_sites = config
         .sites
         .iter()
-        .filter(|site| site.cookiecloud_upload)
+        .filter(|site| site.cookiecloud_upload && config.can_sync_site(site))
         .cloned()
         .collect::<Vec<_>>();
     if upload_sites.is_empty() {
@@ -820,6 +895,7 @@ async fn run_keepalive_batch(
     launched_browser: bool,
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
+    summary: &mut KeepaliveSummary,
 ) -> bool {
     let mut opened_tabs: Vec<(String, String)> = Vec::new();
     let mut login_jobs: Vec<JoinHandle<SiteTaskResult>> = Vec::new();
@@ -1112,15 +1188,7 @@ async fn run_keepalive_batch(
     if opened_tabs.is_empty() {
         push_log(logs, LogEntry::error("没有成功打开任何站点，保活任务结束")).await;
         close_browser_instance(cdp, logs, launched_browser).await;
-        send_notification_summary(
-            config,
-            logs,
-            &successful_logins,
-            &failed_logins,
-            &signin_results,
-            &traffic_results,
-        )
-        .await;
+        summary.record(config, successful_logins, failed_logins, signin_results, traffic_results);
         return false;
     }
 
@@ -1166,16 +1234,11 @@ async fn run_keepalive_batch(
         }
     }
 
-    push_log(logs, LogEntry::success("保活任务全部完成".to_string())).await;
-    send_notification_summary(
-        config,
-        logs,
-        &successful_logins,
-        &failed_logins,
-        &signin_results,
-        &traffic_results,
-    )
-    .await;
+    let completion = config.profile_group.as_deref()
+        .and_then(|id| config.group(id).ok())
+        .map_or_else(|| "保活任务全部完成".to_string(), |group| format!("分组「{}」保活完成", group.name));
+    push_log(logs, LogEntry::success(completion)).await;
+    summary.record(config, successful_logins, failed_logins, signin_results, traffic_results);
     false
 }
 
@@ -1251,6 +1314,27 @@ async fn close_browser_instance(
         .await;
     } else {
         push_log(logs, LogEntry::info("已关闭本次保活启动的专用浏览器实例")).await;
+    }
+}
+
+async fn close_group_browsers(config: &AppConfig, logs: &Arc<Mutex<Vec<LogEntry>>>) {
+    let results = CdpClient::for_profile(config).close_running_dedicated_browsers().await;
+    let mut failed = false;
+    for result in results {
+        match result {
+            Ok(port) => {
+                push_log(logs, LogEntry::info(format!(
+                    "保活结束，已关闭专用 {} localhost:{port}", config.browser.name()
+                ))).await;
+            }
+            Err(err) => {
+                failed = true;
+                push_log(logs, LogEntry::error(err)).await;
+            }
+        }
+    }
+    if !failed {
+        push_log(logs, LogEntry::info("保活结束，已确认专用浏览器关闭")).await;
     }
 }
 

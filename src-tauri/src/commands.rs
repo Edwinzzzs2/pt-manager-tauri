@@ -10,7 +10,8 @@ use crate::scheduler;
 use crate::store::{self, AppConfig, LogEntry};
 use crate::updater;
 use chrono::{DateTime, Local};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,8 +31,14 @@ pub struct AppState {
     pub logs: Arc<Mutex<Vec<LogEntry>>>,
     pub scheduler: Arc<Mutex<scheduler::Scheduler>>,
     pub task_running: Arc<Mutex<bool>>,
+    pub browser_operation: Arc<Mutex<()>>,
     pub task_cancel_requested: Arc<AtomicBool>,
     pub app_handle: tauri::AppHandle,
+}
+
+fn lock_browser_operation(state: &AppState) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    state.browser_operation.try_lock()
+        .map_err(|_| "已有浏览器任务正在执行，请等待结束后重试".to_string())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,12 +52,14 @@ pub struct AppStatus {
     pub cancel_requested: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CookieCloudSyncResult {
     pub matched_cookies: usize,
     pub imported_cookies: usize,
     pub matched_local_storages: usize,
     pub imported_local_storages: usize,
+    pub synced_groups: usize,
+    pub failed_groups: usize,
 }
 
 #[tauri::command]
@@ -72,6 +81,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String>
 
 #[tauri::command]
 pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> Result<(), String> {
+    let _operation = lock_browser_operation(&state)?;
     {
         let current = state.config.lock().await;
         for site in &mut config.sites {
@@ -94,10 +104,7 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     config.update_check_interval_hours = config.update_check_interval_hours.clamp(1, 168);
     config.update_proxy_url = updater::normalize_proxy_url(&config.update_proxy_url)?;
     crate::browser_proxy::normalize_config(&mut config.browser_proxy)?;
-    let proxy_changed = state.config.lock().await.browser_proxy != config.browser_proxy;
-    if proxy_changed && *state.task_running.lock().await {
-        return Err("保活任务执行中，请等待任务结束后修改浏览器代理".to_string());
-    }
+    store::normalize_site_groups(&mut config)?;
     config.gotify.server_url = config
         .gotify
         .server_url
@@ -177,6 +184,7 @@ pub async fn add_site(
     state: State<'_, AppState>,
     name: String,
     url: String,
+    group_id: Option<String>,
     username: String,
     password: String,
     totp_secret: String,
@@ -186,11 +194,14 @@ pub async fn add_site(
     auto_daily_bonus: bool,
     cookiecloud_upload: bool,
 ) -> Result<AppConfig, String> {
+    let _operation = lock_browser_operation(&state)?;
     let mut config = state.config.lock().await;
+    config.validate_account_group(group_id.as_deref(), &url, &username, None)?;
     let site = store::Site {
         id: uuid::Uuid::new_v4().to_string(),
         name,
         url,
+        group_id,
         username,
         password,
         totp_secret: totp_secret.trim().replace(' ', ""),
@@ -243,6 +254,7 @@ pub async fn update_site(
     id: String,
     name: String,
     url: String,
+    group_id: Option<String>,
     username: String,
     password: String,
     totp_secret: String,
@@ -252,10 +264,13 @@ pub async fn update_site(
     auto_daily_bonus: bool,
     cookiecloud_upload: bool,
 ) -> Result<AppConfig, String> {
+    let _operation = lock_browser_operation(&state)?;
     let mut config = state.config.lock().await;
+    config.validate_account_group(group_id.as_deref(), &url, &username, Some(&id))?;
     if let Some(site) = config.sites.iter_mut().find(|s| s.id == id) {
         site.name = name;
         site.url = url;
+        site.group_id = group_id;
         site.username = username;
         site.password = password;
         site.totp_secret = totp_secret.trim().replace(' ', "");
@@ -273,15 +288,107 @@ pub async fn update_site(
 }
 
 #[tauri::command]
+pub async fn batch_update_sites(
+    state: State<'_, AppState>,
+    updates: HashMap<String, store::SiteAutomationUpdate>,
+    group_move: Option<BatchSiteGroupMove>,
+) -> Result<AppConfig, String> {
+    let _operation = lock_browser_operation(&state)?;
+    let mut config = state.config.lock().await;
+    if updates.is_empty() {
+        return Err("请选择需要修改的站点".to_string());
+    }
+    let destination = group_move.as_ref().map(|movement| movement.group_id.as_deref());
+    let next = config.with_batch_site_settings(&updates, destination)?;
+    store::save_config(&state.app_handle, &next);
+    *config = next.clone();
+    drop(config);
+    restart_scheduler(&state, next.clone()).await;
+    Ok(next)
+}
+
+#[derive(Deserialize)]
+pub struct BatchSiteGroupMove {
+    group_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn save_site_group(
+    state: State<'_, AppState>,
+    mut group: store::SiteGroup,
+    show_on_startup: Option<bool>,
+) -> Result<AppConfig, String> {
+    let _operation = lock_browser_operation(&state)?;
+    let mut config = state.config.lock().await;
+    let mut next = config.clone();
+    let is_new = group.id.is_empty();
+    if is_new {
+        group.id = uuid::Uuid::new_v4().to_string();
+    }
+    match show_on_startup {
+        Some(true) => next.startup_group_id = Some(group.id.clone()),
+        Some(false) if next.startup_group_id.as_deref() == Some(group.id.as_str()) => {
+            next.startup_group_id = None;
+        }
+        _ => {}
+    }
+    if is_new {
+        next.site_groups.push(group);
+    } else {
+        let current = config.group(&group.id)?;
+        if (current.cdp_port != group.cdp_port || current.browser_proxy != group.browser_proxy)
+            && CdpClient::for_profile(&config.for_group(Some(&group.id))?).available_port().await.is_some()
+        {
+            return Err("请关闭该分组的专用浏览器，再修改代理或调试端口".to_string());
+        }
+        let index = next.site_groups.iter().position(|current| current.id == group.id)
+            .ok_or_else(|| "所选站点分组已不存在".to_string())?;
+        next.site_groups[index] = group;
+    }
+    store::normalize_site_groups(&mut next)?;
+    store::save_config(&state.app_handle, &next);
+    *config = next.clone();
+    drop(config);
+    restart_scheduler(&state, next.clone()).await;
+    Ok(next)
+}
+
+#[tauri::command]
+pub async fn remove_site_group(state: State<'_, AppState>, id: String) -> Result<AppConfig, String> {
+    let _operation = lock_browser_operation(&state)?;
+    let mut config = state.config.lock().await;
+    let scoped = config.for_group(Some(&id))?;
+    if !scoped.sites.is_empty() {
+        return Err("请先把该分组内的站点移到其他分组".to_string());
+    }
+    if CdpClient::for_profile(&scoped).available_port().await.is_some() {
+        return Err("请先关闭该分组的专用浏览器".to_string());
+    }
+    config.site_groups.retain(|group| group.id != id);
+    if config.startup_group_id.as_deref() == Some(id.as_str()) {
+        config.startup_group_id = None;
+    }
+    store::save_config(&state.app_handle, &config);
+    crate::browser_proxy::remove_group_relay(&id);
+    let next = config.clone();
+    drop(config);
+    restart_scheduler(&state, next.clone()).await;
+    Ok(next)
+}
+
+#[tauri::command]
 pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let _operation = lock_browser_operation(&state)?;
     state.task_cancel_requested.store(false, Ordering::SeqCst);
-    let config = state.config.lock().await.clone();
+    let mut config = state.config.lock().await.clone();
+    store::normalize_site_groups(&mut config)?;
     let site = config
         .sites
         .iter()
         .find(|site| site.id == id)
         .cloned()
         .ok_or_else(|| "未找到要测试的站点".to_string())?;
+    let config = config.for_group(site.group_id.as_deref())?;
     let adapter = SiteAdapter::from_url(&site.url);
     let is_nexusphp = adapter == SiteAdapter::NexusPhp;
     let login_attempt_threshold = store::effective_login_attempt_threshold(
@@ -449,7 +556,7 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         }
     }
 
-    if config.auto_sync_cookie_after_keepalive && site.cookiecloud_upload {
+    if config.auto_sync_cookie_after_keepalive && site.cookiecloud_upload && config.can_sync_site(&site) {
         push_log(
             &state.logs,
             LogEntry::info(format!(
@@ -520,6 +627,7 @@ pub async fn recognize_site_captcha(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<String, String> {
+    let _operation = lock_browser_operation(&state)?;
     let config = state.config.lock().await.clone();
     let site = config
         .sites
@@ -527,6 +635,7 @@ pub async fn recognize_site_captcha(
         .find(|site| site.id == id)
         .cloned()
         .ok_or_else(|| "未找到要识别验证码的站点".to_string())?;
+    let config = config.for_group(site.group_id.as_deref())?;
     if SiteAdapter::from_url(&site.url) != SiteAdapter::NexusPhp {
         return Err("当前验证码识别仅支持 NexusPHP 架构的站点".to_string());
     }
@@ -707,19 +816,31 @@ pub async fn recognize_site_captcha(
 #[tauri::command]
 pub async fn check_cdp(state: State<'_, AppState>) -> Result<bool, String> {
     let config = state.config.lock().await.clone();
-    match CdpClient::for_status(&config) {
-        Some(cdp) => Ok(cdp.available_port().await.is_some()),
-        None => Ok(false),
+    Ok(active_cdp_port(&config).await.is_some())
+}
+
+async fn active_cdp_port(config: &AppConfig) -> Option<u16> {
+    for id in config.group_ids() {
+        let Ok(scoped) = config.for_group(id) else { continue };
+        if let Some(cdp) = CdpClient::for_status(&scoped) {
+            if let Some(port) = cdp.available_port().await {
+                return Some(port);
+            }
+        }
     }
+    None
 }
 
 #[tauri::command]
 pub async fn sync_cookiecloud_cookies(
     state: State<'_, AppState>,
     cookies: serde_json::Value,
+    cookiecloud: Option<store::CookieCloudConfig>,
 ) -> Result<CookieCloudSyncResult, String> {
-    let config = { state.config.lock().await.clone() };
-    import_cookiecloud_cookies(&state, &config, cookies).await
+    let _operation = lock_browser_operation(&state)?;
+    state.task_cancel_requested.store(false, Ordering::SeqCst);
+    let config = global_cookiecloud_config(&state, cookiecloud).await?;
+    import_global_cookiecloud(&state, &config, cookies).await
 }
 
 #[tauri::command]
@@ -727,14 +848,75 @@ pub async fn sync_cookiecloud_from_config(
     state: State<'_, AppState>,
     config: AppConfig,
 ) -> Result<CookieCloudSyncResult, String> {
+    let _operation = lock_browser_operation(&state)?;
+    state.task_cancel_requested.store(false, Ordering::SeqCst);
+    let config = global_cookiecloud_config(&state, Some(config.cookiecloud)).await?;
     let cookiecloud_config = config.cookiecloud.clone();
-    let payload = tauri::async_runtime::spawn_blocking(move || {
-        cookiecloud::fetch_sync_payload(&cookiecloud_config)
-    })
-    .await
-    .map_err(|err| err.to_string())??;
+    let payload = tauri::async_runtime::spawn_blocking(move || cookiecloud::fetch_sync_payload(&cookiecloud_config))
+        .await
+        .map_err(|err| err.to_string())??;
 
-    import_cookiecloud_cookies(&state, &config, payload).await
+    import_global_cookiecloud(&state, &config, payload).await
+}
+
+async fn global_cookiecloud_config(
+    state: &State<'_, AppState>,
+    draft: Option<store::CookieCloudConfig>,
+) -> Result<AppConfig, String> {
+    let mut config = state.config.lock().await.clone();
+    if let Some(draft) = draft {
+        config.cookiecloud = draft;
+    }
+    store::normalize_site_groups(&mut config)?;
+    Ok(config)
+}
+
+async fn import_global_cookiecloud(
+    state: &State<'_, AppState>,
+    config: &AppConfig,
+    payload: serde_json::Value,
+) -> Result<CookieCloudSyncResult, String> {
+    let mut summary = CookieCloudSyncResult::default();
+    let mut first_error = None;
+    for group_id in config.global_cookiecloud_group_ids() {
+        let mut scoped = config.for_group(group_id)?;
+        if scoped.sites.is_empty() {
+            continue;
+        }
+        if state.task_cancel_requested.load(Ordering::SeqCst) {
+            return Err(cdp::CDP_CANCELLED.to_string());
+        }
+        let group_name = match group_id {
+            Some(id) => config.group(id)?.name.as_str(),
+            None => "未分组站点",
+        };
+        scoped.sites = scoped.sites.iter().filter(|site| scoped.can_sync_site(site)).cloned().collect();
+        let result = if scoped.sites.is_empty() {
+            Err("同域名账号共用全局 CookieCloud，已跳过；可为本组配置独立 UUID".to_string())
+        } else {
+            import_cookiecloud_cookies(state, &scoped, payload.clone()).await
+        };
+        match result {
+            Ok(result) => {
+                summary.synced_groups += 1;
+                summary.matched_cookies += result.matched_cookies;
+                summary.imported_cookies += result.imported_cookies;
+                summary.matched_local_storages += result.matched_local_storages;
+                summary.imported_local_storages += result.imported_local_storages;
+            }
+            Err(err) if err == cdp::CDP_CANCELLED => return Err(err),
+            Err(err) => {
+                summary.failed_groups += 1;
+                let message = format!("分组「{group_name}」CookieCloud 同步未完成：{err}");
+                push_log(&state.logs, LogEntry::error(message.clone())).await;
+                first_error.get_or_insert(message);
+            }
+        }
+    }
+    if summary.synced_groups == 0 {
+        return Err(first_error.unwrap_or_else(|| "使用默认 CookieCloud 设置的分组没有可同步的站点".to_string()));
+    }
+    Ok(summary)
 }
 
 async fn import_cookiecloud_cookies(
@@ -804,14 +986,22 @@ async fn import_cookiecloud_cookies(
         .reload_tabs_for_sites(&site_urls)
         .await;
 
+    // 分组浏览器保留给后续单站测试，仅收回同步打开的标签页。
+    let launched_sync_browser = launched_sync_browser && config.profile_group.is_none();
     if launched_sync_browser || !opened_sync_tabs.is_empty() {
         let logs = Arc::clone(&state.logs);
+        let operation = Arc::clone(&state.browser_operation);
+        let cdp = CdpClient::new(write_port);
+        let session = cdp.browser_session().ok();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(
                 cookiecloud::SYNC_BROWSER_CLOSE_DELAY_SECONDS,
             ))
             .await;
-            let cdp = CdpClient::new(write_port);
+            let Ok(_operation) = operation.try_lock() else { return };
+            if session.is_none() || cdp.browser_session().ok() != session {
+                return;
+            }
             if launched_sync_browser {
                 let entry = match cdp.close_browser().await {
                     Ok(()) => LogEntry::info("Cookie 同步启动的专用浏览器已自动关闭"),
@@ -846,7 +1036,11 @@ async fn import_cookiecloud_cookies(
         imported_cookies: imported_cookie_params.len(),
         matched_local_storages: local_storage_item_count(&sync_data.local_storages),
         imported_local_storages: local_storage_item_count(&imported_local_storages),
+        ..CookieCloudSyncResult::default()
     };
+    if result.imported_cookies == 0 && result.imported_local_storages == 0 {
+        return Err("匹配到了云端登录数据，但浏览器没有成功写入".to_string());
+    }
     // 匹配站点按 CookieCloud 解析命中统计；写入数量另算，方便区分“没匹配到”和“匹配到但写入失败”。
     let site_match =
         site_match_summary(&config.sites, &sync_data.cookies, &sync_data.local_storages);
@@ -1059,10 +1253,7 @@ fn is_connection_refused(message: &str) -> bool {
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
     let config = state.config.lock().await.clone();
-    let active_cdp_port = match CdpClient::for_status(&config) {
-        Some(cdp) => cdp.available_port().await,
-        None => None,
-    };
+    let active_cdp_port = active_cdp_port(&config).await;
     let cdp_connected = active_cdp_port.is_some();
     let browser_installed = cdp::browser_installed(config.browser);
     let next_run = state.scheduler.lock().await.next_run().await;
@@ -1086,6 +1277,7 @@ pub async fn run_task(state: State<'_, AppState>) -> Result<(), String> {
     let config = { state.config.lock().await.clone() };
     let logs = Arc::clone(&state.logs);
     let task_running = Arc::clone(&state.task_running);
+    let browser_operation = Arc::clone(&state.browser_operation);
     let task_cancel_requested = Arc::clone(&state.task_cancel_requested);
     let app_handle = state.app_handle.clone();
     let config_state = Arc::clone(&state.config);
@@ -1094,6 +1286,7 @@ pub async fn run_task(state: State<'_, AppState>) -> Result<(), String> {
             &config,
             &logs,
             &task_running,
+            &browser_operation,
             &task_cancel_requested,
             false,
             Some(&app_handle),
@@ -1137,17 +1330,15 @@ pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn clear_browser_data(state: State<'_, AppState>) -> Result<(), String> {
-    if *state.task_running.lock().await {
-        return Err("保活任务执行中，请等待结束后再清除浏览器数据".to_string());
-    }
+    let _operation = lock_browser_operation(&state)?;
 
-    let config = state.config.lock().await.clone();
+    let config = state.config.lock().await.for_group(None)?;
     let site_urls = config
         .sites
         .iter()
         .map(|site| site.url.clone())
         .collect::<Vec<_>>();
-    let cdp = CdpClient::with_browser(config.cdp_port, config.browser);
+    let cdp = CdpClient::for_profile(&config);
     let message = if let Some(active_port) = cdp.available_port().await {
         CdpClient::new(active_port)
             .clear_browser_data(&site_urls)
@@ -1178,11 +1369,9 @@ pub async fn clear_cookiecloud_data(
     state: State<'_, AppState>,
     config: crate::store::CookieCloudConfig,
 ) -> Result<(), String> {
-    if *state.task_running.lock().await {
-        return Err("保活任务执行中，请等待结束后再清空 CookieCloud 数据".to_string());
-    }
-
-    cookiecloud::clear_cloud_data(&config).await?;
+    let _operation = lock_browser_operation(&state)?;
+    let config = global_cookiecloud_config(&state, Some(config)).await?;
+    cookiecloud::clear_cloud_data(&config.cookiecloud).await?;
 
     push_log(
         &state.logs,
@@ -1229,6 +1418,7 @@ async fn restart_scheduler(state: &State<'_, AppState>, config: AppConfig) {
         config,
         Arc::clone(&state.logs),
         Arc::clone(&state.task_running),
+        Arc::clone(&state.browser_operation),
         Arc::clone(&state.task_cancel_requested),
         Some(state.app_handle.clone()),
         Some(Arc::clone(&state.config)),
@@ -1358,6 +1548,7 @@ pub async fn export_config(state: State<'_, AppState>, path: String) -> Result<(
 
 #[tauri::command]
 pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<AppConfig, String> {
+    let _operation = lock_browser_operation(&state)?;
     let json_content =
         std::fs::read_to_string(&path).map_err(|err| format!("读取配置文件失败: {}", err))?;
     let mut new_config: AppConfig = serde_json::from_str(&json_content)
@@ -1365,10 +1556,7 @@ pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<A
     new_config.update_check_interval_hours = new_config.update_check_interval_hours.clamp(1, 168);
     new_config.update_proxy_url = updater::normalize_proxy_url(&new_config.update_proxy_url)?;
     crate::browser_proxy::normalize_config(&mut new_config.browser_proxy)?;
-    let proxy_changed = state.config.lock().await.browser_proxy != new_config.browser_proxy;
-    if proxy_changed && *state.task_running.lock().await {
-        return Err("保活任务执行中，请等待任务结束后导入不同的浏览器代理配置".to_string());
-    }
+    store::normalize_site_groups(&mut new_config)?;
     apply_auto_launch(&state.app_handle, new_config.auto_launch)?;
 
     let mut config = state.config.lock().await;

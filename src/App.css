@@ -296,9 +296,15 @@ button span,
 
 .topbar-actions {
   display: flex;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 10px;
+}
+
+.topbar-actions button {
+  white-space: nowrap;
 }
 
 .eyebrow {
@@ -938,6 +944,21 @@ select:focus {
   white-space: nowrap;
 }
 
+.site-group-filter {
+  width: auto;
+  max-width: 160px;
+  height: 34px;
+}
+
+.site-group-hint {
+  color: var(--color-fg-muted);
+  font-size: 12px;
+}
+
+.site-group-footer .danger-action {
+  margin-right: auto;
+}
+
 .site-selection-bar label {
   display: inline-flex;
   align-items: center;
@@ -966,13 +987,6 @@ select:focus {
   flex-direction: column;
   gap: 12px;
   overflow: hidden;
-}
-
-.site-add-button {
-  flex: 0 0 auto;
-  min-height: 34px;
-  margin-left: auto;
-  white-space: nowrap;
 }
 
 .app-dialog {
@@ -2023,6 +2037,21 @@ html[data-theme="light"] .log-level-filter select {
   border-bottom: 1px solid var(--color-border);
   color: var(--color-fg-muted);
   font-size: 13px;
+}
+
+.batch-group-field {
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.batch-group-field select {
+  width: auto;
+  max-width: 180px;
+}
+
+.batch-settings-footer .app-dialog-error {
+  margin: 0;
 }
 
 .batch-settings-quick-actions,

@@ -202,6 +202,17 @@ async fn fetch_sync_payload_async(config: &CookieCloudConfig) -> Result<Value, S
     Err(format!("读取 CookieCloud 当前数据失败：{}", last_error))
 }
 
+/// HTTPS 同步也需要能在无界面的定时任务中运行。
+pub async fn fetch_for_import(config: &CookieCloudConfig) -> Result<Value, String> {
+    if config.server_url.trim().starts_with("https://") {
+        return fetch_sync_payload_async(config).await;
+    }
+    let config = config.clone();
+    tauri::async_runtime::spawn_blocking(move || fetch_sync_payload(&config))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 fn prepare_upload_request(
     config: &CookieCloudConfig,
     sites: &[Site],

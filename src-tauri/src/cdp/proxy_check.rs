@@ -1,7 +1,7 @@
-use super::{dedicated_profile_dir, recovery_profile_dir, BrowserKind, CdpWebSocket};
+use super::CdpWebSocket;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -26,18 +26,20 @@ static SETTINGS: OnceLock<Mutex<HashMap<String, ProxySettings>>> = OnceLock::new
 pub(super) fn matches(
     version: &serde_json::Value,
     expected: Option<&str>,
+    require_direct: bool,
     timeout: Duration,
 ) -> Result<bool, String> {
     let settings = process_settings(version, timeout)?;
     Ok(settings.server.as_deref() == expected
         && !settings.other_proxy
+        && (!require_direct || settings.forced_direct)
         && (expected.is_none() || !settings.forced_direct))
 }
 
 /// 只允许收尾流程关闭使用 PT Manager 专用 Profile 的浏览器。
 pub(super) fn uses_managed_profile(
     version: &serde_json::Value,
-    browser: BrowserKind,
+    profiles: &[PathBuf],
     timeout: Duration,
 ) -> Result<bool, String> {
     let settings = process_settings(version, timeout)?;
@@ -46,11 +48,7 @@ pub(super) fn uses_managed_profile(
     };
     let actual =
         std::fs::canonicalize(actual).map_err(|_| "无法确认浏览器的 Profile 路径".to_string())?;
-    Ok([
-        dedicated_profile_dir(browser),
-        recovery_profile_dir(browser),
-    ]
-    .iter()
+    Ok(profiles.iter()
     .filter_map(|path| std::fs::canonicalize(path).ok())
     .any(|expected| same_profile_path(&actual, &expected)))
 }
