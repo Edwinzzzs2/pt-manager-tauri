@@ -14,6 +14,7 @@ const SUBMIT_SELECTOR: &str = ".auth-card button.n-button--primary-type";
 #[serde(rename_all = "camelCase")]
 struct LoginPageState {
     ready: bool,
+    blank: bool,
     host: String,
     path: String,
     logged_in: bool,
@@ -78,6 +79,9 @@ impl CdpClient {
             check_cancel(progress)?;
             tokio::time::sleep(Duration::from_millis(250)).await;
             let Some(state) = page_state(&mut websocket) else { continue };
+            if state.blank {
+                continue;
+            }
             ensure_site(&state)?;
             if state.ready {
                 dismiss_announcement(&mut websocket, progress).await?;
@@ -103,7 +107,8 @@ async fn wait_for_page(
 ) -> Result<LoginPageState, String> {
     for _ in 0..160 {
         check_cancel(progress)?;
-        if let Some(state) = page_state(websocket) {
+        // 新标签页首个文档可能仍是 about:blank，此时尚未到达站点。
+        if let Some(state) = page_state(websocket).filter(|state| !state.blank) {
             ensure_site(&state)?;
             if state.ready {
                 dismiss_announcement(websocket, progress).await?;
@@ -124,8 +129,13 @@ async fn wait_for_page(
 fn ensure_site(state: &LoginPageState) -> Result<(), String> {
     if matches!(state.host.as_str(), "jying.top" | "www.jying.top") {
         Ok(())
+    } else if state.host.is_empty() || state.host == "chromewebdata" {
+        Err("聚影未加载出站点页面，请检查浏览器和网络".to_string())
     } else {
-        Err("聚影页面跳转到了其他域名，已停止填写登录信息".to_string())
+        Err(format!(
+            "聚影页面跳转到了其他域名（{}），已停止填写登录信息",
+            state.host
+        ))
     }
 }
 
@@ -152,6 +162,7 @@ const LOGIN_STATE_EXPRESSION: &str = r#"(() => {
         .map(clean).filter(text => text && text.length < 240);
     return {
         ready: document.readyState === 'interactive' || document.readyState === 'complete',
+        blank: location.href === 'about:blank',
         host: location.hostname.toLowerCase(),
         path: location.pathname,
         loggedIn: Boolean(account) && location.pathname !== '/login' && !password,

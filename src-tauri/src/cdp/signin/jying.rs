@@ -9,6 +9,7 @@ use std::time::Duration;
 #[serde(rename_all = "camelCase")]
 struct CheckinPageState {
     ready: bool,
+    blank: bool,
     host: String,
     path: String,
     has_login_form: bool,
@@ -45,8 +46,17 @@ impl CdpClient {
             check_cancel(progress)?;
             tokio::time::sleep(Duration::from_millis(500)).await;
             let Some(state) = inspect_page(&mut websocket) else { continue };
+            if state.blank {
+                continue;
+            }
             if !matches!(state.host.as_str(), "jying.top" | "www.jying.top") {
-                return Ok(SigninResult::failure("聚影签到页跳转到其他域名，已停止操作"));
+                if state.host.is_empty() || state.host == "chromewebdata" {
+                    return Ok(SigninResult::failure("聚影签到页加载失败，请检查浏览器和网络"));
+                }
+                return Ok(SigninResult::failure(format!(
+                    "聚影签到页跳转到其他域名（{}），已停止操作",
+                    state.host
+                )));
             }
             if !state.ready { continue; }
             dismiss_announcement(&mut websocket, progress).await?;
@@ -114,6 +124,7 @@ const CHECKIN_STATE_EXPRESSION: &str = r#"(() => {
         .map(clean).filter(text => text && text.length < 240);
     return {
         ready: document.readyState === 'interactive' || document.readyState === 'complete',
+        blank: location.href === 'about:blank',
         host: location.hostname.toLowerCase(),
         path: location.pathname,
         hasLoginForm: Boolean(document.querySelector('.auth-card input[type="password"]')),

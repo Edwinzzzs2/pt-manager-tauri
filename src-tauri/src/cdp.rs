@@ -1302,7 +1302,9 @@ impl CdpWebSocket {
         self.write_frame(0x1, request.to_string().as_bytes())?;
 
         loop {
-            let message = self.read_message()?;
+            let message = self
+                .read_message()
+                .map_err(|err| format!("{method}：{err}"))?;
             let value = serde_json::from_str::<serde_json::Value>(&message)
                 .map_err(|err| format!("CDP WebSocket 响应解析失败：{}", err))?;
             if value.get("id").and_then(|value| value.as_u64()) == Some(id) {
@@ -1345,7 +1347,12 @@ impl CdpWebSocket {
             let mut header = [0_u8; 2];
             self.stream
                 .read_exact(&mut header)
-                .map_err(|err| format!("读取 CDP WebSocket 帧失败：{}", err))?;
+                .map_err(|err| match err.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        "等待浏览器 CDP 响应超时".to_string()
+                    }
+                    _ => format!("读取 CDP WebSocket 帧失败：{err}"),
+                })?;
             let opcode = header[0] & 0x0f;
             let masked = header[1] & 0x80 != 0;
             let mut len = (header[1] & 0x7f) as u64;

@@ -80,6 +80,17 @@ struct PageState {
     consecutive_days: Option<u32>,
 }
 
+impl PageState {
+    fn is_dolby_two_factor_page(&self) -> bool {
+        reqwest::Url::parse(&self.current_url).is_ok_and(|url| {
+            matches!(url.host_str(), Some("uhddolby.com" | "www.uhddolby.com"))
+                && url.path() == "/take2fa.php"
+        })
+    }
+}
+
+const DOLBY_TWO_FACTOR_REQUIRED: &str = "杜比要求两步验证，请在专用浏览器完成验证后重试签到";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigninAdapter {
     Dian115,
@@ -303,6 +314,9 @@ impl CdpClient {
         let adapter = SigninAdapter::from_url(site_url);
 
         let initial = inspect_page(&mut websocket)?;
+        if initial.is_dolby_two_factor_page() {
+            return Ok(SigninResult::failure(DOLBY_TWO_FACTOR_REQUIRED));
+        }
         // 首页“签到已得”表示此前已经签到，应记录为已签到而不是本次签到成功。
         if initial.home_already_signed && adapter != SigninAdapter::Rousi {
             return Ok(result_from_state(SigninStatus::AlreadySigned, initial));
@@ -357,6 +371,9 @@ impl CdpClient {
             if !state.ready {
                 continue;
             }
+            if state.is_dolby_two_factor_page() {
+                return Ok(SigninResult::failure(DOLBY_TWO_FACTOR_REQUIRED));
+            }
             ready_steps += 1;
 
             if state.success {
@@ -383,6 +400,7 @@ impl CdpClient {
                 }));
             }
             if state.has_challenge && !state.challenge_ready {
+                ready_steps = 0;
                 if !challenge_logged {
                     challenge_logged = true;
                     if let Some(progress) = progress {
@@ -421,6 +439,13 @@ impl CdpClient {
                 }
             }
             if ready_steps >= 16 && !state.has_challenge {
+                if adapter == SigninAdapter::Dian115 {
+                    return Ok(SigninResult::failure(if clicked_action_key.is_empty() {
+                        "癫影签到页未找到可用的“普通签到”按钮，也未识别到今日签到结果"
+                    } else {
+                        "癫影已点击签到，但未识别到今日签到结果"
+                    }));
+                }
                 return Ok(SigninResult::failure(format!(
                     "未识别到签到结果（当前页面：{}），需要添加站点专用适配",
                     state.current_url
@@ -633,7 +658,7 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
     const homeSigned = elements.some((el) => visible(el) && signedPattern.test(textOf(el)))
         || Boolean(accountHeader && signedPattern.test(clean(accountHeader.innerText)));
     const actionCandidates = elements.map((el, index) => ({ el, index, text: textOf(el) })).filter(({ el, text }) => {
-        if (!visible(el) || el.tagName === 'A') return false;
+        if (!visible(el) || el.tagName === 'A' || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
         const selectedNavigation = el.getAttribute('aria-pressed') === 'true'
             || el.getAttribute('aria-selected') === 'true'
             || el.dataset?.state === 'active';
@@ -681,9 +706,11 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
     };
 
     const challengeResponse = document.querySelector('input[name="cf-turnstile-response"], input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]');
-    const hasChallenge = Boolean(challengeResponse)
+    const challengePage = /just a moment|checking your browser/i.test(document.title || '')
+        || Boolean(document.querySelector('#challenge-stage, #challenge-running'));
+    const hasChallenge = challengePage || Boolean(challengeResponse)
         || Boolean(document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], .cf-turnstile, .g-recaptcha'));
-    const challengeReady = !hasChallenge || clean(challengeResponse?.value).length > 10;
+    const challengeReady = !challengePage && (!hasChallenge || clean(challengeResponse?.value).length > 10);
     const hasLoginForm = Boolean(document.querySelector('input[type="password"]'))
         && (Boolean(document.querySelector('form[action*="login" i], input[name="username" i], input[name="uid" i]'))
             || (location.hostname === 'm.dian115.com' && location.pathname === '/login'

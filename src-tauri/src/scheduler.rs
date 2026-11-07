@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime::JoinHandle;
 use tauri::AppHandle;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+
+const MAX_CONCURRENT_SIGNINS: usize = 4;
 
 pub struct Scheduler {
     handle: Option<JoinHandle<()>>,
@@ -1067,6 +1069,8 @@ async fn run_keepalive_batch(
         }
     }
 
+    // 各站共用一个浏览器，避免同时向所有标签页发送签到导航和页面检查。
+    let signin_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_SIGNINS));
     let mut signin_jobs = Vec::new();
     for (site, tab_id) in signin_targets {
         if failed_login_site_ids.contains(&site.id) {
@@ -1081,8 +1085,10 @@ async fn run_keepalive_batch(
         }
         let signin_logs = Arc::clone(logs);
         let signin_cancel = Arc::clone(task_cancel_requested);
+        let signin_slots = Arc::clone(&signin_slots);
         let cdp_port = cdp.port();
         signin_jobs.push(tauri::async_runtime::spawn(async move {
+            let _permit = signin_slots.acquire().await.expect("签到限流器未关闭");
             let signin_cdp = CdpClient::new(cdp_port);
             let result =
                 try_auto_signin_site(&site, &signin_cdp, &tab_id, &signin_logs, signin_cancel)
