@@ -9,7 +9,9 @@ const PROXY_AUTH_HEADER: &str = "X-Proxy-Token";
 
 #[derive(Debug, Serialize)]
 pub struct AppUpdateInfo {
+    pub current_version: String,
     pub version: String,
+    pub notes: Option<String>,
 }
 
 pub fn normalize_proxy_url(value: &str) -> Result<String, String> {
@@ -40,7 +42,9 @@ pub async fn check_for_app_update(
 
     let update = find_update(&state.app_handle, &proxy_url, &proxy_password).await?;
     Ok(update.map(|update| AppUpdateInfo {
+        current_version: update.current_version,
         version: update.version,
+        notes: update.body,
     }))
 }
 

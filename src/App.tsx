@@ -186,7 +186,9 @@ type CookieCloudSyncResult = {
 };
 
 type AppUpdateInfo = {
+  current_version: string;
   version: string;
+  notes: string | null;
 };
 
 type TabKey = "dashboard" | "sites" | "settings" | "logs";
@@ -1040,11 +1042,11 @@ function App() {
 
       setUpdatePhase("confirming");
       const shouldInstall = await ask(
-        `最新版本 ${formatVersion(update.version)}，是否立即更新？`,
+        updateConfirmationText(update),
         {
           kind: "info",
-          okLabel: "立即更新",
-          cancelLabel: "暂不更新",
+          okLabel: "确定",
+          cancelLabel: "取消",
           title: "更新 PT Manager",
         },
       );
@@ -3572,6 +3574,26 @@ function clampNumber(value: number, min: number, max: number) {
 
 function formatVersion(version: string) {
   return version.startsWith("v") ? version : `v${version}`;
+}
+
+function updateConfirmationText(update: AppUpdateInfo): string {
+  const target = formatVersion(update.version);
+  const notes = update.notes?.trim();
+  let summary = "此版本未提供更新摘要。";
+  if (notes && notes !== `Update to ${target}`) {
+    // 原生弹窗没有滚动区，保留摘要的前几行。
+    const lines = notes.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    summary = lines.slice(0, 5).map((line) => {
+      const characters = Array.from(line);
+      return characters.length > 96 ? `${characters.slice(0, 95).join("")}…` : line;
+    }).join("\n");
+    if (lines.length > 5) summary += "\n…";
+  }
+  return [
+    `当前版本 ${formatVersion(update.current_version)} → ${target}`,
+    `更新摘要\n${summary}`,
+    "点击「确定」后下载并安装，完成后会重启应用。",
+  ].join("\n\n");
 }
 
 function levelClass(level: LogEntry["level"]) {

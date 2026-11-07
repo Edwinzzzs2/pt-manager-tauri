@@ -26,7 +26,7 @@ function describeUpdate(props: VersionCardProps) {
     return { label: "检查失败", button: "重新检查", tone: "warning" };
   }
   if (props.availableVersion) {
-    return { label: "有新版本", button: "立即更新", tone: "available" };
+    return { label: "有新版本", button: "查看更新", tone: "available" };
   }
   // 尚未成功检查时只显示自动检查，避免把网络失败或初始状态误报为最新版。
   if (props.hasChecked) {

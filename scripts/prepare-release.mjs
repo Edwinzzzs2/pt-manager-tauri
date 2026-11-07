@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -16,7 +17,7 @@ const macArm = await prepareMacArtifact("darwin-aarch64", "arm64");
 // Tauri 按运行机器匹配 OS-ARCH，同一个清单必须同时包含三种发布目标。
 const manifest = {
   version,
-  notes: `Update to ${tag}`,
+  notes: releaseNotes(),
   pub_date: new Date().toISOString(),
   platforms: {
     "windows-x86_64": updaterEntry(windows),
@@ -30,6 +31,28 @@ await writeFile(
   `${JSON.stringify(manifest)}\n`,
   "utf8",
 );
+
+function releaseNotes() {
+  const tagRef = `refs/tags/${tag}`;
+  // 带注释的标签可提供人工摘要，普通标签则使用上次发布以来的提交标题。
+  if (gitOutput("cat-file", "-t", tagRef) === "tag") {
+    const annotation = gitOutput("for-each-ref", "--format=%(contents:subject)%0a%(contents:body)", tagRef);
+    if (annotation) return annotation;
+  }
+
+  const previousTag = gitOutput(
+    "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", `${tagRef}^`,
+  );
+  const subjects = previousTag
+    ? gitOutput("log", "--no-merges", "-5", "--format=• %s", `${previousTag}..${tagRef}`)
+    : gitOutput("log", "-1", "--format=• %s", tagRef);
+  return subjects || undefined;
+}
+
+function gitOutput(...args) {
+  const result = spawnSync("git", args, { encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : "";
+}
 
 async function prepareWindowsArtifact() {
   const root = path.join(artifactsRoot, "windows-x86_64");
