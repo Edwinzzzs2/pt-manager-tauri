@@ -24,7 +24,6 @@
 .nav-item,
 .primary-action,
 .danger-action,
-.site-form,
 .site-row,
 .panel-heading,
 .row-actions {
@@ -400,7 +399,6 @@ h2 {
 }
 
 .primary-action,
-.site-form button,
 .settings-save,
 .row-actions button {
   display: inline-flex;
@@ -416,7 +414,6 @@ h2 {
 }
 
 .primary-action:hover,
-.site-form button:hover,
 .row-actions button:hover,
 .settings-save:hover {
   background: var(--color-accent-hover);
@@ -752,7 +749,7 @@ button.ghost {
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--subtle-surface);
-  cursor: copy;
+  cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
@@ -773,25 +770,6 @@ button.ghost {
   white-space: nowrap;
   font-size: 14px;
   line-height: 1.3;
-}
-
-.site-form {
-  gap: 10px;
-  padding: 14px;
-}
-
-.site-form input:first-child {
-  flex: 0 0 180px;
-}
-
-.site-form input:nth-child(2) {
-  flex: 1;
-}
-
-.site-form-actions {
-  display: flex;
-  flex: 0 0 auto;
-  gap: 8px;
 }
 
 input,
@@ -990,8 +968,181 @@ select:focus {
   overflow: hidden;
 }
 
-.sites-stack .site-form {
+.site-add-button {
   flex: 0 0 auto;
+  min-height: 34px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.app-dialog {
+  position: fixed;
+  inset: 0;
+  width: min(520px, calc(100% - 24px));
+  max-height: calc(100vh - 24px);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border-light);
+  border-radius: 12px;
+  background: var(--color-bg-card);
+  color: var(--color-fg);
+  box-shadow: 0 24px 80px var(--panel-shadow);
+}
+
+.app-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.app-dialog form,
+.update-dialog-layout {
+  display: flex;
+  max-height: inherit;
+  flex-direction: column;
+}
+
+.app-dialog-heading,
+.app-dialog-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+}
+
+.app-dialog-heading {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-dialog-heading h2 {
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.site-add-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 18px;
+}
+
+.site-add-body .site-edit-fields {
+  gap: 12px;
+  font-size: 13px;
+}
+
+.site-add-body .site-edit-fields > label:not(.switch-row),
+.site-add-body .site-edit-fields > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.site-add-body small {
+  color: var(--color-fg-muted);
+}
+
+.app-dialog-error {
+  margin-top: 12px;
+  color: var(--color-danger);
+  font-size: 13px;
+}
+
+.app-dialog-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--color-border);
+}
+
+.update-dialog {
+  width: min(690px, calc(100% - 24px));
+  border-radius: 18px;
+}
+
+.update-dialog::backdrop {
+  backdrop-filter: blur(6px);
+}
+
+.update-dialog .app-dialog-heading,
+.update-dialog .app-dialog-footer {
+  padding: 16px clamp(14px, 4vw, 28px);
+}
+
+.update-dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.update-dialog-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--color-accent-hover), #0891b2);
+  color: #fff;
+}
+
+.update-dialog-body {
+  min-height: 0;
+  overflow: auto;
+  padding: 22px clamp(14px, 4vw, 28px);
+}
+
+.update-dialog-version {
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.update-dialog-version strong {
+  color: var(--accent-soft-fg);
+  font-size: 16px;
+}
+
+.update-dialog-version p,
+.update-dialog-footer p {
+  margin-top: 6px;
+  color: var(--color-fg-muted);
+  font-size: 13px;
+}
+
+.update-dialog-body h3 {
+  margin: 14px 0 8px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.update-dialog-notes {
+  max-height: min(220px, 35vh);
+  overflow-y: auto;
+  padding: 2px 10px 2px 0;
+  color: var(--color-fg-muted);
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.update-dialog-footer {
+  flex-wrap: wrap;
+  background: var(--subtle-surface-strong);
+}
+
+.update-dialog-footer p {
+  margin: 0 auto 0 0;
+}
+
+button.update-skip-button {
+  border: 1px solid var(--color-border-light);
+  background: transparent;
+}
+
+.update-install-button {
+  background: linear-gradient(115deg, var(--color-accent-hover), #0891b2);
+}
+
+.update-install-button:hover {
+  background: linear-gradient(115deg, var(--color-accent), #0e7490);
 }
 
 .site-list-scroll {
@@ -1115,10 +1266,16 @@ select:focus {
   color: var(--warning-soft-fg);
 }
 
+.site-edit-button,
+.site-test-button,
+.site-captcha-button,
 .site-delete-button {
   width: 38px;
   height: 38px;
   padding: 0;
+}
+
+.site-delete-button {
   border: 1px solid var(--danger-soft-border);
   background: var(--danger-soft-bg);
   color: var(--danger-soft-fg);
@@ -1565,7 +1722,7 @@ html[data-theme="light"] .log-level-filter select {
   border: 1px solid var(--color-border);
   border-radius: 6px;
   background: var(--subtle-surface);
-  cursor: copy;
+  cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 
@@ -1686,7 +1843,6 @@ html[data-theme="light"] .log-level-filter select {
     grid-template-columns: 1fr;
   }
 
-  .site-form,
   .topbar {
     align-items: stretch;
     flex-direction: column;
@@ -1729,10 +1885,6 @@ html[data-theme="light"] .log-level-filter select {
     flex: 0 0 38px;
   }
 
-  .site-form input:first-child {
-    flex: 1;
-  }
-
   .site-edit-fields {
     grid-template-columns: 1fr;
     width: 100%;
@@ -1744,15 +1896,6 @@ html[data-theme="light"] .log-level-filter select {
   .site-auto-signin,
   .site-cookiecloud-upload {
     grid-column: auto;
-  }
-
-  .site-form-actions,
-  .site-form-actions button {
-    width: 100%;
-  }
-
-  .site-form-actions button {
-    flex: 1;
   }
 }
 
@@ -2177,19 +2320,4 @@ html[data-theme="light"] .log-level-filter select {
   color: var(--danger-color, #ef4444) !important;
   border-color: var(--danger-color, #ef4444) !important;
   background-color: rgba(239, 68, 68, 0.1) !important;
-}
-
-.site-test-button.testing .icon-stop,
-.site-test-button.testing .text-stop {
-  display: none;
-}
-
-.site-test-button.testing:hover .icon-testing,
-.site-test-button.testing:hover .text-testing {
-  display: none !important;
-}
-
-.site-test-button.testing:hover .icon-stop,
-.site-test-button.testing:hover .text-stop {
-  display: inline-block !important;
 }

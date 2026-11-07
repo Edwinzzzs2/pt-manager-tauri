@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type FormEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
@@ -27,15 +28,18 @@ import {
   ListChecks,
   Moon,
   PauseCircle,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
   Save,
+  ScanText,
   Send,
   Search,
   Settings,
   Settings2,
   ShieldCheck,
+  Sparkles,
   Square,
   Sun,
   Trash2,
@@ -75,6 +79,19 @@ type SiteDraft = Pick<
   | "auto_daily_bonus"
   | "cookiecloud_upload"
 >;
+
+const emptySiteDraft: SiteDraft = {
+  name: "",
+  url: "",
+  username: "",
+  password: "",
+  totp_secret: "",
+  auto_login: true,
+  auto_keepalive: true,
+  auto_signin: false,
+  auto_daily_bonus: false,
+  cookiecloud_upload: true,
+};
 
 type SiteAutomationSettings = Pick<
   Site,
@@ -195,6 +212,7 @@ type TabKey = "dashboard" | "sites" | "settings" | "logs";
 type ColorMode = "dark" | "light";
 
 const themeStorageKey = "pt-manager-theme";
+const skippedUpdateStorageKey = "pt-manager-skipped-update";
 const releaseTag = import.meta.env.VITE_RELEASE_TAG as string | undefined;
 
 const defaultConfig: AppConfig = {
@@ -302,31 +320,8 @@ function App() {
   const [settingsDraft, setSettingsDraft] = useState<AppConfig>(defaultConfig);
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [newSite, setNewSite] = useState<SiteDraft>({
-    name: "",
-    url: "",
-    username: "",
-    password: "",
-    totp_secret: "",
-    auto_login: true,
-    auto_keepalive: true,
-    auto_signin: false,
-    auto_daily_bonus: false,
-    cookiecloud_upload: true,
-  });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
-  const [editingSite, setEditingSite] = useState<SiteDraft>({
-    name: "",
-    url: "",
-    username: "",
-    password: "",
-    totp_secret: "",
-    auto_login: true,
-    auto_keepalive: true,
-    auto_signin: false,
-    auto_daily_bonus: false,
-    cookiecloud_upload: true,
-  });
+  const [editingSite, setEditingSite] = useState<SiteDraft>(emptySiteDraft);
   const [busy, setBusy] = useState(false);
   const [cookieSyncBusy, setCookieSyncBusy] = useState(false);
   const [cookieCloudClearBusy, setCookieCloudClearBusy] = useState(false);
@@ -341,6 +336,11 @@ function App() {
   const [updateHasChecked, setUpdateHasChecked] = useState(false);
   const [updateCheckFailed, setUpdateCheckFailed] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
+  const [pendingUpdate, setPendingUpdate] = useState<AppUpdateInfo | null>(null);
+  const [updateInstallError, setUpdateInstallError] = useState<string | null>(null);
+  const [skippedUpdateVersion, setSkippedUpdateVersion] = useState(
+    () => window.localStorage.getItem(skippedUpdateStorageKey),
+  );
   const updateCheckPromise = useRef<Promise<AppUpdateInfo | null> | null>(null);
   const [testingSiteId, setTestingSiteId] = useState<string | null>(null);
   const [recognizingSiteId, setRecognizingSiteId] = useState<string | null>(null);
@@ -586,48 +586,37 @@ function App() {
     }
   }
 
-  async function addSite() {
+  async function addSite(newSite: SiteDraft) {
     const name = newSite.name.trim();
     const url = newSite.url.trim();
     if (!name || !url) {
-      setError("站点名称和 URL 不能为空");
-      return;
+      throw new Error("请填写站点名称和地址");
     }
 
-    setBusy(true);
-    setError(null);
-    try {
-      const next = await invoke<AppConfig>("add_site", {
-        name,
-        url,
-        username: newSite.username.trim(),
-        password: newSite.password,
-        totpSecret: newSite.totp_secret.trim(),
-        autoLogin: newSite.auto_login,
-        autoSignin: newSite.auto_signin,
-        autoDailyBonus: newSite.auto_daily_bonus,
-        cookiecloudUpload: newSite.cookiecloud_upload,
-      });
-      setConfig(next);
-      setSettingsDraft(next);
-      setNewSite({
-        name: "",
-        url: "",
-        username: "",
-        password: "",
-        totp_secret: "",
-        auto_login: true,
-        auto_keepalive: true,
-        auto_signin: false,
-        auto_daily_bonus: false,
-        cookiecloud_upload: true,
-      });
-      await refreshStatus();
-    } catch (err) {
-      showError(err);
-    } finally {
-      setBusy(false);
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error("请输入以 https:// 或 http:// 开头的站点地址");
     }
+    try {
+      new URL(url);
+    } catch {
+      throw new Error("请输入完整的站点地址，例如 https://example.com");
+    }
+
+    const next = await invoke<AppConfig>("add_site", {
+      name,
+      url,
+      username: newSite.username.trim(),
+      password: newSite.password,
+      totpSecret: newSite.totp_secret.trim(),
+      autoLogin: newSite.auto_login,
+      autoKeepalive: newSite.auto_keepalive,
+      autoSignin: newSite.auto_signin,
+      autoDailyBonus: isQingwaSite(url) && newSite.auto_daily_bonus,
+      cookiecloudUpload: newSite.cookiecloud_upload,
+    });
+    setConfig(next);
+    setSettingsDraft(next);
+    void refreshStatus().catch(showError);
   }
 
   async function exportConfig() {
@@ -1040,31 +1029,38 @@ function App() {
         return;
       }
 
+      setUpdateInstallError(null);
+      setPendingUpdate(update);
       setUpdatePhase("confirming");
-      const shouldInstall = await ask(
-        updateConfirmationText(update),
-        {
-          kind: "info",
-          okLabel: "确定",
-          cancelLabel: "取消",
-          title: "更新 PT Manager",
-        },
-      );
-      if (!shouldInstall) {
-        return;
-      }
-
-      // 后端合并执行下载和安装，界面不显示未经事件确认的进度百分比。
-      setUpdatePhase("installing");
-      await invoke("download_and_install_app_update", {
-        expectedVersion: update.version,
-      });
-      await relaunch();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(`更新失败：${message}`);
     } finally {
-      setUpdatePhase(null);
+      setUpdatePhase((phase) => phase === "checking" ? null : phase);
+    }
+  }
+
+  function closeUpdateDialog() {
+    setPendingUpdate(null);
+    setUpdatePhase(null);
+  }
+
+  function skipUpdate(version: string) {
+    window.localStorage.setItem(skippedUpdateStorageKey, version);
+    setSkippedUpdateVersion(version);
+    closeUpdateDialog();
+  }
+
+  async function installUpdate(version: string) {
+    setUpdateInstallError(null);
+    setUpdatePhase("installing");
+    try {
+      await invoke("download_and_install_app_update", { expectedVersion: version });
+      await relaunch();
+      closeUpdateDialog();
+    } catch (err) {
+      setUpdateInstallError(err instanceof Error ? err.message : String(err));
+      setUpdatePhase("confirming");
     }
   }
 
@@ -1124,6 +1120,7 @@ function App() {
             phase={updatePhase}
             hasChecked={updateHasChecked}
             checkFailed={updateCheckFailed}
+            skipped={availableUpdate !== null && availableUpdate.version === skippedUpdateVersion}
             onCheck={checkForUpdates}
           />
         </div>
@@ -1207,11 +1204,9 @@ function App() {
               config={config}
               editingSite={editingSite}
               editingSiteId={editingSiteId}
-              newSite={newSite}
               onAdd={addSite}
               onCancelEdit={() => setEditingSiteId(null)}
               onEditChange={setEditingSite}
-              onNewSiteChange={setNewSite}
               onRemove={removeSite}
               onRemoveSelected={removeSites}
               onRecognizeCaptcha={recognizeSiteCaptcha}
@@ -1258,6 +1253,17 @@ function App() {
           ) : null}
         </div>
       </section>
+      {pendingUpdate && (
+        <UpdateDialog
+          error={updateInstallError}
+          installing={updatePhase === "installing"}
+          onClose={closeUpdateDialog}
+          onInstall={() => installUpdate(pendingUpdate.version)}
+          onSkip={() => skipUpdate(pendingUpdate.version)}
+          skipped={pendingUpdate.version === skippedUpdateVersion}
+          update={pendingUpdate}
+        />
+      )}
     </main>
   );
 }
@@ -1963,16 +1969,171 @@ function BatchSettingsModal({
   );
 }
 
+function AddSiteDialog({
+  onAdd,
+  onClose,
+}: {
+  onAdd: (site: SiteDraft) => Promise<void>;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState<SiteDraft>(emptySiteDraft);
+  const [showPassword, setShowPassword] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) {
+      dialog.showModal();
+      nameRef.current?.focus();
+    }
+  }, []);
+
+  function close() {
+    dialogRef.current?.close();
+    onClose();
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await onAdd(draft);
+      close();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <dialog
+      aria-labelledby="site-add-title"
+      className="app-dialog"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!saving) close();
+      }}
+      ref={dialogRef}
+    >
+      <form onSubmit={submit}>
+        <header className="app-dialog-heading">
+          <h2 id="site-add-title">新增站点</h2>
+          <button
+            aria-label="关闭新增站点"
+            className="icon-button"
+            disabled={saving}
+            onClick={close}
+            type="button"
+          >
+            <XCircle size={18} />
+          </button>
+        </header>
+
+        <div className="site-add-body">
+          <fieldset className="site-edit-fields" disabled={saving}>
+            <label>
+              <span>站点名称</span>
+              <input
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                ref={nameRef}
+                required
+                value={draft.name}
+              />
+            </label>
+            <label>
+              <span>站点地址</span>
+              <input
+                onChange={(event) => setDraft({ ...draft, url: event.target.value })}
+                placeholder="https://example.com"
+                required
+                type="url"
+                value={draft.url}
+              />
+            </label>
+            <label>
+              <span>登录用户名 <small>选填</small></span>
+              <input
+                autoComplete="username"
+                onChange={(event) => setDraft({ ...draft, username: event.target.value })}
+                value={draft.username}
+              />
+            </label>
+            <div>
+              <label htmlFor="site-add-password">
+                <span>登录密码 <small>选填</small></span>
+              </label>
+              <div className="password-field">
+                <input
+                  autoComplete="new-password"
+                  id="site-add-password"
+                  onChange={(event) => setDraft({ ...draft, password: event.target.value })}
+                  type={showPassword ? "text" : "password"}
+                  value={draft.password}
+                />
+                <button
+                  aria-label={showPassword ? "隐藏登录密码" : "显示登录密码"}
+                  onClick={() => setShowPassword((value) => !value)}
+                  type="button"
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </div>
+            <label className="site-secret-field">
+              <span>2FA Base32 密钥 <small>选填</small></span>
+              <input
+                autoComplete="off"
+                onChange={(event) => setDraft({ ...draft, totp_secret: event.target.value })}
+                type="password"
+                value={draft.totp_secret}
+              />
+            </label>
+            {automationFields.map(({ key, label }) => (
+              <label className="switch-row" key={key}>
+                <span>{label}</span>
+                <input
+                  checked={draft[key]}
+                  onChange={(event) => setDraft({ ...draft, [key]: event.target.checked })}
+                  type="checkbox"
+                />
+              </label>
+            ))}
+            {isQingwaSite(draft.url.trim()) && (
+              <label className="switch-row">
+                <span>自动购买每日福利</span>
+                <input
+                  checked={draft.auto_daily_bonus}
+                  onChange={(event) => setDraft({ ...draft, auto_daily_bonus: event.target.checked })}
+                  type="checkbox"
+                />
+              </label>
+            )}
+          </fieldset>
+          {error && <p className="app-dialog-error" role="alert">{error}</p>}
+        </div>
+
+        <footer className="app-dialog-footer">
+          <button className="ghost" disabled={saving} onClick={close} type="button">取消</button>
+          <button className="primary-action" disabled={saving} type="submit">{saving ? "正在添加…" : "添加站点"}</button>
+        </footer>
+      </form>
+    </dialog>
+  );
+}
+
 function SitesPanel({
   busy,
   config,
   editingSite,
   editingSiteId,
-  newSite,
   onAdd,
   onCancelEdit,
   onEditChange,
-  onNewSiteChange,
   onRecognizeCaptcha,
   onRemove,
   onRemoveSelected,
@@ -1990,11 +2151,9 @@ function SitesPanel({
   config: AppConfig;
   editingSite: SiteDraft;
   editingSiteId: string | null;
-  newSite: SiteDraft;
-  onAdd: () => void;
+  onAdd: (site: SiteDraft) => Promise<void>;
   onCancelEdit: () => void;
   onEditChange: (site: SiteDraft) => void;
-  onNewSiteChange: (site: SiteDraft) => void;
   onRecognizeCaptcha: (site: Site) => void;
   onRemove: (id: string) => Promise<void>;
   onRemoveSelected: (ids: string[]) => Promise<boolean>;
@@ -2011,6 +2170,7 @@ function SitesPanel({
   onReorderSites: (siteIds: string[]) => Promise<boolean>;
 }) {
   const [siteSearch, setSiteSearch] = useState("");
+  const [addSiteOpen, setAddSiteOpen] = useState(false);
   const [selectedSiteIds, setSelectedSiteIds] = useState<Set<string>>(() => new Set());
   const [showSitePassword, setShowSitePassword] = useState(false);
   const [showTotpSecret, setShowTotpSecret] = useState(false);
@@ -2092,24 +2252,7 @@ function SitesPanel({
 
   return (
     <div className="content-stack sites-stack">
-      <section className="panel site-form">
-        <input
-          onChange={(event) => onNewSiteChange({ ...newSite, name: event.target.value })}
-          placeholder="站点名称"
-          value={newSite.name}
-        />
-        <input
-          onChange={(event) => onNewSiteChange({ ...newSite, url: event.target.value })}
-          placeholder="https://example.com"
-          value={newSite.url}
-        />
-        <div className="site-form-actions">
-          <button disabled={busy} onClick={onAdd} type="button">
-            <Plus size={17} />
-            <span>新增</span>
-          </button>
-        </div>
-      </section>
+      {addSiteOpen && <AddSiteDialog onAdd={onAdd} onClose={() => setAddSiteOpen(false)} />}
 
       <div className="site-selection-bar">
         {visibleSites.length > 0 && (
@@ -2172,6 +2315,16 @@ function SitesPanel({
           </div>
           <span className="site-search-count" role="status">{siteCountLabel}</span>
         </div>
+        <button
+          aria-haspopup="dialog"
+          className="primary-action site-add-button"
+          disabled={busy}
+          onClick={() => setAddSiteOpen(true)}
+          type="button"
+        >
+          <Plus size={16} aria-hidden="true" />
+          <span>新增站点</span>
+        </button>
       </div>
 
       <section className="site-list site-list-scroll">
@@ -2422,6 +2575,7 @@ function SitesPanel({
                     <>
                       {site.auto_login ? (
                         <button
+                          aria-label={testingSiteId === site.id ? `终止测试 ${site.name}` : `测试登录 ${site.name}`}
                           className={`ghost site-test-button ${testingSiteId === site.id ? "testing" : ""}`}
                           disabled={busy || (testingSiteId !== null && testingSiteId !== site.id)}
                           onClick={() => {
@@ -2431,42 +2585,40 @@ function SitesPanel({
                               onTestLogin(site);
                             }
                           }}
-                          title={testingSiteId === site.id ? "终止当前测试" : "单独测试自动登录"}
+                          title={testingSiteId === site.id ? "测试中，点击终止" : "单独测试自动登录"}
                           type="button"
                         >
                           {testingSiteId === site.id ? (
-                            <>
-                              <RefreshCw size={16} className="icon-testing spin" />
-                              <XCircle size={16} className="icon-stop" />
-                              <span className="text-testing">测试中</span>
-                              <span className="text-stop">终止</span>
-                            </>
+                            <Square size={16} aria-hidden="true" />
                           ) : (
-                            <>
-                              <ShieldCheck size={16} />
-                              <span>测试</span>
-                            </>
+                            <ShieldCheck size={16} aria-hidden="true" />
                           )}
                         </button>
                       ) : null}
                       {site.auto_login && !site.url.toLowerCase().includes("kp.m-team.cc") && !site.url.toLowerCase().includes("hdkyl.in") ? (
                         <button
+                          aria-label={recognizingSiteId === site.id ? `正在识别 ${site.name} 的验证码` : `识别 ${site.name} 的验证码`}
                           className="ghost site-captcha-button"
                           disabled={busy || testingSiteId !== null || recognizingSiteId !== null}
                           onClick={() => onRecognizeCaptcha(site)}
-                          title="识别并填入当前图片验证码"
+                          title={recognizingSiteId === site.id ? "正在识别验证码" : "识别并填入当前图片验证码"}
                           type="button"
                         >
                           {recognizingSiteId === site.id ? (
-                            <RefreshCw size={16} />
+                            <RefreshCw size={16} className="spin" aria-hidden="true" />
                           ) : (
-                            <Search size={16} />
+                            <ScanText size={16} aria-hidden="true" />
                           )}
-                          <span>{recognizingSiteId === site.id ? "识别中" : "识别码"}</span>
                         </button>
                       ) : null}
-                      <button onClick={() => startEditingSite(site)} type="button">
-                        编辑
+                      <button
+                        aria-label={`编辑 ${site.name}`}
+                        className="site-edit-button"
+                        onClick={() => startEditingSite(site)}
+                        title="编辑站点"
+                        type="button"
+                      >
+                        <Pencil size={16} aria-hidden="true" />
                       </button>
                       <button
                         aria-label={`删除 ${site.name}`}
@@ -3576,24 +3728,118 @@ function formatVersion(version: string) {
   return version.startsWith("v") ? version : `v${version}`;
 }
 
-function updateConfirmationText(update: AppUpdateInfo): string {
+function UpdateDialog({
+  error,
+  installing,
+  onClose,
+  onInstall,
+  onSkip,
+  skipped,
+  update,
+}: {
+  error: string | null;
+  installing: boolean;
+  onClose: () => void;
+  onInstall: () => Promise<void>;
+  onSkip: () => void;
+  skipped: boolean;
+  update: AppUpdateInfo;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
   const target = formatVersion(update.version);
   const notes = update.notes?.trim();
-  let summary = "此版本未提供更新摘要。";
-  if (notes && notes !== `Update to ${target}`) {
-    // 原生弹窗没有滚动区，保留摘要的前几行。
-    const lines = notes.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    summary = lines.slice(0, 5).map((line) => {
-      const characters = Array.from(line);
-      return characters.length > 96 ? `${characters.slice(0, 95).join("")}…` : line;
-    }).join("\n");
-    if (lines.length > 5) summary += "\n…";
+  const hasNotes = notes && notes !== `Update to ${target}`;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) {
+      dialog.showModal();
+      cancelRef.current?.focus();
+    }
+  }, []);
+
+  function close(action: () => void) {
+    dialogRef.current?.close();
+    action();
   }
-  return [
-    `当前版本 ${formatVersion(update.current_version)} → ${target}`,
-    `更新摘要\n${summary}`,
-    "点击「确定」后下载并安装，完成后会重启应用。",
-  ].join("\n\n");
+
+  return (
+    <dialog
+      aria-labelledby="update-dialog-title"
+      className="app-dialog update-dialog"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!installing) close(onClose);
+      }}
+      ref={dialogRef}
+    >
+      <div className="update-dialog-layout">
+        <header className="app-dialog-heading">
+          <div className="update-dialog-title">
+            <span className="update-dialog-icon"><Sparkles size={18} aria-hidden="true" /></span>
+            <h2 id="update-dialog-title">发现新版本</h2>
+          </div>
+          <button
+            aria-label="关闭版本提示"
+            className="icon-button"
+            disabled={installing}
+            onClick={() => close(onClose)}
+            type="button"
+          >
+            <XCircle size={18} />
+          </button>
+        </header>
+
+        <div className="update-dialog-body">
+          <div className="update-dialog-version">
+            <strong>{target}</strong>
+            <p>当前版本 {formatVersion(update.current_version)}，新版本已可用。</p>
+          </div>
+          <h3 id="update-notes-title">更新内容</h3>
+          <div
+            aria-labelledby="update-notes-title"
+            className="update-dialog-notes"
+            role="region"
+            tabIndex={0}
+          >
+            {hasNotes ? notes : "此版本未提供更新摘要。"}
+          </div>
+          {error && <p className="app-dialog-error" role="alert">{error}</p>}
+        </div>
+
+        <footer className="app-dialog-footer update-dialog-footer">
+          {installing && <p role="status">安装完成后将自动重启。</p>}
+          <button
+            className="ghost"
+            disabled={installing}
+            onClick={() => close(onClose)}
+            ref={cancelRef}
+            type="button"
+          >
+            取消
+          </button>
+          <button
+            className="ghost update-skip-button"
+            disabled={installing || skipped}
+            onClick={() => close(onSkip)}
+            type="button"
+          >
+            {skipped ? "已跳过此版本" : "跳过此版本"}
+          </button>
+          <button
+            className="primary-action update-install-button"
+            disabled={installing}
+            onClick={onInstall}
+            type="button"
+          >
+            <Download size={16} aria-hidden="true" />
+            {installing ? "下载并安装中…" : "立即更新"}
+          </button>
+        </footer>
+      </div>
+    </dialog>
+  );
 }
 
 function levelClass(level: LogEntry["level"]) {

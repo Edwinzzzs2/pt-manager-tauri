@@ -9,6 +9,7 @@ type VersionCardProps = {
   phase: UpdatePhase;
   hasChecked: boolean;
   checkFailed: boolean;
+  skipped: boolean;
   onCheck: () => Promise<void>;
 };
 
@@ -26,6 +27,9 @@ function describeUpdate(props: VersionCardProps) {
     return { label: "检查失败", button: "重新检查", tone: "warning" };
   }
   if (props.availableVersion) {
+    if (props.skipped) {
+      return { label: "已跳过", button: "查看更新", tone: "idle" };
+    }
     return { label: "有新版本", button: "查看更新", tone: "available" };
   }
   // 尚未成功检查时只显示自动检查，避免把网络失败或初始状态误报为最新版。
@@ -38,7 +42,7 @@ function describeUpdate(props: VersionCardProps) {
 export function VersionCard(props: VersionCardProps) {
   const state = describeUpdate(props);
   const busy = props.phase !== null || props.checking;
-  const hasUpdate = Boolean(props.availableVersion);
+  const hasUpdate = Boolean(props.availableVersion) && !props.skipped;
   const spinning = props.checking || props.phase === "checking" || props.phase === "installing";
   const ActionIcon = hasUpdate && !busy && !props.checkFailed ? Download : RefreshCw;
   const actionTitle = props.availableVersion
