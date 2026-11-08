@@ -4,14 +4,15 @@ use super::common::{
     click_runtime_element, human_delay, nexus_captcha_page_state, nexus_login_page_state,
     runtime_object_bool, type_runtime_input,
 };
+use super::ubits::click_turnstile_checkbox;
 use crate::auth;
 use crate::cdp::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TOTP_INPUT_SELECTOR: &str = "input[name=\"two_factor\"], input[name=\"twofactor\"], input[name=\"two_step_code\"], input[name=\"otp\"], input[name=\"two_factor_code\"], input[name=\"2fa_secret\"], input[name=\"2fa\"], input[autocomplete=\"one-time-code\"]";
 
 impl CdpClient {
-    /// 通用 NexusPHP 站点的登录逻辑（包含可选的 TOTP、Cloudflare 绕过、以及自动 OCR 验证码识别）
+    /// 通用 NexusPHP 登录，支持 TOTP、人机验证和图片验证码识别。
     pub(super) async fn login_nexusphp(
         &self,
         tab_id: &str,
@@ -235,11 +236,7 @@ impl CdpClient {
                         })?;
 
                     if let Some(p) = progress {
-                        p.info(format!(
-                            "获取验证码图片成功，准备发送给 OCR 服务，Base64 为：{}",
-                            image_base64
-                        ))
-                        .await;
+                        p.info("获取验证码图片成功，准备发送给 OCR 服务").await;
                     }
 
                     let ocr_server_url_clone = ocr_server_url.clone();
@@ -255,7 +252,7 @@ impl CdpClient {
                         Ok(res) => res,
                         Err(err) => {
                             if let Some(p) = progress {
-                                p.info(format!(
+                                p.ocr(format!(
                                     "第 {}/{} 张验证码识别失败：{}{}",
                                     attempt + 1,
                                     max_attempts,
@@ -265,7 +262,7 @@ impl CdpClient {
                                     } else {
                                         "，已达到换图尝试上限"
                                     }
-                                ))
+                                ), image_base64, err.candidate.as_deref())
                                 .await;
                             }
                             if attempt + 1 >= max_attempts {
@@ -279,12 +276,11 @@ impl CdpClient {
                     };
 
                     if let Some(p) = progress {
-                        p.info(format!(
-                            "验证码识别成功：{}，验证码尝试次数：{}/{}。正在自动填入...",
-                            recognition.text,
+                        p.ocr(format!(
+                            "验证码识别成功，验证码尝试次数：{}/{}。正在自动填入...",
                             attempt + 1,
                             max_attempts
-                        ))
+                        ), image_base64, Some(&recognition.text))
                         .await;
                     }
 
@@ -324,6 +320,9 @@ impl CdpClient {
             let mut has_altcha = false;
             let mut altcha_clicked = false;
             let mut logged_challenge_state = false;
+            let mut has_ubits_turnstile = false;
+            let mut turnstile_clicked = false;
+            let mut next_turnstile_probe = Instant::now();
 
             for _ in 0..120 {
                 // 最多等待 60 秒
@@ -361,8 +360,14 @@ impl CdpClient {
                         || (altcha?.querySelector('input[name="altcha"]')?.value || '').trim().length > 0;
                     const canClickAltcha = ['qingwapt.com', 'www.qingwapt.com'].includes(location.hostname)
                         && Boolean(altcha?.querySelector('.altcha[data-state="unverified"] input[type="checkbox"]'));
+                    const ubitsTurnstile = location.protocol === 'https:'
+                        && ['ubits.club', 'www.ubits.club'].includes(location.hostname)
+                        && Boolean(form?.querySelector('.cf-turnstile, [name="cf-turnstile-response"]'));
+                    const ubitsTurnstileSolved = Boolean(
+                        form?.querySelector('[name="cf-turnstile-response"]')?.value.trim()
+                    );
                     // 仅加载验证脚本不能证明需要验证，否则没有验证码的页面会一直等待。
-                    const hasTokenChallenge = fields.length > 0 || widgets.length > 0;
+                    const hasTokenChallenge = fields.length > 0 || widgets.length > 0 || ubitsTurnstile;
                     const hasChallenge = hasTokenChallenge || Boolean(altcha);
                     const tokenSolved = Array.from(fields).some((field) =>
                         typeof field.value === 'string' && field.value.trim().length > 10
@@ -372,6 +377,7 @@ impl CdpClient {
                         && (!altcha || Boolean(altchaVerified));
                     return {
                         hasChallenge, solved, hasAltcha: Boolean(altcha), canClickAltcha,
+                        ubitsTurnstile, ubitsTurnstileSolved,
                         fieldCount: fields.length, widgetCount: widgets.length, challengeScript
                     };
                 })()"#;
@@ -395,6 +401,20 @@ impl CdpClient {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
                         let solved = val.get("solved").and_then(|v| v.as_bool()).unwrap_or(true);
+                        has_ubits_turnstile |= val["ubitsTurnstile"].as_bool() == Some(true);
+                        let turnstile_solved = val["ubitsTurnstileSolved"].as_bool() == Some(true);
+                        if has_ubits_turnstile && !turnstile_solved && !turnstile_clicked
+                            && Instant::now() >= next_turnstile_probe
+                        {
+                            turnstile_clicked = click_turnstile_checkbox(&mut websocket);
+                            next_turnstile_probe = Instant::now() + Duration::from_secs(2);
+                            if turnstile_clicked {
+                                logged_challenge_msg = false;
+                                if let Some(p) = progress {
+                                    p.info("已点击 UBits 人机验证框，等待 Cloudflare 返回结果").await;
+                                }
+                            }
+                        }
                         if !logged_challenge_state {
                             if let Some(p) = progress {
                                 p.info(format!(
@@ -430,7 +450,7 @@ impl CdpClient {
                             }
                         }
 
-                        if !has_challenge {
+                        if !has_challenge && !has_ubits_turnstile {
                             if let Some(p) = progress {
                                 p.info(format!("{} 登录表单无需人机验证，准备点击登录", site_name)).await;
                             }
@@ -438,7 +458,7 @@ impl CdpClient {
                             break;
                         }
 
-                        if solved {
+                        if solved && (!has_ubits_turnstile || turnstile_solved) {
                             stable_solved_samples += 1;
                             if stable_solved_samples >= 2 {
                                 captcha_solved = true;
@@ -450,7 +470,9 @@ impl CdpClient {
 
                         if !logged_challenge_msg {
                             if let Some(p) = progress {
-                                let message = if has_altcha {
+                                let message = if has_ubits_turnstile {
+                                    "UBits 正在等待人机验证。如果页面仍要求勾选，请切到浏览器完成验证，软件会接着登录。"
+                                } else if has_altcha {
                                     "检测到 ALTCHA 验证，请在浏览器中勾选并等待验证完成..."
                                 } else {
                                     "检测到页面存在人机验证（如 Cloudflare Turnstile），请在浏览器中完成验证..."
@@ -466,6 +488,12 @@ impl CdpClient {
             }
 
             if !captcha_solved {
+                if has_ubits_turnstile {
+                    return Err((
+                        format!("等待 {} 的 Cloudflare 验证通过超时，请在浏览器完成验证后重试", site_name),
+                        last_remaining_attempts,
+                    ));
+                }
                 return Err((
                     format!(
                         "等待 {} {}验证通过超时",
@@ -518,6 +546,11 @@ impl CdpClient {
                 if (!passwordInput) return false;
                 const form = passwordInput.form || passwordInput.closest('form');
                 if (!form) return false;
+                if (location.protocol === 'https:' && ['ubits.club', 'www.ubits.club'].includes(location.hostname)
+                    && form.querySelector('.cf-turnstile, [name="cf-turnstile-response"]')
+                    && !form.querySelector('[name="cf-turnstile-response"]')?.value.trim()) {
+                    return false;
+                }
 
                 // Some NexusPHP sites use challenge-response authentication. Their
                 // visible login button runs an async script that fills `response`
@@ -565,6 +598,12 @@ impl CdpClient {
             }
 
             if !submitted {
+                if has_ubits_turnstile {
+                    return Err((
+                        format!("{} 登录表单尚未就绪，请检查浏览器里的人机验证和登录按钮", site_name),
+                        last_remaining_attempts,
+                    ));
+                }
                 if !click_runtime_element(&mut websocket, "input[type=\"submit\"][value=\"登录\"], input[type=\"submit\"][value=\"进入！\"], input[type=\"submit\"][value=\"Login\"], button[type=\"submit\"]") {
                     if !click_runtime_element(&mut websocket, "input[type=\"submit\"]") {
                         return Err((format!("{} 登录按钮尚未启用或未找到", site_name), last_remaining_attempts));
@@ -604,6 +643,12 @@ impl CdpClient {
                 return Ok((true, last_remaining_attempts));
             }
             if captcha_failed {
+                if has_ubits_turnstile {
+                    return Err((
+                        format!("{} 登录被站点拒绝，请检查凭据、两步验证码和人机验证结果", site_name),
+                        last_remaining_attempts,
+                    ));
+                }
                 if attempt + 1 >= max_attempts {
                     return Err((
                         format!(

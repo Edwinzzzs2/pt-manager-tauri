@@ -1,17 +1,27 @@
 //! macOS 13+ 直接注册主应用登录项，旧系统保留带应用关联的 LaunchAgent。
 //! 不重置系统后台项目数据库，也不强行覆盖用户在系统设置中的禁用选择。
 
+#[cfg(not(debug_assertions))]
 use objc2::rc::{autoreleasepool, Retained};
+#[cfg(not(debug_assertions))]
 use objc2::runtime::{AnyClass, AnyObject, Bool};
+#[cfg(not(debug_assertions))]
 use objc2::msg_send;
 use plist::Value;
+#[cfg(not(debug_assertions))]
 use std::ffi::{CStr, CString};
+#[cfg(not(debug_assertions))]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(debug_assertions))]
+use std::path::PathBuf;
+#[cfg(not(debug_assertions))]
 use std::ptr;
+#[cfg(not(debug_assertions))]
 use tauri_plugin_autostart::ManagerExt;
 
 // 动态查找类：10.15–12 没有 SMAppService，不能静态引用该类符号。
+#[cfg(not(debug_assertions))]
 #[link(name = "ServiceManagement", kind = "framework")]
 extern "C" {}
 
@@ -21,18 +31,21 @@ const REQUIRES_APPROVAL: isize = 2;
 const NOT_FOUND: isize = 3;
 const LEGACY_NAMES: [&str; 2] = ["PT Manager", "pt-manager"];
 
+#[cfg(not(debug_assertions))]
 fn native_service() -> Option<Retained<AnyObject>> {
     let class = AnyClass::get(c"SMAppService")?;
     // SAFETY: mainAppService 返回当前应用的 SMAppService，objc2 管理返回值的引用计数。
     Some(unsafe { msg_send![class, mainAppService] })
 }
 
+#[cfg(not(debug_assertions))]
 fn status(service: &AnyObject) -> isize {
     // SAFETY: service 仅由 SMAppService.mainAppService 创建；status 返回 NSInteger。
     unsafe { msg_send![service, status] }
 }
 
 /// None 表示旧系统或尚未迁移的旧注册；false 包括系统禁用和等待授权。
+#[cfg(not(debug_assertions))]
 pub fn native_enabled() -> Result<Option<bool>, String> {
     // 若迁移曾失败，不能用尚未注册的原生状态覆盖仍在工作的旧自启偏好。
     let directory = launch_agents_dir()?;
@@ -42,6 +55,7 @@ pub fn native_enabled() -> Result<Option<bool>, String> {
     autoreleasepool(|_| Ok(native_service().map(|service| status(&service) == ENABLED)))
 }
 
+#[cfg(not(debug_assertions))]
 fn set_native(service: &AnyObject, enabled: bool) -> Result<(), String> {
     let current = status(service);
     if enabled && current == REQUIRES_APPROVAL {
@@ -89,6 +103,7 @@ fn bundled_app(executable: &Path) -> Option<&Path> {
         .then_some(bundle)
 }
 
+#[cfg(not(debug_assertions))]
 fn bundle_identifier(executable: &Path) -> Option<String> {
     Value::from_file(bundled_app(executable)?.join("Contents/Info.plist"))
         .ok()?
@@ -98,6 +113,7 @@ fn bundle_identifier(executable: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(not(debug_assertions))]
 fn launch_agents_dir() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join("Library/LaunchAgents"))
@@ -114,6 +130,7 @@ fn legacy_executable(value: &Value) -> Option<&str> {
 }
 
 /// 只检查历史版本实际使用的两个文件名，并核对它们引用的应用标识。
+#[cfg(not(debug_assertions))]
 fn owned_legacy_entries(identifier: &str) -> Result<Vec<(PathBuf, Value)>, String> {
     let mut entries = Vec::new();
     for name in LEGACY_NAMES {
@@ -134,6 +151,7 @@ fn owned_legacy_entries(identifier: &str) -> Result<Vec<(PathBuf, Value)>, Strin
     Ok(entries)
 }
 
+#[cfg(not(debug_assertions))]
 fn remove_legacy(entries: &[(PathBuf, Value)]) -> Result<(), String> {
     for (path, _) in entries {
         match fs::remove_file(path) {
@@ -146,6 +164,7 @@ fn remove_legacy(entries: &[(PathBuf, Value)]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(debug_assertions))]
 fn legacy_allowed(path: &Path) -> Result<bool, String> {
     let path = CString::new(path.to_str().ok_or("旧自启配置路径编码无效")?)
         .map_err(|_| "旧自启配置路径无效".to_string())?;
@@ -165,6 +184,7 @@ fn should_migrate(configured: bool, legacy_enabled: bool, native_status: isize) 
     configured && legacy_enabled && native_status == NOT_REGISTERED
 }
 
+#[cfg(not(debug_assertions))]
 fn prepare(app: &tauri::AppHandle) -> Result<Vec<(PathBuf, Value)>, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     if bundle_identifier(&executable).as_deref() != Some(app.config().identifier.as_str()) {
@@ -173,6 +193,7 @@ fn prepare(app: &tauri::AppHandle) -> Result<Vec<(PathBuf, Value)>, String> {
     owned_legacy_entries(&app.config().identifier)
 }
 
+#[cfg(not(debug_assertions))]
 pub fn apply(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
     autoreleasepool(|_| {
         let entries = prepare(app)?;
@@ -186,6 +207,7 @@ pub fn apply(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 /// 启动时只迁移现存旧注册，其余情况以系统状态为准，避免重新开启用户已禁用的登录项。
+#[cfg(not(debug_assertions))]
 pub fn reconcile(app: &tauri::AppHandle, configured: bool) -> Result<bool, String> {
     autoreleasepool(|_| {
         let entries = prepare(app)?;
@@ -215,6 +237,7 @@ pub fn reconcile(app: &tauri::AppHandle, configured: bool) -> Result<bool, Strin
     })
 }
 
+#[cfg(not(debug_assertions))]
 fn apply_legacy(app: &tauri::AppHandle, enabled: bool, entries: &[(PathBuf, Value)]) -> Result<(), String> {
     if !enabled { return remove_legacy(entries); }
     let manager = app.autolaunch();

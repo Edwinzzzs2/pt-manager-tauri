@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { XCircle } from "lucide-react";
+import { CronField, CronPreviewText, useCronPreview } from "./CronField";
 
 export type BrowserProxyConfig = {
   enabled: boolean;
@@ -23,22 +24,54 @@ export type SiteGroup = {
   cookiecloud: CookieCloudConfig;
   cookie_auto_import: boolean;
   cookie_auto_upload: boolean;
+  task?: GroupTaskConfig | null;
+};
+
+export type GroupTaskConfig = {
+  cron: string;
+  cron_offset_minutes: number;
+  visit_duration: number;
+};
+
+export const cookieModeLabels: Record<SiteGroup["cookie_mode"], string> = {
+  manual: "关闭同步",
+  inherit: "沿用默认设置",
+  custom: "自定义同步",
 };
 
 const emptyCookieCloud: CookieCloudConfig = { server_url: "", uuid: "", password: "" };
 
-export function SiteGroupOptions({
-  groups,
-  includeUngrouped = true,
-}: {
-  groups: SiteGroup[];
-  includeUngrouped?: boolean;
-}) {
+export function SiteGroupOptions({ groups }: { groups: SiteGroup[] }) {
   return (
     <>
-      {includeUngrouped && <option value="">未分组</option>}
+      <option value="">默认分组</option>
       {groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
     </>
+  );
+}
+
+export function SiteGroupTabs({ groups, value, defaultLabel, label, onChange }: {
+  groups: SiteGroup[];
+  value: string;
+  defaultLabel: string;
+  label: string;
+  onChange: (id: string) => void;
+}) {
+  const tabs = [{ id: "", name: defaultLabel }, ...groups];
+  return (
+    <div className="group-tabs" role="group" aria-label={label}>
+      {tabs.map(({ id, name }) => (
+        <button
+          key={id}
+          aria-pressed={value === id}
+          onClick={() => { if (id !== value) onChange(id); }}
+          title={name}
+          type="button"
+        >
+          {name}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -47,6 +80,7 @@ export function SiteGroupDialog({
   initialId,
   startupGroupId,
   defaultPort,
+  defaultTask,
   countSites,
   onSave,
   onRemove,
@@ -56,6 +90,7 @@ export function SiteGroupDialog({
   initialId: string;
   startupGroupId: string | null;
   defaultPort: number;
+  defaultTask: GroupTaskConfig;
   countSites: (id: string) => number;
   onSave: (group: SiteGroup, showOnStartup: boolean) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
@@ -82,6 +117,7 @@ export function SiteGroupDialog({
       cookiecloud: emptyCookieCloud,
       cookie_auto_import: false,
       cookie_auto_upload: false,
+      task: null,
     };
   }
 
@@ -125,6 +161,8 @@ export function SiteGroupDialog({
   }
 
   const siteCount = draft.id ? countSites(draft.id) : 0;
+  const task = draft.task;
+  const cronPreview = useCronPreview(task?.cron ?? defaultTask.cron);
 
   return (
     <dialog
@@ -138,7 +176,7 @@ export function SiteGroupDialog({
     >
       <form onSubmit={submit}>
         <header className="app-dialog-heading">
-          <h2 id="site-group-title">{draft.id ? "编辑分组" : "新建分组"}</h2>
+          <h2 id="site-group-title">{draft.id ? "编辑分组" : "新增分组"}</h2>
           <button aria-label="关闭站点分组" className="icon-button" disabled={saving} onClick={close} type="button">
             <XCircle size={18} aria-hidden="true" />
           </button>
@@ -153,7 +191,7 @@ export function SiteGroupDialog({
                 setShowOnStartup(id === startupGroupId);
                 setError(null);
               }}>
-                <option value="">新建分组</option>
+                <option value="">新增分组</option>
                 {groups.map((group) => (
                   <option key={group.id} value={group.id}>
                     {group.name}{group.id === startupGroupId ? "（启动时显示）" : ""}
@@ -173,6 +211,43 @@ export function SiteGroupDialog({
               <span>启动时显示此分组</span>
               <input type="checkbox" checked={showOnStartup} onChange={(event) => setShowOnStartup(event.target.checked)} />
             </label>
+            <label className="site-secret-field">
+              <span>保活计划</span>
+              <select value={task ? "custom" : "inherit"} onChange={(event) => {
+                const savedTask = groups.find((group) => group.id === draft.id)?.task;
+                const task = event.target.value === "custom" ? { ...(savedTask ?? defaultTask) } : null;
+                setDraft({ ...draft, task });
+              }}>
+                <option value="inherit">沿用默认设置的计划</option>
+                <option value="custom">单独设置计划</option>
+              </select>
+            </label>
+            {task ? (
+              <>
+                <CronField
+                  className="site-secret-field"
+                  value={task.cron}
+                  preview={cronPreview}
+                  onChange={(cron) => setDraft({ ...draft, task: { ...task, cron } })}
+                />
+                <label>
+                  <span>随机延迟上限（分钟）</span>
+                  <input required type="number" min={0} max={1440} value={task.cron_offset_minutes} onChange={(event) =>
+                    setDraft({ ...draft, task: { ...task, cron_offset_minutes: Number(event.target.value) } })
+                  } />
+                </label>
+                <label>
+                  <span>保活停留时间（秒）</span>
+                  <input required type="number" min={5} value={task.visit_duration} onChange={(event) =>
+                    setDraft({ ...draft, task: { ...task, visit_duration: Number(event.target.value) } })
+                  } />
+                </label>
+              </>
+            ) : (
+              <p className="site-group-hint site-secret-field">
+                <CronPreviewText preview={cronPreview} /> · 随机延迟最多 {defaultTask.cron_offset_minutes} 分钟 · 停留 {defaultTask.visit_duration} 秒
+              </p>
+            )}
             <label className="site-secret-field">
               <span>网络出口</span>
               <select value={draft.browser_proxy.enabled ? "proxy" : "direct"} onChange={(event) => setDraft({
@@ -201,16 +276,16 @@ export function SiteGroupDialog({
             <label className="site-secret-field">
               <span>CookieCloud</span>
               <select value={draft.cookie_mode} onChange={(event) => setDraft({ ...draft, cookie_mode: event.target.value as SiteGroup["cookie_mode"] })}>
-                <option value="manual">手动</option>
-                <option value="inherit">默认（跟随设置）</option>
-                <option value="custom">自定义</option>
+                <option value="manual">{cookieModeLabels.manual}</option>
+                <option value="inherit">{cookieModeLabels.inherit}</option>
+                <option value="custom">{cookieModeLabels.custom}</option>
               </select>
             </label>
             {draft.cookie_mode === "manual" && (
-              <p className="site-group-hint site-secret-field">登录状态保存在本组浏览器中，不参与 CookieCloud 同步。</p>
+              <p className="site-group-hint site-secret-field">本组停用 CookieCloud 导入和上传。站点自动登录仍由各站点的开关控制。</p>
             )}
             {draft.cookie_mode === "inherit" && (
-              <p className="site-group-hint site-secret-field">使用设置页的 CookieCloud 连接和自动同步开关。</p>
+              <p className="site-group-hint site-secret-field">使用「默认设置」里的 CookieCloud 连接和自动同步开关。</p>
             )}
             {draft.cookie_mode === "custom" && (
               <>
@@ -245,7 +320,7 @@ export function SiteGroupDialog({
               </>
             )}
             <p className="site-group-hint site-secret-field">
-              每组使用独立的浏览器数据。同一站点的不同账号请放到不同组。未分组站点沿用设置页的配置。
+              每组使用独立的浏览器数据。同一站点的不同账号请放到不同组。默认分组使用「默认设置」里的浏览器配置。
             </p>
           </fieldset>
           {error && <p className="app-dialog-error" role="alert">{error}</p>}
@@ -263,7 +338,7 @@ export function SiteGroupDialog({
             </button>
           )}
           <button className="ghost" disabled={saving} onClick={close} type="button">取消</button>
-          <button className="primary-action" disabled={saving} type="submit">{saving ? "保存中…" : "保存分组"}</button>
+          <button className="primary-action" disabled={saving || (!!task && cronPreview.state !== "valid")} type="submit">{saving ? "保存中…" : "保存分组"}</button>
         </footer>
       </form>
     </dialog>

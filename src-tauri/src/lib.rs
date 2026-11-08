@@ -5,14 +5,13 @@ mod cdp;
 mod commands;
 mod cookiecloud;
 mod gotify;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(not(debug_assertions), test)))]
 mod macos_autostart;
 mod ocr;
 mod scheduler;
 mod store;
 mod updater;
 
-use chrono::{DateTime, Local};
 use commands::AppState;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -39,16 +38,21 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // 加载配置
-            let mut config = store::load_config(&app.handle());
+            let config = store::load_config(&app.handle());
             store::set_log_retention(config.log_retention);
+            store::set_ocr_debug_enabled(config.ocr_debug_enabled);
             #[cfg(all(target_os = "macos", not(debug_assertions)))]
-            let auto_launch_result = macos_autostart::reconcile(app.handle(), config.auto_launch)
-                .map(|enabled| {
-                    if config.auto_launch != enabled {
-                        config.auto_launch = enabled;
-                        store::save_config(app.handle(), &config);
-                    }
-                });
+            let (config, auto_launch_result) = {
+                let mut config = config;
+                let result = macos_autostart::reconcile(app.handle(), config.auto_launch)
+                    .map(|enabled| {
+                        if config.auto_launch != enabled {
+                            config.auto_launch = enabled;
+                            store::save_config(app.handle(), &config);
+                        }
+                    });
+                (config, result)
+            };
             #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
             let auto_launch_result = commands::apply_auto_launch(app.handle(), config.auto_launch);
             let logs = Arc::new(Mutex::new(store::load_logs()));
@@ -64,8 +68,7 @@ pub fn run() {
             let task_running = Arc::new(Mutex::new(false));
             let browser_operation = Arc::new(Mutex::new(()));
             let task_cancel_requested = Arc::new(AtomicBool::new(false));
-            let next_run: Arc<Mutex<Option<DateTime<Local>>>> = Arc::new(Mutex::new(None));
-            let mut scheduler = scheduler::Scheduler::new(Arc::clone(&next_run));
+            let mut scheduler = scheduler::Scheduler::new();
             let config_state = Arc::new(Mutex::new(config.clone()));
             scheduler.start(
                 config.clone(),
@@ -97,6 +100,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
+            commands::describe_cron,
             commands::save_config,
             commands::test_gotify,
             commands::test_bark,
@@ -116,6 +120,7 @@ pub fn run() {
             commands::run_task,
             commands::stop_task,
             commands::get_logs,
+            commands::get_ocr_debug,
             commands::clear_logs,
             commands::clear_browser_data,
             commands::clear_cookiecloud_data,
@@ -157,7 +162,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItemBuilder::with_id("show", "打开主界面").build(app)?;
-    let run = MenuItemBuilder::with_id("run", "立即执行保活").build(app)?;
+    let run = MenuItemBuilder::with_id("run", "保活默认分组").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
     let menu = MenuBuilder::new(app).items(&[&show, &run, &quit]).build()?;
 
@@ -178,18 +183,10 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app.state::<AppState>();
-                    let config = state.config.lock().await.clone();
-                    scheduler::run_with_flag(
-                        &config,
-                        &state.logs,
-                        &state.task_running,
-                        &state.browser_operation,
-                        &state.task_cancel_requested,
-                        false,
-                        Some(&state.app_handle),
-                        Some(&state.config),
-                    )
-                    .await;
+                    let logs = Arc::clone(&state.logs);
+                    if let Err(err) = commands::run_task(state, None).await {
+                        store::push_log(&logs, store::LogEntry::error(err)).await;
+                    }
                 });
             }
             "quit" => {

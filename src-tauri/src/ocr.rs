@@ -19,7 +19,24 @@ pub struct RecognitionResult {
     pub text: String,
 }
 
-pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResult, String> {
+pub struct RecognitionError {
+    summary: String,
+    pub candidate: Option<String>,
+}
+
+impl From<String> for RecognitionError {
+    fn from(summary: String) -> Self {
+        Self { summary, candidate: None }
+    }
+}
+
+impl std::fmt::Display for RecognitionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.summary)
+    }
+}
+
+pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResult, RecognitionError> {
     ensure_initialized(server_url)?;
     let image_base64 = preprocess_captcha(image_base64)?;
     // 同一张图只识别一次；位数不符或识别失败时，由调用方刷新页面换图。
@@ -29,7 +46,7 @@ pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResu
         "probability": false,
         "charset_range": CAPTCHA_CHARSET
     });
-    let (_, payload) = request_json(
+    let payload = request_json(
         server_url,
         "POST",
         "/ocr",
@@ -37,11 +54,7 @@ pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResu
         Duration::from_secs(30),
     )?;
     if payload.get("success").and_then(Value::as_bool) != Some(true) {
-        return Err(format!(
-            "{} (完整响应: {})",
-            api_message(&payload, "OCR 识别失败"),
-            payload
-        ));
+        return Err("OCR 服务未能识别验证码".to_string().into());
     }
     let text = payload
         .get("data")
@@ -49,17 +62,17 @@ pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResu
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("OCR 未返回识别文本 (完整响应: {})", payload))?;
+        .ok_or_else(|| "OCR 未返回识别文本".to_string())?;
     // 拒绝缺字和非英文数字的结果，避免无效识别消耗登录次数。
     if text.len() != CAPTCHA_LENGTH || !text.chars().all(|char| char.is_ascii_alphanumeric()) {
-        return Err(format!(
-            "OCR 结果格式异常 (识别文本: \"{}\", 长度: {}, 要求长度: {}, 仅含英文数字: {}, 完整响应: {})",
-            text,
-            text.len(),
-            CAPTCHA_LENGTH,
-            text.chars().all(|c| c.is_ascii_alphanumeric()),
-            payload
-        ));
+        return Err(RecognitionError {
+            summary: format!(
+                "OCR 结果格式异常（长度 {}，要求 {} 位英文或数字）",
+                text.chars().count(),
+                CAPTCHA_LENGTH
+            ),
+            candidate: Some(text.chars().take(64).collect()),
+        });
     }
     Ok(RecognitionResult {
         text: text.to_string(),
@@ -116,7 +129,7 @@ fn preprocess_captcha(value: &str) -> Result<String, String> {
 }
 
 pub fn ensure_initialized(server_url: &str) -> Result<(), String> {
-    let (_, status) = request_json(server_url, "GET", "/status", None, Duration::from_secs(15))?;
+    let status = request_json(server_url, "GET", "/status", None, Duration::from_secs(15))?;
     let normalized_url = server_url.trim().trim_end_matches('/');
     let beta_ready = BETA_INITIALIZED_SERVERS
         .lock()
@@ -135,7 +148,7 @@ pub fn ensure_initialized(server_url: &str) -> Result<(), String> {
 }
 
 fn initialize(server_url: &str) -> Result<(), String> {
-    let (_, initialized) = request_json(
+    let initialized = request_json(
         server_url,
         "POST",
         "/initialize",
@@ -143,10 +156,10 @@ fn initialize(server_url: &str) -> Result<(), String> {
         Duration::from_secs(120),
     )?;
     if initialized.get("success").and_then(Value::as_bool) != Some(true) {
-        return Err(api_message(&initialized, "OCR 服务初始化失败"));
+        return Err("OCR 服务初始化失败".to_string());
     }
 
-    let (_, status) = request_json(server_url, "GET", "/status", None, Duration::from_secs(15))?;
+    let status = request_json(server_url, "GET", "/status", None, Duration::from_secs(15))?;
     if ocr_ready(&status) {
         Ok(())
     } else {
@@ -166,22 +179,13 @@ fn string_array_contains(value: Option<&Value>, expected: &str) -> bool {
         .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(expected)))
 }
 
-fn api_message(payload: &Value, fallback: &str) -> String {
-    payload
-        .get("message")
-        .or_else(|| payload.get("detail"))
-        .and_then(Value::as_str)
-        .unwrap_or(fallback)
-        .to_string()
-}
-
 fn request_json(
     server_url: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
     timeout: Duration,
-) -> Result<(u16, Value), String> {
+) -> Result<Value, String> {
     let base_url = server_url.trim().trim_end_matches('/');
     if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
         return Err("OCR 地址必须以 http:// 或 https:// 开头".to_string());
@@ -190,7 +194,7 @@ fn request_json(
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .build()
-        .map_err(|err| format!("OCR HTTP 客户端初始化失败：{}", err))?;
+        .map_err(|err| format!("OCR HTTP 客户端初始化失败：{}", err.without_url()))?;
     let mut request = match method {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
@@ -203,24 +207,17 @@ fn request_json(
         if err.is_timeout() {
             "OCR 服务请求超时".to_string()
         } else if err.is_connect() {
-            format!("OCR 服务连接失败：{}", err)
+            format!("OCR 服务连接失败：{}", err.without_url())
         } else {
-            format!("OCR 请求失败：{}", err)
+            format!("OCR 请求失败：{}", err.without_url())
         }
     })?;
     let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("OCR 服务返回 HTTP {status}"));
+    }
     let response_text = response
         .text()
-        .map_err(|err| format!("读取 OCR 响应失败：{}", err))?;
-    let payload: Value = serde_json::from_str(&response_text)
-        .map_err(|err| format!("OCR JSON 解析失败：{} (原始响应: {})", err, response_text))?;
-    if !(200..300).contains(&status) {
-        return Err(format!(
-            "OCR 服务返回 HTTP {}：{} (完整响应: {})",
-            status,
-            api_message(&payload, "请求失败"),
-            payload
-        ));
-    }
-    Ok((status, payload))
+        .map_err(|err| format!("读取 OCR 响应失败：{}", err.without_url()))?;
+    serde_json::from_str(&response_text).map_err(|_| "OCR 服务返回了无效的 JSON".to_string())
 }

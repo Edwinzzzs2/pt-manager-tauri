@@ -1,9 +1,10 @@
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::Mutex;
@@ -13,12 +14,16 @@ const MIN_LOG_RETENTION: usize = 50;
 const MAX_LOG_RETENTION: usize = 5000;
 const LOGIN_ATTEMPT_RESET_SECONDS: i64 = 24 * 60 * 60;
 static LOG_RETENTION: AtomicUsize = AtomicUsize::new(DEFAULT_LOG_RETENTION);
+static OCR_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+const MAX_OCR_DEBUG_ENTRIES: usize = 12;
+const MAX_OCR_DEBUG_IMAGE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Site {
     pub id: String,
     pub name: String,
     pub url: String,
+    /// 旧版没有此字段，缺省和 null 都表示默认分组。
     #[serde(default)]
     pub group_id: Option<String>,
     #[serde(default)]
@@ -88,6 +93,8 @@ pub struct AppConfig {
     pub ocr_server_url: String,
     #[serde(default = "default_ocr_retry_count")]
     pub ocr_retry_count: u8,
+    #[serde(default)]
+    pub ocr_debug_enabled: bool,
     #[serde(default = "default_min_login_attempts_remaining")]
     pub min_login_attempts_remaining: u8,
     #[serde(default = "default_auto_check_updates")]
@@ -176,6 +183,15 @@ pub struct SiteGroup {
     pub cookie_auto_import: bool,
     #[serde(default)]
     pub cookie_auto_upload: bool,
+    #[serde(default)]
+    pub task: Option<GroupTaskConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupTaskConfig {
+    pub cron: String,
+    pub cron_offset_minutes: i64,
+    pub visit_duration: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +242,14 @@ impl AppConfig {
         std::iter::once(None).chain(self.site_groups.iter().map(|group| Some(group.id.as_str())))
     }
 
+    pub fn group_ids_for_scope(&self, scope: &str) -> Result<Vec<Option<String>>, String> {
+        match scope {
+            "all" => Ok(self.group_ids().map(|id| id.map(str::to_owned)).collect()),
+            "" => Ok(vec![None]),
+            id => Ok(vec![Some(self.group(id)?.id.clone())]),
+        }
+    }
+
     pub fn global_cookiecloud_group_ids(&self) -> impl Iterator<Item = Option<&str>> {
         std::iter::once(None).chain(
             self.site_groups.iter()
@@ -239,6 +263,11 @@ impl AppConfig {
             .iter()
             .find(|group| group.id == id)
             .ok_or_else(|| "所选站点分组已不存在".to_string())
+    }
+
+    pub fn group_name(&self, id: Option<&str>) -> &str {
+        id.and_then(|id| self.group(id).ok())
+            .map_or("默认分组", |group| group.name.as_str())
     }
 
     pub fn for_group(&self, id: Option<&str>) -> Result<Self, String> {
@@ -255,6 +284,11 @@ impl AppConfig {
             scoped.profile_group = Some(group.id.clone());
             scoped.cdp_port = group.cdp_port;
             scoped.browser_proxy = group.browser_proxy.clone();
+            if let Some(task) = &group.task {
+                scoped.cron = task.cron.clone();
+                scoped.cron_offset_minutes = task.cron_offset_minutes;
+                scoped.visit_duration = task.visit_duration;
+            }
             match group.cookie_mode {
                 GroupCookieMode::Manual | GroupCookieMode::Off => {
                     scoped.cookiecloud = CookieCloudConfig::default();
@@ -363,6 +397,14 @@ pub fn normalize_site_groups(config: &mut AppConfig) -> Result<(), String> {
         }
         crate::browser_proxy::normalize_config(&mut group.browser_proxy)
             .map_err(|err| format!("分组「{}」：{err}", group.name))?;
+        if let Some(task) = &mut group.task {
+            task.cron = task.cron.split_whitespace().collect::<Vec<_>>().join(" ");
+            if crate::scheduler::next_run_from_cron(&task.cron).is_none() {
+                return Err(format!("分组「{}」的 Cron 表达式无效", group.name));
+            }
+            task.cron_offset_minutes = task.cron_offset_minutes.clamp(0, 1440);
+            task.visit_duration = task.visit_duration.max(5);
+        }
         if group.cookie_mode == GroupCookieMode::Custom {
             group.cookiecloud.server_url = group.cookiecloud.server_url.trim().trim_end_matches('/').to_string();
             group.cookiecloud.uuid = group.cookiecloud.uuid.trim().to_string();
@@ -486,6 +528,7 @@ impl Default for AppConfig {
             auto_sync_cookie_after_keepalive: false,
             ocr_server_url: default_ocr_server_url(),
             ocr_retry_count: default_ocr_retry_count(),
+            ocr_debug_enabled: false,
             min_login_attempts_remaining: default_min_login_attempts_remaining(),
             auto_check_updates: default_auto_check_updates(),
             update_check_interval_hours: default_update_check_interval_hours(),
@@ -622,6 +665,22 @@ pub struct LogEntry {
     pub timestamp: DateTime<Local>,
     pub level: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_debug_id: Option<String>,
+    #[serde(skip)]
+    ocr_debug: Option<Arc<OcrDebugDetails>>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct OcrDebugDetails {
+    pub image_base64: Option<String>,
+    pub recognized_text: Option<String>,
+}
+
+impl std::fmt::Debug for OcrDebugDetails {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("OcrDebugDetails").finish_non_exhaustive()
+    }
 }
 
 impl LogEntry {
@@ -630,6 +689,8 @@ impl LogEntry {
             timestamp: Local::now(),
             level: "INFO".to_string(),
             message: msg.into(),
+            ocr_debug_id: None,
+            ocr_debug: None,
         }
     }
 
@@ -638,6 +699,8 @@ impl LogEntry {
             timestamp: Local::now(),
             level: "ERROR".to_string(),
             message: msg.into(),
+            ocr_debug_id: None,
+            ocr_debug: None,
         }
     }
 
@@ -646,7 +709,14 @@ impl LogEntry {
             timestamp: Local::now(),
             level: "SUCCESS".to_string(),
             message: msg.into(),
+            ocr_debug_id: None,
+            ocr_debug: None,
         }
+    }
+
+    fn clear_ocr_debug(&mut self) {
+        self.ocr_debug_id = None;
+        self.ocr_debug = None;
     }
 }
 
@@ -691,6 +761,10 @@ pub fn set_log_retention(value: usize) {
     LOG_RETENTION.store(normalize_log_retention(value), Ordering::Relaxed);
 }
 
+pub fn set_ocr_debug_enabled(enabled: bool) {
+    OCR_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 pub fn current_log_retention() -> usize {
     normalize_log_retention(LOG_RETENTION.load(Ordering::Relaxed))
 }
@@ -709,10 +783,43 @@ pub fn append_log(entry: &LogEntry) {
 pub fn load_logs() -> Vec<LogEntry> {
     let data = fs::read_to_string(log_file_path()).unwrap_or_default();
     let mut logs = data.lines().filter_map(parse_log_line).collect::<Vec<_>>();
-    if trim_logs(&mut logs, current_log_retention()) {
+    let mut redacted = false;
+    for entry in &mut logs {
+        if let Some(message) = redact_legacy_ocr_message(&entry.message) {
+            entry.message = message;
+            redacted = true;
+        }
+    }
+    if trim_logs(&mut logs, current_log_retention()) || redacted {
         write_log_file(&logs);
     }
     logs
+}
+
+fn redact_legacy_ocr_message(message: &str) -> Option<String> {
+    if let Some((prefix, _)) = message.split_once("，Base64 为：") {
+        if prefix.ends_with("获取验证码图片成功，准备发送给 OCR 服务") {
+            return Some(prefix.to_string());
+        }
+    }
+    if let Some((prefix, details)) = message.split_once("验证码识别成功：") {
+        if let Some((_, suffix)) = details.split_once("，验证码尝试次数：") {
+            return Some(format!("{prefix}验证码识别成功，验证码尝试次数：{suffix}"));
+        }
+    }
+    if let Some((prefix, _)) = message.split_once(" 张成功，验证码：") {
+        if prefix.contains(" OCR 识别：") {
+            return Some(format!("{prefix} 张成功"));
+        }
+    }
+    if message.contains("OCR") || message.contains("验证码识别失败") {
+        for marker in [" (识别文本: ", " (完整响应: ", " (原始响应: "] {
+            if let Some((prefix, _)) = message.split_once(marker) {
+                return Some(prefix.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parse_log_line(line: &str) -> Option<LogEntry> {
@@ -730,6 +837,8 @@ fn parse_log_line(line: &str) -> Option<LogEntry> {
         timestamp,
         level: level.to_string(),
         message: message.to_string(),
+        ocr_debug_id: None,
+        ocr_debug: None,
     })
 }
 
@@ -737,19 +846,162 @@ pub fn clear_log_file() {
     let _ = fs::write(log_file_path(), "");
 }
 
+tokio::task_local! {
+    static LOG_GROUP: Option<String>;
+}
+
+pub async fn with_group_log<F: Future>(group: &str, future: F) -> F::Output {
+    LOG_GROUP.scope(Some(group.to_owned()), future).await
+}
+
+pub fn spawn_with_group_log<F>(future: F) -> tauri::async_runtime::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let group = LOG_GROUP.try_with(Clone::clone).ok().flatten();
+    tauri::async_runtime::spawn(LOG_GROUP.scope(group, future))
+}
+
+#[cfg(test)]
+mod group_log_tests {
+    use super::*;
+
+    #[test]
+    fn spawned_jobs_keep_their_own_group_context() {
+        tauri::async_runtime::block_on(async {
+            let first = with_group_log("直连组", async {
+                spawn_with_group_log(async { LOG_GROUP.with(Clone::clone) })
+            }).await;
+            let second = with_group_log("代理组", async {
+                spawn_with_group_log(async { LOG_GROUP.with(Clone::clone) })
+            }).await;
+            assert_eq!(first.await.unwrap().as_deref(), Some("直连组"));
+            assert_eq!(second.await.unwrap().as_deref(), Some("代理组"));
+            assert!(LOG_GROUP.try_with(Clone::clone).is_err());
+        });
+    }
+}
+
 pub async fn push_log(logs: &Arc<Mutex<Vec<LogEntry>>>, entry: LogEntry) {
-    append_log(&entry);
+    push_log_inner(logs, entry, None).await;
+}
+
+pub async fn push_ocr_log(
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    entry: LogEntry,
+    image_base64: &str,
+    recognized_text: Option<&str>,
+) {
+    push_log_inner(logs, entry, Some((image_base64, recognized_text))).await;
+}
+
+async fn push_log_inner(
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    mut entry: LogEntry,
+    ocr_details: Option<(&str, Option<&str>)>,
+) {
+    if let Ok(Some(group)) = LOG_GROUP.try_with(Clone::clone) {
+        // 保持 run.log 的文本格式，旧版本和日志搜索也能读到分组名称。
+        let group = group.replace(['\r', '\n'], " ");
+        entry.message = format!("「{group}」{}", entry.message);
+    }
     let mut guard = logs.lock().await;
+    if let Some((image_base64, recognized_text)) = ocr_details.filter(|_| OCR_DEBUG_ENABLED.load(Ordering::Relaxed)) {
+        entry.ocr_debug_id = Some(uuid::Uuid::new_v4().to_string());
+        entry.ocr_debug = Some(Arc::new(OcrDebugDetails {
+            image_base64: (image_base64.len() <= MAX_OCR_DEBUG_IMAGE_BYTES).then(|| image_base64.to_owned()),
+            recognized_text: recognized_text.map(str::to_owned),
+        }));
+        for old in guard.iter_mut().rev().filter(|log| log.ocr_debug.is_some()).skip(MAX_OCR_DEBUG_ENTRIES - 1) {
+            old.clear_ocr_debug();
+        }
+    }
+    append_log(&entry);
     guard.push(entry);
     if trim_logs(&mut guard, current_log_retention()) {
         write_log_file(&guard);
     }
 }
 
-pub async fn apply_log_retention(logs: &Arc<Mutex<Vec<LogEntry>>>) {
+pub async fn apply_log_settings(logs: &Arc<Mutex<Vec<LogEntry>>>, retention: usize, ocr_debug_enabled: bool) {
     let mut guard = logs.lock().await;
+    set_log_retention(retention);
+    set_ocr_debug_enabled(ocr_debug_enabled);
+    if !ocr_debug_enabled {
+        for entry in &mut *guard {
+            entry.clear_ocr_debug();
+        }
+    }
     if trim_logs(&mut guard, current_log_retention()) {
         write_log_file(&guard);
+    }
+}
+
+pub async fn ocr_debug_details(logs: &Arc<Mutex<Vec<LogEntry>>>, id: &str) -> Option<OcrDebugDetails> {
+    let guard = logs.lock().await;
+    if !OCR_DEBUG_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    guard.iter()
+        .find(|entry| entry.ocr_debug_id.as_deref() == Some(id))?
+        .ocr_debug.as_deref().cloned()
+}
+
+#[cfg(test)]
+mod ocr_debug_log_tests {
+    use super::*;
+
+    #[test]
+    fn regular_log_output_excludes_debug_payload() {
+        let mut entry = LogEntry::info("验证码识别成功");
+        assert!(entry.ocr_debug_id.is_none());
+        entry.ocr_debug_id = Some("preview-id".to_string());
+        entry.ocr_debug = Some(Arc::new(OcrDebugDetails {
+            image_base64: Some("fixture-image".to_string()),
+            recognized_text: Some("A1B2C3".to_string()),
+        }));
+        let file_line = format_log_line(&entry);
+        let polled_log = serde_json::to_value(&entry).unwrap();
+        assert!(file_line.ends_with("验证码识别成功"));
+        assert!(!file_line.contains("preview-id"));
+        assert_eq!(polled_log["ocr_debug_id"], "preview-id");
+        assert!(!polled_log.to_string().contains("fixture-image"));
+        assert!(!polled_log.to_string().contains("A1B2C3"));
+    }
+
+    #[test]
+    fn disabling_debug_clears_previews_but_keeps_log_messages() {
+        tauri::async_runtime::block_on(async {
+            let mut entry = LogEntry::info("验证码识别成功");
+            entry.ocr_debug_id = Some("preview-id".to_string());
+            entry.ocr_debug = Some(Arc::new(OcrDebugDetails {
+                image_base64: None,
+                recognized_text: Some("A1B2C3".to_string()),
+            }));
+            let logs = Arc::new(Mutex::new(vec![entry]));
+            apply_log_settings(&logs, DEFAULT_LOG_RETENTION, true).await;
+            assert!(ocr_debug_details(&logs, "preview-id").await.is_some());
+
+            apply_log_settings(&logs, DEFAULT_LOG_RETENTION, false).await;
+            assert!(ocr_debug_details(&logs, "preview-id").await.is_none());
+            let guard = logs.lock().await;
+            assert!(guard[0].ocr_debug_id.is_none());
+            assert_eq!(guard[0].message, "验证码识别成功");
+        });
+    }
+
+    #[test]
+    fn redacts_legacy_captcha_payloads_and_preserves_group_context() {
+        for (old, expected) in [
+            ("获取验证码图片成功，准备发送给 OCR 服务，Base64 为：fixture-image", "获取验证码图片成功，准备发送给 OCR 服务"),
+            ("「代理组」验证码识别成功：A1B2C3，验证码尝试次数：1/2。正在自动填入...", "「代理组」验证码识别成功，验证码尝试次数：1/2。正在自动填入..."),
+            ("站点 OCR 识别：第 1/2 张成功，验证码：A1B2C3", "站点 OCR 识别：第 1/2 张成功"),
+            ("OCR 结果格式异常 (识别文本: A1B2C3, 完整响应: fixture)", "OCR 结果格式异常"),
+        ] {
+            assert_eq!(redact_legacy_ocr_message(old).as_deref(), Some(expected));
+        }
+        assert!(redact_legacy_ocr_message("「代理组」站点保活完成").is_none());
     }
 }
 
@@ -864,9 +1116,61 @@ mod site_group_tests {
                 },
                 cookie_auto_import: false,
                 cookie_auto_upload: false,
+                task: None,
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn upgrading_a_config_without_groups_keeps_sites_and_their_existing_settings() {
+        // 分组功能上线前的配置没有 site_groups、startup_group_id 或 group_id。
+        let legacy = serde_json::json!({
+            "sites": [
+                { "id": "one", "name": "站点一", "url": "https://one.example/",
+                  "username": "alice", "password": "sample", "auto_signin": true },
+                { "id": "two", "name": "站点二", "url": "https://two.example/",
+                  "auto_keepalive": false }
+            ],
+            "cron": "0 5,19 * * *",
+            "cron_offset_minutes": 7,
+            "random_delay": true,
+            "visit_duration": 42,
+            "browser": "edge",
+            "cdp_port": 9333,
+            "browser_proxy": { "enabled": true, "server_url": "http://proxy.example:8080" },
+            "cookiecloud": {
+                "server_url": "https://cookies.example",
+                "uuid": "existing-vault",
+                "password": "sample"
+            },
+            "auto_sync_cookie": true,
+            "auto_sync_cookie_after_keepalive": true
+        });
+        let mut config: AppConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!config.ocr_debug_enabled);
+        normalize_site_groups(&mut config).unwrap();
+        assert_eq!(config.group_ids().collect::<Vec<_>>(), vec![None]);
+        assert_eq!(config.global_cookiecloud_group_ids().collect::<Vec<_>>(), vec![None]);
+        assert!(config.startup_group_id.is_none());
+
+        let default = config.for_group(None).unwrap();
+        assert!(default.profile_group.is_none());
+        assert_eq!(default.sites.len(), 2);
+        assert!(default.sites.iter().all(|site| site.group_id.is_none()));
+        assert_eq!(default.sites[0].username, "alice");
+        assert_eq!(default.sites[0].password, "sample");
+        assert!(default.sites[0].auto_signin);
+        assert!(!default.sites[1].auto_keepalive);
+        assert_eq!(default.cron, "0 5,19 * * *");
+        assert_eq!(default.cron_offset_minutes, 7);
+        assert_eq!(default.visit_duration, 42);
+        assert_eq!(default.browser, BrowserKind::Edge);
+        assert_eq!(default.cdp_port, 9333);
+        assert!(default.browser_proxy.enabled);
+        assert_eq!(default.browser_proxy.server_url, "http://proxy.example:8080");
+        assert_eq!(default.cookiecloud.uuid, "existing-vault");
+        assert!(default.auto_sync_cookie && default.auto_sync_cookie_after_keepalive);
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod mteam;
 mod nexusphp;
 mod pting;
 mod sixcloud;
+mod ubits;
 
 use crate::cdp::{CdpClient, CdpProgress};
 

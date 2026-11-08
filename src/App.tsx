@@ -1,4 +1,5 @@
 import {
+  Fragment,
   memo,
   useCallback,
   useEffect,
@@ -7,6 +8,7 @@ import {
   useState,
   type FormEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { getVersion, setTheme as setTauriTheme } from "@tauri-apps/api/app";
@@ -47,8 +49,9 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import "./App.css";
+import { CronField, CronPreviewText, useCronPreview } from "./components/CronField";
 import { VersionCard, type UpdatePhase } from "./components/VersionCard";
-import { SiteGroupDialog, SiteGroupOptions, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup } from "./components/SiteGroups";
+import { cookieModeLabels, SiteGroupDialog, SiteGroupOptions, SiteGroupTabs, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup } from "./components/SiteGroups";
 
 type Site = {
   id: string;
@@ -149,6 +152,7 @@ type AppConfig = {
   auto_sync_cookie_after_keepalive: boolean;
   ocr_server_url: string;
   ocr_retry_count: number;
+  ocr_debug_enabled: boolean;
   min_login_attempts_remaining: number;
   auto_check_updates: boolean;
   update_check_interval_hours: number;
@@ -177,6 +181,12 @@ type LogEntry = {
   timestamp: string;
   level: "INFO" | "SUCCESS" | "ERROR";
   message: string;
+  ocr_debug_id?: string;
+};
+
+type OcrDebugDetails = {
+  image_base64: string | null;
+  recognized_text: string | null;
 };
 
 type AppStatus = {
@@ -187,6 +197,13 @@ type AppStatus = {
   last_result: LogEntry | null;
   is_running: boolean;
   cancel_requested: boolean;
+  groups: GroupStatus[];
+};
+
+type GroupStatus = {
+  group_id: string | null;
+  active_cdp_port: number | null;
+  next_run: string | null;
 };
 
 type CookieCloudSyncResult = {
@@ -224,6 +241,7 @@ const defaultConfig: AppConfig = {
   auto_sync_cookie_after_keepalive: false,
   ocr_server_url: "https://ocr-read.decoffee.top",
   ocr_retry_count: 2,
+  ocr_debug_enabled: false,
   min_login_attempts_remaining: 5,
   auto_check_updates: true,
   update_check_interval_hours: 1,
@@ -309,13 +327,14 @@ function isQingwaSite(siteUrl: string): boolean {
 function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
   const [siteDialog, setSiteDialog] = useState<"add" | "groups" | null>(null);
-  const [selectedSiteGroup, setSelectedSiteGroup] = useState("all");
+  const [selectedSiteGroup, setSelectedSiteGroup] = useState("");
+  const [selectedSettingsGroup, setSelectedSettingsGroup] = useState("");
   const startupNavigationHandled = useRef(false);
   const [colorMode, setColorMode] = useState<ColorMode>(() => readStoredTheme());
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppConfig>(defaultConfig);
-  const [status, setStatus] = useState<AppStatus | null>(null);
+  const [statusSnapshot, setStatusSnapshot] = useState<{ scope: string; value: AppStatus } | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
   const [editingSite, setEditingSite] = useState<SiteDraft>(emptySiteDraft);
@@ -327,6 +346,7 @@ function App() {
   const [browserProxyTestBusy, setBrowserProxyTestBusy] = useState(false);
   const [browserProxyTestResult, setBrowserProxyTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
+  const [browserDataScope, setBrowserDataScope] = useState<string | null>(null);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase>(null);
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -346,18 +366,35 @@ function App() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const browserName = config.browser === "edge" ? "Edge" : "Chrome";
+  const status = statusSnapshot?.value ?? null;
   const siteGroupBusy = busy || !!status?.is_running || cookieSyncBusy
     || testingSiteId !== null || recognizingSiteId !== null;
-  const editingSelectedGroup = config.site_groups.some((group) => group.id === selectedSiteGroup);
+  const siteGroup = config.site_groups.find((group) => group.id === selectedSiteGroup);
+  const settingsGroup = config.site_groups.find((group) => group.id === selectedSettingsGroup);
+  const settingsScope = settingsGroup?.id ?? "";
+  const settingsScopeRef = useRef(settingsScope);
+  const siteScope = siteGroup?.id ?? "";
+  const taskGroup = activeTab === "settings" ? settingsGroup : siteGroup;
+  const taskScope = taskGroup?.id ?? "";
+  const statusScope = activeTab === "dashboard" ? "all" : taskScope;
+  const statusScopeRef = useRef(statusScope);
+  const pendingStatusScopes = useRef(new Set<string>());
+  const scopedStatus = statusSnapshot?.scope === statusScope ? status : null;
+  const taskScopeName = taskGroup?.name ?? "默认分组";
+  const taskSites = config.sites.filter((site) => (site.group_id ?? "") === taskScope);
+  const runnableSiteCount = taskSites.filter((site) => site.auto_keepalive).length;
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
 
   useEffect(() => {
+    settingsScopeRef.current = settingsScope;
     setBrowserProxyTestResult(null);
   }, [
+    settingsScope,
     settingsDraft.browser_proxy.enabled,
     settingsDraft.browser_proxy.server_url,
     settingsDraft.browser_proxy.username,
     settingsDraft.browser_proxy.password,
+    settingsGroup?.browser_proxy,
   ]);
 
   useEffect(() => {
@@ -383,9 +420,24 @@ function App() {
   }
 
   async function refreshStatus() {
-    const next = await invoke<AppStatus>("get_status");
-    setStatus(next);
+    const scope = statusScopeRef.current;
+    const pending = pendingStatusScopes.current;
+    if (pending.has(scope)) return;
+    pending.add(scope);
+    try {
+      const value = await invoke<AppStatus>("get_status", { scope });
+      if (scope === statusScopeRef.current) setStatusSnapshot({ scope, value });
+    } catch (err) {
+      if (scope === statusScopeRef.current) throw err;
+    } finally {
+      pending.delete(scope);
+    }
   }
+
+  useEffect(() => {
+    statusScopeRef.current = statusScope;
+    void refreshStatus().catch(showError);
+  }, [statusScope]);
 
   async function refreshLogs() {
     const next = await invoke<LogEntry[]>("get_logs");
@@ -394,7 +446,6 @@ function App() {
 
   useEffect(() => {
     refreshConfig().catch(showError);
-    refreshStatus().catch(showError);
     refreshLogs().catch(showError);
     resolveDisplayVersion().then(setAppVersion).catch(showError);
 
@@ -452,11 +503,27 @@ function App() {
     setColorMode((mode) => (mode === "dark" ? "light" : "dark"));
   }
 
+  function selectSiteGroup(scope: string) {
+    setSelectedSiteGroup(scope);
+    setEditingSiteId(null);
+  }
+
   async function runNow() {
-    setBusy(true);
     setError(null);
     try {
-      await invoke("run_task");
+      const confirmed = await ask(
+        `将对「${taskScopeName}」中开启自动保活的 ${runnableSiteCount} 个站点执行保活。是否继续？`,
+        {
+          kind: "info",
+          title: "确认立即保活",
+          okLabel: "开始保活",
+          cancelLabel: "取消",
+        },
+      );
+      if (!confirmed) return;
+
+      setBusy(true);
+      await invoke("run_task", { scope: taskScope });
       await refreshStatus();
       await refreshLogs();
     } catch (err) {
@@ -499,24 +566,29 @@ function App() {
   }
 
   async function syncCookieCloud() {
+    const scope = settingsGroup?.id ?? "all";
+    const cookiecloud = scope === "all"
+      ? settingsDraft.cookiecloud
+      : settingsGroup?.cookie_mode === "custom" ? settingsGroup.cookiecloud : config.cookiecloud;
     setCookieSyncBusy(true);
     setError(null);
     try {
       let result: CookieCloudSyncResult;
       try {
-        result = await invoke("sync_cookiecloud_from_config", { config: settingsDraft });
+        result = await invoke("sync_cookiecloud_from_config", { config: settingsDraft, scope });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (!message.includes("仅支持 http://")) throw err;
-        const cookies = await fetchCookieCloudData(settingsDraft.cookiecloud);
+        const cookies = await fetchCookieCloudData(cookiecloud);
         result = await invoke("sync_cookiecloud_cookies", {
           cookies,
-          cookiecloud: settingsDraft.cookiecloud,
+          cookiecloud,
+          scope,
         });
       }
       await refreshStatus();
       await refreshLogs();
-      setNotice(result.failed_groups > 0
+      setNotice(settingsGroup ? `已为「${settingsGroup.name}」同步 CookieCloud 登录数据` : result.failed_groups > 0
         ? `已同步 ${result.synced_groups} 个分组，另有 ${result.failed_groups} 个未同步，详情见日志`
         : `已同步 ${result.synced_groups} 个分组的 CookieCloud 登录数据`);
     } catch (err) {
@@ -526,49 +598,33 @@ function App() {
     }
   }
 
-  async function clearBrowserData() {
-    const confirmed = await ask(
-      `将清除未分组站点使用的专用 ${browserName} 中的 Cookie、Local Storage 和缓存。清除后可重新同步 CookieCloud，确定继续？`,
-      {
-        kind: "warning",
-        okLabel: "清除",
-        cancelLabel: "取消",
-        title: "清除浏览器数据",
-      },
-    );
-    if (!confirmed) {
-      return;
-    }
-
+  async function clearBrowserData(scope: string) {
     setBrowserDataClearBusy(true);
     setError(null);
     try {
-      await invoke("clear_browser_data");
-      await refreshStatus();
-      await refreshLogs();
-      await message("浏览器数据已清除，可以重新同步 CookieCloud", {
-        kind: "info",
-        title: "清除完成",
-      });
-    } catch (err) {
-      showError(err);
+      await invoke("clear_browser_data", { scope });
+      setNotice("所选范围的浏览器数据已清除");
     } finally {
+      void refreshStatus().catch(showError);
+      void refreshLogs().catch(showError);
       setBrowserDataClearBusy(false);
     }
   }
 
   async function clearCookieCloudData() {
-    const serverUrl = settingsDraft.cookiecloud.server_url.trim();
+    const scope = settingsGroup?.id ?? "all";
+    const cookiecloud = settingsGroup?.cookie_mode === "custom" ? settingsGroup.cookiecloud : settingsDraft.cookiecloud;
+    const serverUrl = cookiecloud.server_url.trim();
     if (
       !serverUrl ||
-      !settingsDraft.cookiecloud.uuid.trim() ||
-      !settingsDraft.cookiecloud.password
+      !cookiecloud.uuid.trim() ||
+      !cookiecloud.password
     ) {
       setError("请先填写 CookieCloud 地址、UUID 和密码");
       return;
     }
     const confirmed = await ask(
-      `将永久清空 ${serverUrl} 上当前 UUID 对应的 Cookie 和 Local Storage 数据，确定继续？`,
+      `将永久清空「${settingsGroup?.name ?? "共享 CookieCloud"}」在 ${serverUrl} 上的 Cookie 和站点存储，确定继续？`,
       {
         kind: "warning",
         okLabel: "清空云端数据",
@@ -581,7 +637,7 @@ function App() {
     setCookieCloudClearBusy(true);
     setError(null);
     try {
-      await invoke("clear_cookiecloud_data", { config: settingsDraft.cookiecloud });
+      await invoke("clear_cookiecloud_data", { config: cookiecloud, scope });
       await refreshLogs();
       setNotice("CookieCloud 服务器上的 Cookie 和 Local Storage 数据已清空");
     } catch (err) {
@@ -621,7 +677,7 @@ function App() {
       cookiecloudUpload: newSite.cookiecloud_upload,
     });
     setConfig(next);
-    setSettingsDraft(next);
+    setSettingsDraft((draft) => ({ ...draft, sites: next.sites }));
     void refreshStatus().catch(showError);
   }
 
@@ -744,13 +800,23 @@ function App() {
   async function saveSiteGroup(group: SiteGroup, showOnStartup: boolean) {
     const next = await invoke<AppConfig>("save_site_group", { group, showOnStartup });
     setConfig(next);
-    setSettingsDraft(next);
+    setSettingsDraft((draft) => ({
+      ...draft, sites: next.sites, site_groups: next.site_groups, startup_group_id: next.startup_group_id,
+    }));
+    if (!group.id) {
+      const added = next.site_groups.find((saved) => !config.site_groups.some((existing) => existing.id === saved.id));
+      if (added) setSelectedSettingsGroup(added.id);
+    }
   }
 
   async function removeSiteGroup(id: string) {
     const next = await invoke<AppConfig>("remove_site_group", { id });
     setConfig(next);
-    setSettingsDraft(next);
+    setSettingsDraft((draft) => ({
+      ...draft, sites: next.sites, site_groups: next.site_groups, startup_group_id: next.startup_group_id,
+    }));
+    if (selectedSiteGroup === id) selectSiteGroup("");
+    if (selectedSettingsGroup === id) setSelectedSettingsGroup("");
   }
 
   async function removeSite(id: string) {
@@ -890,10 +956,13 @@ function App() {
   async function saveSettings() {
     const next: AppConfig = {
       ...settingsDraft,
-      cdp_port: Number(settingsDraft.cdp_port) || 9222,
+      sites: config.sites,
+      site_groups: config.site_groups,
+      startup_group_id: config.startup_group_id,
+      cdp_port: settingsDraft.cdp_port,
       visit_duration: Math.max(5, Number(settingsDraft.visit_duration) || 30),
       log_retention: clampNumber(Number(settingsDraft.log_retention) || 500, 50, 5000),
-      cron: settingsDraft.cron.trim() || defaultConfig.cron,
+      cron: settingsDraft.cron.trim(),
       cron_offset_minutes: clampNumber(Number(settingsDraft.cron_offset_minutes) || 0, 0, 1440),
       random_delay: Number(settingsDraft.cron_offset_minutes) > 0,
       ocr_server_url: settingsDraft.ocr_server_url.trim(),
@@ -910,11 +979,6 @@ function App() {
       ),
       update_proxy_url: settingsDraft.update_proxy_url.trim().replace(/\/+$/, ""),
       update_proxy_password: settingsDraft.update_proxy_password,
-      browser_proxy: {
-        ...settingsDraft.browser_proxy,
-        server_url: settingsDraft.browser_proxy.server_url.trim().replace(/\/+$/, ""),
-        username: settingsDraft.browser_proxy.username.trim(),
-      },
       gotify: {
         ...settingsDraft.gotify,
         server_url: settingsDraft.gotify.server_url.trim().replace(/\/+$/, ""),
@@ -983,17 +1047,18 @@ function App() {
     }
   }
 
-  async function testBrowserProxy() {
+  async function testBrowserProxy(proxy: BrowserProxyConfig) {
+    const scope = settingsScope;
     setBrowserProxyTestBusy(true);
     setBrowserProxyTestResult(null);
     setError(null);
     try {
       const message = await invoke<string>("test_browser_proxy", {
-        config: settingsDraft.browser_proxy,
+        config: proxy,
       });
-      setBrowserProxyTestResult({ ok: true, message });
+      if (scope === settingsScopeRef.current) setBrowserProxyTestResult({ ok: true, message });
     } catch (err) {
-      setBrowserProxyTestResult({ ok: false, message: String(err) });
+      if (scope === settingsScopeRef.current) setBrowserProxyTestResult({ ok: false, message: String(err) });
     } finally {
       setBrowserProxyTestBusy(false);
     }
@@ -1115,18 +1180,18 @@ function App() {
 
         <div className="sidebar-footer">
           <div className="sidebar-status">
-            <span className={status?.cdp_connected ? "dot ok" : "dot standby"} />
+            <span className={scopedStatus?.cdp_connected ? "dot ok" : "dot standby"} />
             <div>
               <strong>
-                {status?.cdp_connected
+                {scopedStatus?.cdp_connected
                   ? `${browserName} 已连接`
                   : status?.browser_installed === false
                     ? `需要安装 ${browserName}`
                     : "自动模式待命"}
               </strong>
               <span>
-                {status?.cdp_connected
-                  ? `localhost:${status.active_cdp_port ?? config.cdp_port}`
+                {scopedStatus?.cdp_connected
+                  ? `localhost:${scopedStatus.active_cdp_port ?? config.cdp_port}`
                   : status?.browser_installed === false
                     ? "安装后自动接管"
                     : "运行时自动准备"}
@@ -1150,7 +1215,7 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <p className="eyebrow">MVP 控制台</p>
+            <p className="eyebrow">PT Manager</p>
             <h1>{pageTitle(activeTab)}</h1>
           </div>
           <div className="topbar-actions">
@@ -1162,34 +1227,11 @@ function App() {
             >
               {colorMode === "dark" ? <Sun size={17} /> : <Moon size={17} />}
             </button>
-            {activeTab === "sites" && (
-              <>
-                <button
-                  aria-haspopup="dialog"
-                  className="ghost"
-                  disabled={siteGroupBusy}
-                  onClick={() => setSiteDialog("groups")}
-                  type="button"
-                >
-                  {editingSelectedGroup ? <Pencil size={16} aria-hidden="true" /> : <Settings2 size={16} aria-hidden="true" />}
-                  <span>{editingSelectedGroup ? "编辑分组" : "分组管理"}</span>
-                </button>
-                <button
-                  aria-haspopup="dialog"
-                  className="primary-action"
-                  disabled={siteGroupBusy}
-                  onClick={() => setSiteDialog("add")}
-                  type="button"
-                >
-                  <Plus size={16} aria-hidden="true" />
-                  <span>新增站点</span>
-                </button>
-              </>
-            )}
             <button
               className="primary-action"
-              disabled={busy || status?.is_running}
+              disabled={siteGroupBusy || browserDataClearBusy || cookieCloudClearBusy || runnableSiteCount === 0}
               onClick={runNow}
+              title={runnableSiteCount === 0 ? "当前分组没有开启自动保活的站点" : undefined}
               type="button"
             >
               {busy || status?.is_running ? <RefreshCw size={18} /> : <Play size={18} />}
@@ -1235,7 +1277,8 @@ function App() {
               lastLog={lastVisibleLog}
               onOpenBrowserDownload={openBrowserDownload}
               recentLogs={logs.slice(-30).reverse()}
-              status={status}
+              status={scopedStatus}
+              taskRunning={!!status?.is_running}
               onRefresh={() => {
                 refreshStatus().catch(showError);
                 refreshLogs().catch(showError);
@@ -1248,21 +1291,17 @@ function App() {
               busy={busy}
               groupBusy={siteGroupBusy}
               config={config}
-              siteDialog={siteDialog}
-              selectedGroup={selectedSiteGroup}
-              onSelectGroup={setSelectedSiteGroup}
+              selectedGroup={siteScope}
+              onSelectGroup={selectSiteGroup}
               editingSite={editingSite}
               editingSiteId={editingSiteId}
-              onAdd={addSite}
+              onAddSite={() => setSiteDialog("add")}
               onCancelEdit={() => setEditingSiteId(null)}
-              onCloseSiteDialog={() => setSiteDialog(null)}
               onEditChange={setEditingSite}
               onRemove={removeSite}
               onRemoveSelected={removeSites}
-              onRemoveGroup={removeSiteGroup}
               onRecognizeCaptcha={recognizeSiteCaptcha}
               onSave={saveSite}
-              onSaveGroup={saveSiteGroup}
               onStartEdit={startEdit}
               onTestLogin={testSiteLogin}
               onStopTest={stopTask}
@@ -1274,7 +1313,45 @@ function App() {
             />
           ) : null}
 
-          {activeTab === "settings" ? (
+          {activeTab === "settings" && (
+            <div className="settings-scope-bar">
+              <SiteGroupTabs
+                groups={config.site_groups}
+                value={settingsScope}
+                defaultLabel="默认设置"
+                label="设置范围"
+                onChange={setSelectedSettingsGroup}
+              />
+              <div className="row-actions">
+                <button
+                  aria-haspopup="dialog"
+                  className="ghost"
+                  disabled={siteGroupBusy}
+                  onClick={() => setSiteDialog("groups")}
+                  type="button"
+                >
+                  {settingsGroup ? <Pencil size={16} aria-hidden="true" /> : <Plus size={16} aria-hidden="true" />}
+                  <span>{settingsGroup ? "编辑分组" : "新增分组"}</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "settings" && settingsGroup ? (
+            <GroupSettingsPanel
+              config={config}
+              group={settingsGroup}
+              siteCount={config.sites.filter((site) => site.group_id === settingsScope).length}
+              busy={siteGroupBusy || browserDataClearBusy || cookieCloudClearBusy}
+              cookieSyncBusy={cookieSyncBusy}
+              browserProxyTestBusy={browserProxyTestBusy}
+              browserProxyTestResult={browserProxyTestResult}
+              onTestProxy={() => testBrowserProxy(settingsGroup.browser_proxy)}
+              onSyncCookieCloud={syncCookieCloud}
+              onClearCookieCloud={clearCookieCloudData}
+              onOpenBrowserData={() => setBrowserDataScope(settingsScope)}
+            />
+          ) : activeTab === "settings" ? (
             <SettingsPanel
               busy={busy}
               browserDataClearBusy={browserDataClearBusy}
@@ -1286,14 +1363,14 @@ function App() {
               browserProxyTestResult={browserProxyTestResult}
               draft={settingsDraft}
               onChange={setSettingsDraft}
-              onClearBrowserData={clearBrowserData}
+              onOpenBrowserData={() => setBrowserDataScope("")}
               onClearCookieCloudData={clearCookieCloudData}
               onOpenBrowserProxyGuide={openBrowserProxyGuide}
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               onTestGotify={testGotify}
               onTestBark={testBark}
-              onTestBrowserProxy={testBrowserProxy}
+              onTestBrowserProxy={() => testBrowserProxy(settingsDraft.browser_proxy)}
               taskRunning={!!status?.is_running}
               onImportConfig={importConfig}
               onExportConfig={exportConfig}
@@ -1301,10 +1378,46 @@ function App() {
           ) : null}
 
           {activeTab === "logs" ? (
-            <LogsPanel logs={logs} onClear={clearLogs} onRefresh={refreshLogs} />
+            <LogsPanel logs={logs} ocrDebugEnabled={config.ocr_debug_enabled} onClear={clearLogs} onRefresh={refreshLogs} />
           ) : null}
         </div>
       </section>
+
+      {siteDialog === "add" && (
+        <AddSiteDialog
+          groups={config.site_groups}
+          initialGroupId={siteGroup?.id ?? null}
+          onAdd={addSite}
+          onClose={() => setSiteDialog(null)}
+        />
+      )}
+      {siteDialog === "groups" && (
+        <SiteGroupDialog
+          groups={config.site_groups}
+          initialId={settingsGroup?.id ?? ""}
+          startupGroupId={config.startup_group_id}
+          defaultPort={config.cdp_port}
+          defaultTask={{
+            cron: config.cron,
+            cron_offset_minutes: config.cron_offset_minutes,
+            visit_duration: config.visit_duration,
+          }}
+          countSites={(id) => config.sites.filter((site) => site.group_id === id).length}
+          onSave={saveSiteGroup}
+          onRemove={removeSiteGroup}
+          onClose={() => setSiteDialog(null)}
+        />
+      )}
+      {browserDataScope !== null && (
+        <BrowserDataDialog
+          groups={config.site_groups}
+          initialScope={browserDataScope}
+          busy={browserDataClearBusy}
+          taskRunning={!!status?.is_running}
+          onClear={clearBrowserData}
+          onClose={() => setBrowserDataScope(null)}
+        />
+      )}
       {pendingUpdate && (
         <UpdateDialog
           error={updateInstallError}
@@ -1442,6 +1555,7 @@ function Dashboard({
   onOpenBrowserDownload,
   recentLogs,
   status,
+  taskRunning,
   onRefresh,
 }: {
   config: AppConfig;
@@ -1449,12 +1563,19 @@ function Dashboard({
   onOpenBrowserDownload: () => void;
   recentLogs: LogEntry[];
   status: AppStatus | null;
+  taskRunning: boolean;
   onRefresh: () => void;
 }) {
   const browserName = config.browser === "edge" ? "Edge" : "Chrome";
   const browserInstalled = status?.browser_installed !== false;
   const browserConnected = !!status?.cdp_connected;
   const latestResult = status?.last_result ?? lastLog;
+  const groups = [
+    { id: null, name: "默认分组", cdp_port: config.cdp_port, browser_proxy: config.browser_proxy },
+    ...config.site_groups,
+  ];
+  const groupStatuses = status?.groups ?? [];
+  const connectedGroupCount = groupStatuses.filter((group) => group.active_cdp_port !== null).length;
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   function handleCopyLog(entry: LogEntry, key: string) {
@@ -1472,18 +1593,43 @@ function Dashboard({
           tone={browserConnected ? "ok" : browserInstalled ? "muted" : "warning"}
           value={browserConnected ? "已就绪" : browserInstalled ? "自动模式" : "需安装"}
         />
-        <MetricCard icon={ListChecks} label="站点数量" value={`${config.sites.length}`} />
+        <MetricCard icon={ListChecks} label="站点总数" value={`${config.sites.length}`} />
         <MetricCard
           icon={Clock3}
           label="下一轮任务"
           value={formatDate(status?.next_run)}
         />
         <MetricCard
-          icon={status?.is_running ? RefreshCw : PauseCircle}
-          label="执行状态"
-          tone={status?.is_running ? "warning" : "muted"}
-          value={status?.is_running ? "运行中" : "待机"}
+          icon={taskRunning ? RefreshCw : PauseCircle}
+          label="应用执行状态"
+          tone={taskRunning ? "warning" : "muted"}
+          value={taskRunning ? "运行中" : "待机"}
         />
+      </section>
+
+      <section className="panel dashboard-groups" aria-labelledby="dashboard-groups-title">
+        <div className="panel-heading">
+          <h2 id="dashboard-groups-title">分组概览</h2>
+          <span className="field-hint">共 {groups.length} 个分组</span>
+        </div>
+        <ul className="dashboard-group-list">
+          {groups.map((group) => {
+            const sites = config.sites.filter((site) => (site.group_id ?? null) === group.id);
+            const groupStatus = groupStatuses.find((item) => item.group_id === group.id);
+            const port = groupStatus?.active_cdp_port;
+            return (
+              <li className="dashboard-group-row" key={group.id ?? "default"}>
+                <strong>{group.name}</strong>
+                <dl className="scope-settings-grid">
+                  <div><dt>站点 / 自动保活</dt><dd>{sites.length} / {sites.filter((site) => site.auto_keepalive).length}</dd></div>
+                  <div><dt>浏览器</dt><dd>{port ? `已连接 · ${port}` : `待连接 · ${group.cdp_port}`}</dd></div>
+                  <div><dt>网络出口</dt><dd>{group.browser_proxy.enabled ? "代理" : "直连"}</dd></div>
+                  <div><dt>下次保活</dt><dd>{formatDate(groupStatus?.next_run)}</dd></div>
+                </dl>
+              </li>
+            );
+          })}
+        </ul>
       </section>
 
       <section className="dashboard-grid">
@@ -1511,7 +1657,7 @@ function Dashboard({
           </div>
           <code className="command-line">
             {browserConnected
-              ? `CDP 已连接：localhost:${status?.active_cdp_port ?? config.cdp_port}`
+              ? `${connectedGroupCount} 个分组的专用浏览器已连接`
               : browserInstalled
                 ? `自动模式待命：保活或测试登录时自动准备 ${browserName}`
                 : `未检测到 ${browserName}：安装完成后即可自动启动专用浏览器`}
@@ -1526,7 +1672,7 @@ function Dashboard({
         <div className="panel result-panel">
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">最近结果</p>
+              <p className="eyebrow">应用最近结果</p>
               <h2>{latestResult ? levelLabel(latestResult.level) : "暂无任务"}</h2>
             </div>
             <span className={latestResult ? levelClass(latestResult.level) : "badge"}>
@@ -1544,7 +1690,7 @@ function Dashboard({
       <section className="panel live-log-panel">
         <div className="panel-heading live-log-heading">
           <div>
-            <h2>实时日志</h2>
+            <h2>应用实时日志</h2>
           </div>
           <button className="icon-button" onClick={onRefresh} title="刷新日志" type="button">
             <RefreshCw size={17} />
@@ -2224,21 +2370,17 @@ function SitesPanel({
   busy,
   groupBusy,
   config,
-  siteDialog,
   selectedGroup,
   onSelectGroup,
   editingSite,
   editingSiteId,
-  onAdd,
+  onAddSite,
   onCancelEdit,
-  onCloseSiteDialog,
   onEditChange,
   onRecognizeCaptcha,
   onRemove,
-  onRemoveGroup,
   onRemoveSelected,
   onSave,
-  onSaveGroup,
   onStartEdit,
   onTestLogin,
   onStopTest,
@@ -2251,21 +2393,17 @@ function SitesPanel({
   busy: boolean;
   groupBusy: boolean;
   config: AppConfig;
-  siteDialog: "add" | "groups" | null;
   selectedGroup: string;
-  onSelectGroup: (group: string) => void;
+  onSelectGroup: (scope: string) => void;
   editingSite: SiteDraft;
   editingSiteId: string | null;
-  onAdd: (site: SiteDraft) => Promise<void>;
+  onAddSite: () => void;
   onCancelEdit: () => void;
-  onCloseSiteDialog: () => void;
   onEditChange: (site: SiteDraft) => void;
   onRecognizeCaptcha: (site: Site) => void;
   onRemove: (id: string) => Promise<void>;
-  onRemoveGroup: (id: string) => Promise<void>;
   onRemoveSelected: (ids: string[]) => Promise<boolean>;
   onSave: (id: string) => void;
-  onSaveGroup: (group: SiteGroup, showOnStartup: boolean) => Promise<void>;
   onStartEdit: (site: Site) => void;
   onTestLogin: (site: Site) => void;
   onStopTest?: () => void;
@@ -2283,15 +2421,9 @@ function SitesPanel({
   const [showSitePassword, setShowSitePassword] = useState(false);
   const [showTotpSecret, setShowTotpSecret] = useState(false);
   const [batchSettingsOpen, setBatchSettingsOpen] = useState(false);
-  const hasUngroupedSites = config.sites.some((site) => site.group_id == null);
-  const groupFilter = (selectedGroup === "" && hasUngroupedSites) || config.site_groups.some((group) => group.id === selectedGroup)
-    ? selectedGroup : "all";
-  const currentGroup = config.site_groups.find((group) => group.id === groupFilter);
   const groupSites = useMemo(
-    () => groupFilter === "all"
-      ? config.sites
-      : config.sites.filter((site) => (site.group_id ?? "") === groupFilter),
-    [config.sites, groupFilter],
+    () => config.sites.filter((site) => (site.group_id ?? "") === selectedGroup),
+    [config.sites, selectedGroup],
   );
   const visibleSites = useMemo(() => {
     const keyword = siteSearch.trim().toLowerCase();
@@ -2370,42 +2502,29 @@ function SitesPanel({
 
   return (
     <div className="content-stack sites-stack">
-      {siteDialog === "add" && (
-        <AddSiteDialog
+      <div className="site-group-bar">
+        <SiteGroupTabs
           groups={config.site_groups}
-          initialGroupId={currentGroup?.id ?? null}
-          onAdd={onAdd}
-          onClose={onCloseSiteDialog}
+          value={selectedGroup}
+          defaultLabel="默认分组"
+          label="站点分组"
+          onChange={(id) => {
+            setSelectedSiteIds(new Set());
+            onSelectGroup(id);
+          }}
         />
-      )}
-      {siteDialog === "groups" && (
-        <SiteGroupDialog
-          groups={config.site_groups}
-          initialId={currentGroup?.id ?? ""}
-          startupGroupId={config.startup_group_id}
-          defaultPort={config.cdp_port}
-          countSites={(id) => config.sites.filter((site) => site.group_id === id).length}
-          onSave={onSaveGroup}
-          onRemove={onRemoveGroup}
-          onClose={onCloseSiteDialog}
-        />
-      )}
-
+        <button
+          aria-haspopup="dialog"
+          className="primary-action"
+          disabled={groupBusy}
+          onClick={onAddSite}
+          type="button"
+        >
+          <Plus size={16} aria-hidden="true" />
+          <span>新增站点</span>
+        </button>
+      </div>
       <div className="site-selection-bar">
-        {config.site_groups.length > 0 && (
-          <select
-            aria-label="筛选站点分组"
-            className="site-group-filter"
-            value={groupFilter}
-            onChange={(event) => {
-              onSelectGroup(event.target.value);
-              setSelectedSiteIds(new Set());
-            }}
-          >
-            <option value="all">全部分组</option>
-            <SiteGroupOptions groups={config.site_groups} includeUngrouped={hasUngroupedSites} />
-          </select>
-        )}
         {visibleSites.length > 0 && (
           <div className="site-batch-actions">
             <label>
@@ -2474,7 +2593,6 @@ function SitesPanel({
         ) : (
           visibleSites.map((site) => {
             const editing = editingSiteId === site.id;
-            const groupName = config.site_groups.find((group) => group.id === site.group_id)?.name;
             return (
               <article
                 className={`site-row${editing ? " editing" : ""}`}
@@ -2663,7 +2781,6 @@ function SitesPanel({
                   <div className="site-main">
                     <div className="site-title-line">
                       <strong>{site.name}</strong>
-                      {config.site_groups.length > 0 && <span className="site-login-badge">{groupName ?? "未分组"}</span>}
                       {!site.auto_keepalive ? (
                         <span className="site-login-badge disabled">
                           未启用
@@ -2763,7 +2880,7 @@ function SitesPanel({
                       ) : null}
                       <button
                         aria-label={`编辑 ${site.name}`}
-                        className="site-edit-button"
+                        className="ghost site-edit-button"
                         onClick={() => startEditingSite(site)}
                         title="编辑站点"
                         type="button"
@@ -2772,7 +2889,7 @@ function SitesPanel({
                       </button>
                       <button
                         aria-label={`删除 ${site.name}`}
-                        className="danger-action site-delete-button"
+                        className="ghost site-delete-button"
                         disabled={busy}
                         onClick={() => removeSingleSite(site)}
                         title="删除站点"
@@ -2804,6 +2921,239 @@ function SitesPanel({
   );
 }
 
+function GroupSettingsPanel({
+  config, group, siteCount, busy, cookieSyncBusy, browserProxyTestBusy, browserProxyTestResult,
+  onTestProxy, onSyncCookieCloud, onClearCookieCloud, onOpenBrowserData,
+}: {
+  config: AppConfig;
+  group: SiteGroup;
+  siteCount: number;
+  busy: boolean;
+  cookieSyncBusy: boolean;
+  browserProxyTestBusy: boolean;
+  browserProxyTestResult: { ok: boolean; message: string } | null;
+  onTestProxy: () => void;
+  onSyncCookieCloud: () => void;
+  onClearCookieCloud: () => void;
+  onOpenBrowserData: () => void;
+}) {
+  const task = group.task ?? config;
+  const cronPreview = useCronPreview(task.cron);
+  const proxy = group.browser_proxy;
+  let proxyAddress = "地址未配置或无效";
+  if (proxy.enabled) {
+    try {
+      const address = new URL(proxy.server_url);
+      if (address.protocol === "http:" || address.protocol === "https:") proxyAddress = address.origin;
+    } catch {
+      // 配置文件也可能由用户手动编辑，摘要不显示无效地址。
+    }
+  }
+  const cookiecloud = group.cookie_mode === "custom" ? group.cookiecloud : config.cookiecloud;
+  const canSync = group.cookie_mode !== "manual" && siteCount > 0
+    && !!(cookiecloud.server_url.trim() && cookiecloud.uuid.trim() && cookiecloud.password);
+
+  return (
+    <div className="settings-stack">
+      <div className="settings-scroll">
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">分组设置</p>
+              <h2>{group.name}</h2>
+            </div>
+          </div>
+          <p className="field-hint">
+            {siteCount} 个站点 · {config.startup_group_id === group.id ? "启动时显示此分组" : "独立浏览器数据"}
+          </p>
+        </section>
+
+        <section className="panel settings-card">
+          <div className="panel-heading"><h2>保活计划</h2></div>
+          <dl className="scope-settings-grid">
+            <div><dt>计划来源</dt><dd>{group.task ? "本组独立计划" : "默认设置"}</dd></div>
+            <div>
+              <dt>Cron 表达式</dt>
+              <dd>{task.cron}</dd>
+              <dd><CronPreviewText preview={cronPreview} /></dd>
+            </div>
+            <div><dt>随机延迟上限</dt><dd>{task.cron_offset_minutes} 分钟</dd></div>
+            <div><dt>页面停留时间</dt><dd>{task.visit_duration} 秒</dd></div>
+          </dl>
+        </section>
+
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <h2>浏览器与网络</h2>
+            <div className="row-actions">
+              <button className="ghost" disabled={busy || browserProxyTestBusy || !proxy.enabled}
+                onClick={onTestProxy} type="button">
+                <RefreshCw size={16} /> {browserProxyTestBusy ? "测试中" : "测试代理"}
+              </button>
+              <button aria-haspopup="dialog" className="danger-action" disabled={busy} onClick={onOpenBrowserData} type="button">
+                <Trash2 size={16} /> 清除浏览器数据
+              </button>
+            </div>
+          </div>
+          <dl className="scope-settings-grid">
+            <div><dt>浏览器</dt><dd>{config.browser === "edge" ? "Microsoft Edge" : "Google Chrome"}</dd></div>
+            <div><dt>调试端口</dt><dd>{group.cdp_port}</dd></div>
+            <div>
+              <dt>{proxy.enabled ? "本组代理地址" : "网络出口"}</dt>
+              <dd>{proxy.enabled ? proxyAddress : "直连"}</dd>
+              {proxy.enabled && (
+                <dd className="field-hint">{proxy.username.trim() ? `认证账号：${proxy.username}` : "无需账号认证"}</dd>
+              )}
+            </div>
+          </dl>
+          {browserProxyTestResult && (
+            <p className={`proxy-test-result ${browserProxyTestResult.ok ? "success" : "error"}`} role="status">
+              {browserProxyTestResult.message}
+            </p>
+          )}
+        </section>
+
+        <section className="panel settings-card">
+          <div className="panel-heading">
+            <h2>CookieCloud</h2>
+            {group.cookie_mode !== "manual" && (
+              <div className="row-actions">
+                <button className="ghost" disabled={busy || !canSync} onClick={onSyncCookieCloud} type="button">
+                  <RefreshCw size={16} /> {cookieSyncBusy ? "同步中" : "同步本组 Cookie"}
+                </button>
+                {group.cookie_mode === "custom" && (
+                  <button className="danger-action" disabled={busy} onClick={onClearCookieCloud} type="button">
+                    <Cookie size={16} /> 清空本组云端数据
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <dl className="scope-settings-grid">
+            <div><dt>同步方式</dt><dd>{cookieModeLabels[group.cookie_mode]}</dd></div>
+            {group.cookie_mode !== "manual" && (
+              <>
+                <div><dt>保活前自动导入</dt><dd>{(group.cookie_mode === "custom" ? group.cookie_auto_import : config.auto_sync_cookie) ? "开启" : "关闭"}</dd></div>
+                <div><dt>保活后自动上传</dt><dd>{(group.cookie_mode === "custom" ? group.cookie_auto_upload : config.auto_sync_cookie_after_keepalive) ? "开启" : "关闭"}</dd></div>
+              </>
+            )}
+          </dl>
+          <p className="field-hint">
+            {group.cookie_mode === "manual" ? "本组登录状态保存在本组浏览器中，CookieCloud 导入和上传已关闭。"
+              : group.cookie_mode === "inherit" ? "使用默认设置里的共享 CookieCloud。同步按钮只导入本组站点。"
+              : "使用本组独立的 CookieCloud 账号。"}
+          </p>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function BrowserDataDialog({
+  groups, initialScope, busy, taskRunning, onClear, onClose,
+}: {
+  groups: SiteGroup[];
+  initialScope: string;
+  busy: boolean;
+  taskRunning: boolean;
+  onClear: (scope: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const browserDataDialogRef = useRef<HTMLDialogElement>(null);
+  const [browserDataScope, setBrowserDataScope] = useState(initialScope);
+  const [browserDataError, setBrowserDataError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const dialog = browserDataDialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+  }, []);
+
+  function close() {
+    browserDataDialogRef.current?.close();
+    onClose();
+  }
+
+  async function submitBrowserDataClear(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || taskRunning) return;
+    setBrowserDataError(null);
+    try {
+      await onClear(browserDataScope);
+      close();
+    } catch (err) {
+      setBrowserDataError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <dialog
+      aria-labelledby="browser-data-dialog-title"
+      className="app-dialog"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!busy) close();
+      }}
+      ref={browserDataDialogRef}
+    >
+      <form onSubmit={submitBrowserDataClear}>
+        <header className="app-dialog-heading">
+          <h2 id="browser-data-dialog-title">清除浏览器数据</h2>
+        </header>
+        <div className="site-add-body">
+          <fieldset className="site-edit-fields" disabled={busy}>
+            <label className="site-secret-field">
+              <span>清除范围</span>
+              <select
+                value={browserDataScope}
+                onChange={(event) => {
+                  setBrowserDataScope(event.target.value);
+                  setBrowserDataError(null);
+                }}
+              >
+                <SiteGroupOptions groups={groups} />
+                <option value="all">全部分组</option>
+              </select>
+            </label>
+            <p className="site-group-hint site-secret-field">
+              将清除所选范围内专用浏览器的缓存、Cookie 和站点存储。站点可能需要重新登录。
+            </p>
+          </fieldset>
+          {browserDataError && <p className="app-dialog-error" role="alert">{browserDataError}</p>}
+        </div>
+        <footer className="app-dialog-footer">
+          <button className="ghost" disabled={busy} onClick={() => close()} type="button">
+            取消
+          </button>
+          <button className="danger-action" disabled={busy || taskRunning} type="submit">
+            {busy ? "清除中…" : browserDataScope === "all" ? "确认清除全部" : "确认清除"}
+          </button>
+        </footer>
+      </form>
+    </dialog>
+  );
+}
+
+function SettingsToggle({
+  label, checked, onChange, disabled, onText = "已开启", offText = "已关闭",
+}: {
+  label: ReactNode;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  disabled?: boolean;
+  onText?: string;
+  offText?: string;
+}) {
+  return (
+    <label>
+      <span>{label}</span>
+      <span className="switch-row settings-toggle-control">
+        <span aria-hidden="true">{checked ? onText : offText}</span>
+        <input checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+      </span>
+    </label>
+  );
+}
+
 function SettingsPanel({
   browserDataClearBusy,
   busy,
@@ -2815,7 +3165,7 @@ function SettingsPanel({
   browserProxyTestResult,
   draft,
   onChange,
-  onClearBrowserData,
+  onOpenBrowserData,
   onClearCookieCloudData,
   onOpenBrowserProxyGuide,
   onSave,
@@ -2837,7 +3187,7 @@ function SettingsPanel({
   browserProxyTestResult: { ok: boolean; message: string } | null;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
-  onClearBrowserData: () => void;
+  onOpenBrowserData: () => void;
   onClearCookieCloudData: () => void;
   onOpenBrowserProxyGuide: () => void;
   onSave: () => void;
@@ -2854,6 +3204,7 @@ function SettingsPanel({
   const [showCookiePassword, setShowCookiePassword] = useState(false);
   const [showGotifyToken, setShowGotifyToken] = useState(false);
   const [showBarkKey, setShowBarkKey] = useState(false);
+  const cronPreview = useCronPreview(draft.cron);
   const inheritedCookieGroups = new Set(draft.site_groups
     .filter((group) => group.cookie_mode === "inherit")
     .map((group) => group.id));
@@ -2881,18 +3232,11 @@ function SettingsPanel({
             </div>
           </div>
           <div className="settings-form updater-settings-form">
-            <label>
-              <span>自动检测更新</span>
-              <span className="switch-row update-check-control">
-                <span>{draft.auto_check_updates ? "已开启" : "已关闭"}</span>
-                <input
-                  aria-label="自动检测更新"
-                  checked={draft.auto_check_updates}
-                  onChange={(event) => onChange({ ...draft, auto_check_updates: event.target.checked })}
-                  type="checkbox"
-                />
-              </span>
-            </label>
+            <SettingsToggle
+              label="自动检测更新"
+              checked={draft.auto_check_updates}
+              onChange={(checked) => onChange({ ...draft, auto_check_updates: checked })}
+            />
             <label>
               <span>检测间隔（小时）</span>
               <input
@@ -2963,11 +3307,11 @@ function SettingsPanel({
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Keepalive</p>
-              <h2>任务设置</h2>
+              <h2>默认保活计划与运行设置</h2>
             </div>
           </div>
 
-          <div className="settings-form">
+          <div className="settings-form keepalive-settings-form">
           <label>
             <span>专用浏览器</span>
             <select
@@ -2978,14 +3322,11 @@ function SettingsPanel({
               <option value="edge">Microsoft Edge</option>
             </select>
           </label>
-          <label>
-            <span>Cron 表达式</span>
-            <input
-              onChange={(event) => onChange({ ...draft, cron: event.target.value })}
-              placeholder="0 9 * * *"
-              value={draft.cron}
-            />
-          </label>
+          <CronField
+            value={draft.cron}
+            preview={cronPreview}
+            onChange={(cron) => onChange({ ...draft, cron })}
+          />
           <label>
             <span className="label-with-help">
               随机延迟上限（分钟）
@@ -3032,28 +3373,12 @@ function SettingsPanel({
               value={draft.log_retention}
             />
           </label>
-          <label className="switch-row">
-            <span>开机自启</span>
-            <input
-              checked={draft.auto_launch}
-              onChange={(event) => onChange({ ...draft, auto_launch: event.target.checked })}
-              type="checkbox"
-            />
-          </label>
+          <SettingsToggle
+            label="开机自启"
+            checked={draft.auto_launch}
+            onChange={(checked) => onChange({ ...draft, auto_launch: checked })}
+          />
           </div>
-
-          <details className="advanced-settings">
-          <summary>手动端口（可选）</summary>
-          <label>
-            <span>浏览器调试端口</span>
-            <input
-              min={1}
-              onChange={(event) => onChange({ ...draft, cdp_port: Number(event.target.value) })}
-              type="number"
-              value={draft.cdp_port}
-            />
-          </label>
-          </details>
 
         </section>
 
@@ -3062,7 +3387,7 @@ function SettingsPanel({
             <div>
               <p className="eyebrow">Browser Proxy</p>
               <div className="title-with-help">
-                <h2>浏览器代理</h2>
+                <h2>默认浏览器与代理</h2>
                 <button
                   aria-label="查看浏览器代理部署说明"
                   className="help-tip help-tip-button"
@@ -3087,54 +3412,70 @@ function SettingsPanel({
             </div>
           </div>
           <div className="settings-form">
-            <label className="switch-row">
-              <span>启用浏览器代理</span>
+            <label>
+              <span>浏览器调试端口</span>
               <input
-                checked={draft.browser_proxy.enabled}
-                disabled={taskRunning || browserProxyTestBusy}
-                onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, enabled: event.target.checked } })}
-                type="checkbox"
+                min={1}
+                max={65535}
+                onChange={(event) => onChange({ ...draft, cdp_port: Number(event.target.value) })}
+                type="number"
+                value={draft.cdp_port}
               />
             </label>
-            <label>
-              <span>HTTP / HTTPS 代理地址</span>
-              <input
-                disabled={!draft.browser_proxy.enabled || taskRunning || browserProxyTestBusy}
-                onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
-                placeholder="http://服务器IP:3128"
-                value={draft.browser_proxy.server_url}
-              />
-            </label>
-            <label>
-              <span>代理用户名（可选）</span>
-              <input
-                autoComplete="off"
-                disabled={!draft.browser_proxy.enabled || taskRunning || browserProxyTestBusy}
-                onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, username: event.target.value } })}
-                value={draft.browser_proxy.username}
-              />
-            </label>
-            <label>
-              <span>代理密码（可选）</span>
-              <div className="password-field">
-                <input
-                  autoComplete="new-password"
-                  disabled={!draft.browser_proxy.enabled || taskRunning || browserProxyTestBusy}
-                  onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, password: event.target.value } })}
-                  type={showBrowserProxyPassword ? "text" : "password"}
-                  value={draft.browser_proxy.password}
-                />
-                <button
-                  aria-label={showBrowserProxyPassword ? "隐藏浏览器代理密码" : "显示浏览器代理密码"}
-                  onClick={() => setShowBrowserProxyPassword((value) => !value)}
-                  type="button"
-                >
-                  {showBrowserProxyPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
-              </div>
-            </label>
+            <SettingsToggle
+              label="启用浏览器代理"
+              checked={draft.browser_proxy.enabled}
+              disabled={taskRunning || browserProxyTestBusy}
+              onText="通过代理"
+              offText="直连"
+              onChange={(enabled) => {
+                if (!enabled) setShowBrowserProxyPassword(false);
+                onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, enabled } });
+              }}
+            />
+            {draft.browser_proxy.enabled && (
+              <>
+                <label className="proxy-address-field">
+                  <span>HTTP / HTTPS 代理地址</span>
+                  <input
+                    disabled={taskRunning || browserProxyTestBusy}
+                    onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
+                    placeholder="http://服务器IP:3128"
+                    value={draft.browser_proxy.server_url}
+                  />
+                </label>
+                <label>
+                  <span>代理用户名（可选）</span>
+                  <input
+                    autoComplete="off"
+                    disabled={taskRunning || browserProxyTestBusy}
+                    onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, username: event.target.value } })}
+                    value={draft.browser_proxy.username}
+                  />
+                </label>
+                <label>
+                  <span>代理密码（可选）</span>
+                  <div className="password-field">
+                    <input
+                      autoComplete="new-password"
+                      disabled={taskRunning || browserProxyTestBusy}
+                      onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, password: event.target.value } })}
+                      type={showBrowserProxyPassword ? "text" : "password"}
+                      value={draft.browser_proxy.password}
+                    />
+                    <button
+                      aria-label={showBrowserProxyPassword ? "隐藏浏览器代理密码" : "显示浏览器代理密码"}
+                      onClick={() => setShowBrowserProxyPassword((value) => !value)}
+                      type="button"
+                    >
+                      {showBrowserProxyPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                </label>
+              </>
+            )}
             <p className="field-hint">
-              Chrome 和 Edge 的保活、登录、签到及每日福利使用此代理，账号密码会自动认证。
+              这里的端口和代理用于默认分组。启用代理后，保活、登录、签到及每日福利都会通过该代理访问站点。
               支持 HTTP 和 HTTPS 代理；HTTPS 会加密到代理服务器的连接并校验证书。
               可先测试当前填写的配置，无需保存；测试会单独发送代理请求。保存后请关闭专用浏览器，再执行任务使新配置生效。
             </p>
@@ -3155,10 +3496,10 @@ function SettingsPanel({
           <div>
             <p className="eyebrow">CookieCloud</p>
             <div className="title-with-help">
-              <h2>Cookie 同步</h2>
+              <h2>共享 CookieCloud</h2>
               <span
                 className="help-tip"
-                data-tooltip="此处的同步和自动同步开关适用于未分组站点，以及 CookieCloud 选择「默认（跟随设置）」的分组。"
+                data-tooltip="同步和自动同步开关适用于默认分组，以及沿用默认 CookieCloud 设置的分组。"
                 tabIndex={0}
               >
                 <HelpCircle size={16} />
@@ -3185,7 +3526,7 @@ function SettingsPanel({
               type="button"
             >
               <RefreshCw size={16} />
-              <span>{taskRunning ? "任务执行中" : cookieSyncBusy ? "同步中" : "同步 Cookie"}</span>
+              <span>{taskRunning ? "任务执行中" : cookieSyncBusy ? "同步中" : "同步共享 Cookie"}</span>
             </button>
           </div>
         </div>
@@ -3238,8 +3579,8 @@ function SettingsPanel({
               </button>
             </div>
           </label>
-          <label className="switch-row">
-            <span className="label-with-help">
+          <SettingsToggle
+            label={<span className="label-with-help">
               保活前自动同步
               <span
                 className="help-tip"
@@ -3248,15 +3589,12 @@ function SettingsPanel({
               >
                 <HelpCircle size={14} />
               </span>
-            </span>
-            <input
-              checked={draft.auto_sync_cookie}
-              onChange={(event) => onChange({ ...draft, auto_sync_cookie: event.target.checked })}
-              type="checkbox"
-            />
-          </label>
-          <label className="switch-row">
-            <span className="label-with-help">
+            </span>}
+            checked={draft.auto_sync_cookie}
+            onChange={(checked) => onChange({ ...draft, auto_sync_cookie: checked })}
+          />
+          <SettingsToggle
+            label={<span className="label-with-help">
               保活/测试后自动上传
               <span
                 className="help-tip"
@@ -3265,18 +3603,10 @@ function SettingsPanel({
               >
                 <HelpCircle size={14} />
               </span>
-            </span>
-            <input
-              checked={draft.auto_sync_cookie_after_keepalive}
-              onChange={(event) =>
-                onChange({
-                  ...draft,
-                  auto_sync_cookie_after_keepalive: event.target.checked,
-                })
-              }
-              type="checkbox"
-            />
-          </label>
+            </span>}
+            checked={draft.auto_sync_cookie_after_keepalive}
+            onChange={(checked) => onChange({ ...draft, auto_sync_cookie_after_keepalive: checked })}
+          />
           <p className="field-hint cookiecloud-upload-summary">
             使用此设置的站点中，{globalCookieSites.filter((site) => site.cookiecloud_upload).length} / {globalCookieSites.length} 个已开启自动上传。
           </p>
@@ -3345,6 +3675,23 @@ function SettingsPanel({
                 value={draft.min_login_attempts_remaining}
               />
             </label>
+            <SettingsToggle
+              label={
+                <span className="label-with-help">
+                  OCR 调试
+                  <span
+                    className="help-tip"
+                    aria-label="OCR 调试说明"
+                    data-tooltip="开启并保存后，可在运行日志里查看验证码图片和识别文本。关闭调试或重启后，详情会清除。"
+                    tabIndex={0}
+                  >
+                    <HelpCircle size={14} aria-hidden="true" />
+                  </span>
+                </span>
+              }
+              checked={draft.ocr_debug_enabled}
+              onChange={(checked) => onChange({ ...draft, ocr_debug_enabled: checked })}
+            />
           </div>
         </section>
 
@@ -3371,19 +3718,11 @@ function SettingsPanel({
             </div>
           </div>
           <div className="settings-form">
-            <label className="switch-row">
-              <span>启用 Gotify 通知</span>
-              <input
-                checked={draft.gotify.enabled}
-                onChange={(event) =>
-                  onChange({
-                    ...draft,
-                    gotify: { ...draft.gotify, enabled: event.target.checked },
-                  })
-                }
-                type="checkbox"
-              />
-            </label>
+            <SettingsToggle
+              label="启用 Gotify 通知"
+              checked={draft.gotify.enabled}
+              onChange={(enabled) => onChange({ ...draft, gotify: { ...draft.gotify, enabled } })}
+            />
             <label>
               <span>Gotify 服务地址</span>
               <input
@@ -3461,16 +3800,11 @@ function SettingsPanel({
             </div>
           </div>
           <div className="settings-form">
-            <label className="switch-row">
-              <span>启用 Bark 通知</span>
-              <input
-                checked={draft.bark.enabled}
-                onChange={(event) =>
-                  onChange({ ...draft, bark: { ...draft.bark, enabled: event.target.checked } })
-                }
-                type="checkbox"
-              />
-            </label>
+            <SettingsToggle
+              label="启用 Bark 通知"
+              checked={draft.bark.enabled}
+              onChange={(enabled) => onChange({ ...draft, bark: { ...draft.bark, enabled } })}
+            />
             <label>
               <span>Bark 服务地址</span>
               <input
@@ -3540,7 +3874,7 @@ function SettingsPanel({
               </div>
               <div>
                 <dt>NexusPHP 兼容登录</dt>
-                <dd>青蛙、HDArea（好大）、HDDolby（杜比）、UBits（U堡）使用兼容登录流程，支持登录状态识别、按页面要求填写两步验证码及常见图片验证码。青蛙另适配登录入口和 ALTCHA 验证流程。</dd>
+                <dd>青蛙、HDArea（好大）、HDDolby（杜比）、UBits（U堡）使用兼容登录流程，支持登录状态识别、按页面要求填写两步验证码及常见图片验证码。青蛙另适配登录入口和 ALTCHA 验证。U堡会尝试点击 Cloudflare 验证框，需手动操作时可在浏览器中完成，软件会继续登录。</dd>
               </div>
               <div>
                 <dt>专门适配的自动签到</dt>
@@ -3571,13 +3905,12 @@ function SettingsPanel({
               <p className="eyebrow">Backup</p>
               <h2>备份与还原</h2>
             </div>
-            <div className="row-actions" style={{ gap: "10px" }}>
+            <div className="row-actions">
               <button
                 className="ghost"
                 disabled={busy}
                 onClick={onImportConfig}
                 type="button"
-                style={{ minHeight: "34px", padding: "0 12px" }}
               >
                 <FileUp size={16} />
                 <span>导入全部配置</span>
@@ -3587,7 +3920,6 @@ function SettingsPanel({
                 disabled={busy}
                 onClick={onExportConfig}
                 type="button"
-                style={{ minHeight: "34px", padding: "0 12px" }}
               >
                 <Download size={16} />
                 <span>导出全部配置</span>
@@ -3609,7 +3941,7 @@ function SettingsPanel({
               <button
                 className="danger-action"
                 disabled={browserDataClearBusy || taskRunning}
-                onClick={onClearBrowserData}
+                onClick={onOpenBrowserData}
                 type="button"
               >
                 {browserDataClearBusy ? <RefreshCw size={16} /> : <Trash2 size={16} />}
@@ -3623,9 +3955,9 @@ function SettingsPanel({
       </div>
 
       <div className="settings-actions settings-actions-bottom">
-        <button className="primary-action settings-save" disabled={busy} onClick={onSave} type="button">
+        <button className="primary-action settings-save" disabled={busy || cronPreview.state !== "valid"} onClick={onSave} type="button">
           <Save size={18} />
-          <span>保存全部设置</span>
+          <span>保存默认设置</span>
         </button>
       </div>
     </div>
@@ -3634,10 +3966,12 @@ function SettingsPanel({
 
 function LogsPanel({
   logs,
+  ocrDebugEnabled,
   onClear,
   onRefresh,
 }: {
   logs: LogEntry[];
+  ocrDebugEnabled: boolean;
   onClear: () => void;
   onRefresh: () => void;
 }) {
@@ -3666,7 +4000,7 @@ function LogsPanel({
       <div className="panel-heading">
         <div>
           <p className="eyebrow">Runtime</p>
-          <h2>运行日志</h2>
+          <h2>应用运行日志</h2>
         </div>
         <div className="row-actions">
           <label className="log-search">
@@ -3711,32 +4045,77 @@ function LogsPanel({
             .slice()
             .reverse()
             .map((entry, index) => {
-              const rowKey = `${entry.timestamp}-${index}`;
+              const rowKey = entry.ocr_debug_id ?? `${entry.timestamp}-${index}`;
               const copied = copiedKey === rowKey;
               return (
-                <div
-                  className={copied ? "log-row copied" : "log-row"}
-                  key={rowKey}
-                  onClick={() => handleCopyLog(entry, rowKey)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      handleCopyLog(entry, rowKey);
-                    }
-                  }}
-                  role="button"
-                  tabIndex={0}
-                  title={copied ? "已复制！" : `${entry.message}\n\n(点击复制完整日志)`}
-                >
-                  <span className={levelClass(entry.level)}>{entry.level}</span>
-                  <time>{formatLogTime(entry.timestamp)}</time>
-                  <p>{copied ? "✓ 已复制" : entry.message}</p>
-                </div>
+                <Fragment key={rowKey}>
+                  <div
+                    className={copied ? "log-row copied" : "log-row"}
+                    onClick={() => handleCopyLog(entry, rowKey)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handleCopyLog(entry, rowKey);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                    title={copied ? "已复制！" : `${entry.message}\n\n(点击复制完整日志)`}
+                  >
+                    <span className={levelClass(entry.level)}>{entry.level}</span>
+                    <time>{formatLogTime(entry.timestamp)}</time>
+                    <p>{copied ? "✓ 已复制" : entry.message}</p>
+                  </div>
+                  {ocrDebugEnabled && entry.ocr_debug_id && (
+                    <OcrDebugPreview key={entry.ocr_debug_id} id={entry.ocr_debug_id} />
+                  )}
+                </Fragment>
               );
             })
         )}
       </div>
     </section>
+  );
+}
+
+function OcrDebugPreview({ id }: { id: string }) {
+  const [open, setOpen] = useState(false);
+  const [details, setDetails] = useState<OcrDebugDetails | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    invoke<OcrDebugDetails>("get_ocr_debug", { id }).then(
+      (result) => { if (active) setDetails(result); },
+      (err) => { if (active) setError(err instanceof Error ? err.message : String(err)); },
+    );
+    return () => { active = false; };
+  }, [id, open]);
+
+  return (
+    <details className="ocr-debug-preview" onToggle={(event) => {
+      const open = event.currentTarget.open;
+      if (!open) {
+        setDetails(null);
+        setError(null);
+      }
+      setOpen(open);
+    }}>
+      <summary>查看 OCR 调试详情</summary>
+      {open && (
+        <div className="ocr-debug-content">
+          {error ? <span role="alert">{error}</span> : details ? (
+            <>
+              {details.image_base64
+                ? <img src={`data:image/png;base64,${details.image_base64}`} alt="本次识别的验证码" />
+                : <span>图片过大，未保留预览。</span>}
+              <span>识别文本：{details.recognized_text ?? "未识别到文本"}</span>
+            </>
+          ) : <span>正在读取…</span>}
+        </div>
+      )}
+    </details>
   );
 }
 
@@ -3824,7 +4203,7 @@ function pageTitle(tab: TabKey) {
   return {
     dashboard: "状态总览",
     sites: "站点管理",
-    settings: "保活设置",
+    settings: "设置",
     logs: "运行日志",
   }[tab];
 }

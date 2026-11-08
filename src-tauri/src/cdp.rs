@@ -114,6 +114,10 @@ impl CdpProgress {
     async fn info(&self, message: impl Into<String>) {
         store::push_log(&self.logs, LogEntry::info(message)).await;
     }
+
+    async fn ocr(&self, message: impl Into<String>, image: &str, recognized_text: Option<&str>) {
+        store::push_ocr_log(&self.logs, LogEntry::info(message), image, recognized_text).await;
+    }
 }
 
 impl CdpClient {
@@ -205,14 +209,22 @@ impl CdpClient {
     }
 
     async fn is_available_with_timeout(&self, timeout: Duration) -> bool {
+        self.browser_version(timeout).is_some_and(|version| {
+            (!self.require_managed_profile
+                || proxy_check::uses_managed_profile(&version, &self.profiles(), timeout)
+                    .unwrap_or(false))
+                && self.proxy_matches(&version, timeout).unwrap_or(false)
+        })
+    }
+
+    fn browser_version(&self, timeout: Duration) -> Option<serde_json::Value> {
         self.request("GET", "/json/version", timeout)
-            .map(|response| {
+            .ok()
+            .and_then(|response| {
                 if !(200..300).contains(&response.status) {
-                    return false;
+                    return None;
                 }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&response.body) else {
-                    return false;
-                };
+                let value = serde_json::from_str::<serde_json::Value>(&response.body).ok()?;
                 let product = value
                     .get("Browser")
                     .and_then(|value| value.as_str())
@@ -223,12 +235,8 @@ impl CdpClient {
                     }
                     BrowserKind::Edge => product.starts_with("Edg/"),
                 };
-                browser_matches
-                    && (!self.require_managed_profile
-                        || proxy_check::uses_managed_profile(&value, &self.profiles(), timeout).unwrap_or(false))
-                    && self.proxy_matches(&value, timeout).unwrap_or(false)
+                browser_matches.then_some(value)
             })
-            .unwrap_or(false)
     }
 
     fn proxy_matches(&self, version: &serde_json::Value, timeout: Duration) -> Result<bool, String> {
@@ -655,8 +663,67 @@ impl CdpClient {
         }
     }
 
-    /// 通过 CDP 清除专用浏览器数据，给 CookieCloud 重新同步前准备干净环境。
-    pub async fn clear_browser_data(&self, site_urls: &[String]) -> Result<(), String> {
+    pub async fn clear_managed_browser_data(&self, site_urls: &[String]) -> Result<bool, String> {
+        let mut cleared = false;
+        let mut failures = Vec::new();
+        for profile in self.profiles() {
+            match self.clear_profile_data(&profile, site_urls).await {
+                Ok(result) => cleared |= result,
+                Err(err) => failures.push(err),
+            }
+        }
+        if failures.is_empty() {
+            Ok(cleared)
+        } else {
+            Err(failures.join("；"))
+        }
+    }
+
+    async fn clear_profile_data(
+        &self,
+        profile: &PathBuf,
+        site_urls: &[String],
+    ) -> Result<bool, String> {
+        match fs::symlink_metadata(profile) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("专用浏览器数据路径不是普通目录".to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(format!("无法读取专用浏览器数据目录：{err}")),
+        }
+
+        let mut ports = vec![self.port];
+        if let Some(port) = read_devtools_port(profile).filter(|port| *port != self.port) {
+            ports.push(port);
+        }
+        let timeout = Duration::from_millis(600);
+        let mut ownership_unconfirmed = false;
+        for port in ports {
+            let cdp = Self::with_browser(port, self.browser);
+            let Some(version) = cdp.browser_version(timeout) else {
+                continue;
+            };
+            match proxy_check::uses_managed_profile(&version, std::slice::from_ref(profile), timeout) {
+                Ok(true) => {
+                    cdp.clear_connected_browser_data(site_urls).await?;
+                    return Ok(true);
+                }
+                Ok(false) => {}
+                Err(_) => ownership_unconfirmed = true,
+            }
+        }
+
+        if ownership_unconfirmed || profile_dir_in_use(profile) {
+            return Err(format!(
+                "无法确认专用 {} 已关闭，请关闭该浏览器后再清除",
+                self.browser.name()
+            ));
+        }
+        fs::remove_dir_all(profile)
+            .map_err(|err| format!("清除专用 {} 数据目录失败：{err}", self.browser.name()))?;
+        Ok(true)
+    }
+
+    async fn clear_connected_browser_data(&self, site_urls: &[String]) -> Result<(), String> {
         let websocket_url = self.page_websocket_url().await?;
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
         websocket.call("Network.clearBrowserCookies", serde_json::json!({}))?;
@@ -1210,23 +1277,6 @@ pub fn browser_installed(browser: BrowserKind) -> bool {
     find_browser_executable(browser).is_some()
 }
 
-pub fn clear_dedicated_profile_data(browser: BrowserKind) -> Result<usize, String> {
-    let profile_dir = dedicated_profile_dir(browser);
-    if profile_dir_in_use(&profile_dir) {
-        return Err(format!(
-            "专用 {} 正在运行，请关闭后再清除离线浏览器数据",
-            browser.name()
-        ));
-    }
-    if !profile_dir.exists() {
-        return Ok(0);
-    }
-
-    fs::remove_dir_all(&profile_dir)
-        .map_err(|err| format!("清除专用 {} Profile 失败：{}", browser.name(), err))?;
-    Ok(1)
-}
-
 fn read_http_response(stream: &mut TcpStream) -> Result<String, String> {
     let mut raw = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -1347,13 +1397,25 @@ impl CdpWebSocket {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.call_in_session(method, params, None)
+    }
+
+    fn call_in_session(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "id": id,
             "method": method,
             "params": params,
         });
+        if let Some(session_id) = session_id {
+            request["sessionId"] = serde_json::json!(session_id);
+        }
         self.write_frame(0x1, request.to_string().as_bytes())?;
 
         loop {
@@ -1939,4 +2001,30 @@ fn find_in_path(command: &PathBuf) -> Option<PathBuf> {
     env::split_paths(&path_var)
         .map(|dir| dir.join(file_name))
         .find(|path| path.exists())
+}
+
+#[cfg(test)]
+mod browser_data_tests {
+    use super::*;
+
+    #[test]
+    fn offline_cleanup_only_removes_the_requested_profile() {
+        let root = env::temp_dir().join(format!("pt-manager-clear-test-{}", uuid::Uuid::new_v4()));
+        let selected = root.join("selected");
+        let other = root.join("other");
+        fs::create_dir_all(&selected).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(selected.join("Cookies"), "test cookies").unwrap();
+        fs::write(other.join("Cookies"), "other group cookies").unwrap();
+
+        let cdp = CdpClient::new(0);
+        let result = tauri::async_runtime::block_on(cdp.clear_profile_data(&selected, &[]));
+        let selected_removed = !selected.exists();
+        let other_cookies = fs::read_to_string(other.join("Cookies"));
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(result.unwrap());
+        assert!(selected_removed);
+        assert_eq!(other_cookies.unwrap(), "other group cookies");
+    }
 }

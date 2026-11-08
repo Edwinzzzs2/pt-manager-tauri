@@ -50,6 +50,14 @@ pub struct AppStatus {
     pub last_result: Option<LogEntry>,
     pub is_running: bool,
     pub cancel_requested: bool,
+    pub groups: Vec<GroupStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupStatus {
+    pub group_id: Option<String>,
+    pub active_cdp_port: Option<u16>,
+    pub next_run: Option<DateTime<Local>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -63,16 +71,22 @@ pub struct CookieCloudSyncResult {
 }
 
 #[tauri::command]
+pub async fn describe_cron(expression: String) -> Result<String, String> {
+    scheduler::describe_cron(&expression)
+}
+
+#[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await;
-    let mut changed = store::refresh_login_attempt_resets(&mut config);
+    let changed = store::refresh_login_attempt_resets(&mut config);
     #[cfg(all(target_os = "macos", not(debug_assertions)))]
-    if let Some(enabled) = crate::macos_autostart::native_enabled()? {
-        if config.auto_launch != enabled {
+    let changed = match crate::macos_autostart::native_enabled()? {
+        Some(enabled) if config.auto_launch != enabled => {
             config.auto_launch = enabled;
-            changed = true;
+            true
         }
-    }
+        _ => changed,
+    };
     if changed {
         store::save_config(&state.app_handle, &config);
     }
@@ -84,6 +98,15 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     let _operation = lock_browser_operation(&state)?;
     {
         let current = state.config.lock().await;
+        if config.cdp_port == 0 {
+            return Err("请填写 1 到 65535 之间的浏览器调试端口".to_string());
+        }
+        crate::browser_proxy::normalize_config(&mut config.browser_proxy)?;
+        if (current.cdp_port != config.cdp_port || current.browser_proxy != config.browser_proxy)
+            && CdpClient::for_profile(&current.for_group(None)?).available_port().await.is_some()
+        {
+            return Err("请关闭默认分组的专用浏览器，再修改代理或调试端口".to_string());
+        }
         for site in &mut config.sites {
             if let Some(saved_site) = current.sites.iter().find(|saved| saved.id == site.id) {
                 site.login_attempts_remaining = saved_site.login_attempts_remaining;
@@ -103,7 +126,9 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
     config.update_check_interval_hours = config.update_check_interval_hours.clamp(1, 168);
     config.update_proxy_url = updater::normalize_proxy_url(&config.update_proxy_url)?;
-    crate::browser_proxy::normalize_config(&mut config.browser_proxy)?;
+    if scheduler::next_run_from_cron(&config.cron).is_none() {
+        return Err("默认保活计划的 Cron 表达式无效".to_string());
+    }
     store::normalize_site_groups(&mut config)?;
     config.gotify.server_url = config
         .gotify
@@ -148,21 +173,20 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
             .await
             .map_err(|err| err.to_string())??;
     }
-    let mut auto_launch_changed = state.config.lock().await.auto_launch != config.auto_launch;
+    let auto_launch_changed = state.config.lock().await.auto_launch != config.auto_launch;
     #[cfg(all(target_os = "macos", not(debug_assertions)))]
-    if let Some(enabled) = crate::macos_autostart::native_enabled()? {
-        auto_launch_changed |= enabled != config.auto_launch;
-    }
+    let auto_launch_changed = crate::macos_autostart::native_enabled()?
+        .is_some_and(|enabled| enabled != config.auto_launch)
+        || auto_launch_changed;
     if auto_launch_changed {
         apply_auto_launch(&state.app_handle, config.auto_launch)?;
     }
-    store::set_log_retention(config.log_retention);
     {
         let mut current = state.config.lock().await;
         *current = config.clone();
     }
     store::save_config(&state.app_handle, &config);
-    store::apply_log_retention(&state.logs).await;
+    store::apply_log_settings(&state.logs, config.log_retention, config.ocr_debug_enabled).await;
     restart_scheduler(&state, config).await;
     Ok(())
 }
@@ -388,7 +412,12 @@ pub async fn test_site_login(state: State<'_, AppState>, id: String) -> Result<S
         .find(|site| site.id == id)
         .cloned()
         .ok_or_else(|| "未找到要测试的站点".to_string())?;
+    let group = config.group_name(site.group_id.as_deref()).to_owned();
     let config = config.for_group(site.group_id.as_deref())?;
+    store::with_group_log(&group, test_site_login_in_group(&state, config, site)).await
+}
+
+async fn test_site_login_in_group(state: &AppState, config: AppConfig, site: store::Site) -> Result<String, String> {
     let adapter = SiteAdapter::from_url(&site.url);
     let is_nexusphp = adapter == SiteAdapter::NexusPhp;
     let login_attempt_threshold = store::effective_login_attempt_threshold(
@@ -635,7 +664,12 @@ pub async fn recognize_site_captcha(
         .find(|site| site.id == id)
         .cloned()
         .ok_or_else(|| "未找到要识别验证码的站点".to_string())?;
+    let group = config.group_name(site.group_id.as_deref()).to_owned();
     let config = config.for_group(site.group_id.as_deref())?;
+    store::with_group_log(&group, recognize_site_captcha_in_group(&state, config, site)).await
+}
+
+async fn recognize_site_captcha_in_group(state: &AppState, config: AppConfig, site: store::Site) -> Result<String, String> {
     if SiteAdapter::from_url(&site.url) != SiteAdapter::NexusPhp {
         return Err("当前验证码识别仅支持 NexusPHP 架构的站点".to_string());
     }
@@ -772,12 +806,14 @@ pub async fn recognize_site_captcha(
             Ok(result) => result,
             Err(err) => {
                 if attempt + 1 < max_attempts {
-                    push_log(
+                    store::push_ocr_log(
                         &state.logs,
                         LogEntry::info(format!(
                             "{} OCR 识别失败：{}，原地刷新页面后识别新验证码",
                             site.name, err
                         )),
+                        &image,
+                        err.candidate.as_deref(),
                     )
                     .await;
                     continue;
@@ -786,19 +822,25 @@ pub async fn recognize_site_captcha(
                     "{} OCR 识别失败：{}，已尝试 {} 张验证码",
                     site.name, err, max_attempts
                 );
-                push_log(&state.logs, LogEntry::error(message.clone())).await;
+                store::push_ocr_log(
+                    &state.logs,
+                    LogEntry::error(message.clone()),
+                    &image,
+                    err.candidate.as_deref(),
+                ).await;
                 return Err(message);
             }
         };
-        push_log(
+        store::push_ocr_log(
             &state.logs,
             LogEntry::info(format!(
-                "{} OCR 识别：第 {}/{} 张成功，验证码：{}",
+                "{} OCR 识别：第 {}/{} 张成功",
                 site.name,
                 attempt + 1,
-                max_attempts,
-                recognition.text
+                max_attempts
             )),
+            &image,
+            Some(&recognition.text),
         )
         .await;
         cdp.fill_nexusphp_captcha(&tab_id, &recognition.text)
@@ -816,19 +858,21 @@ pub async fn recognize_site_captcha(
 #[tauri::command]
 pub async fn check_cdp(state: State<'_, AppState>) -> Result<bool, String> {
     let config = state.config.lock().await.clone();
-    Ok(active_cdp_port(&config).await.is_some())
+    Ok(active_cdp_port(&config, config.group_ids()).await.is_some())
 }
 
-async fn active_cdp_port(config: &AppConfig) -> Option<u16> {
-    for id in config.group_ids() {
-        let Ok(scoped) = config.for_group(id) else { continue };
-        if let Some(cdp) = CdpClient::for_status(&scoped) {
-            if let Some(port) = cdp.available_port().await {
-                return Some(port);
-            }
+async fn active_cdp_port<'a>(config: &AppConfig, groups: impl Iterator<Item = Option<&'a str>>) -> Option<u16> {
+    for id in groups {
+        if let Some(port) = group_cdp_port(config, id).await {
+            return Some(port);
         }
     }
     None
+}
+
+async fn group_cdp_port(config: &AppConfig, id: Option<&str>) -> Option<u16> {
+    let scoped = config.for_group(id).ok()?;
+    CdpClient::for_status(&scoped)?.available_port().await
 }
 
 #[tauri::command]
@@ -836,49 +880,73 @@ pub async fn sync_cookiecloud_cookies(
     state: State<'_, AppState>,
     cookies: serde_json::Value,
     cookiecloud: Option<store::CookieCloudConfig>,
+    scope: Option<String>,
 ) -> Result<CookieCloudSyncResult, String> {
     let _operation = lock_browser_operation(&state)?;
     state.task_cancel_requested.store(false, Ordering::SeqCst);
-    let config = global_cookiecloud_config(&state, cookiecloud).await?;
-    import_global_cookiecloud(&state, &config, cookies).await
+    let scope = scope.as_deref().unwrap_or("all");
+    let config = cookiecloud_config(&state, scope, cookiecloud.clone()).await?;
+    if scope != "all" && cookiecloud.as_ref() != Some(&cookiecloud_for_scope(&config, scope)?) {
+        return Err("CookieCloud 设置已变更，请重新同步".to_string());
+    }
+    import_scoped_cookiecloud(&state, &config, scope, cookies).await
 }
 
 #[tauri::command]
 pub async fn sync_cookiecloud_from_config(
     state: State<'_, AppState>,
     config: AppConfig,
+    scope: Option<String>,
 ) -> Result<CookieCloudSyncResult, String> {
     let _operation = lock_browser_operation(&state)?;
     state.task_cancel_requested.store(false, Ordering::SeqCst);
-    let config = global_cookiecloud_config(&state, Some(config.cookiecloud)).await?;
-    let cookiecloud_config = config.cookiecloud.clone();
-    let payload = tauri::async_runtime::spawn_blocking(move || cookiecloud::fetch_sync_payload(&cookiecloud_config))
-        .await
-        .map_err(|err| err.to_string())??;
+    let scope = scope.as_deref().unwrap_or("all");
+    let config = cookiecloud_config(&state, scope, Some(config.cookiecloud)).await?;
+    let cookiecloud_config = cookiecloud_for_scope(&config, scope)?;
+    let payload = cookiecloud::fetch_for_import(&cookiecloud_config).await?;
 
-    import_global_cookiecloud(&state, &config, payload).await
+    import_scoped_cookiecloud(&state, &config, scope, payload).await
 }
 
-async fn global_cookiecloud_config(
+async fn cookiecloud_config(
     state: &State<'_, AppState>,
+    scope: &str,
     draft: Option<store::CookieCloudConfig>,
 ) -> Result<AppConfig, String> {
     let mut config = state.config.lock().await.clone();
-    if let Some(draft) = draft {
+    if let Some(draft) = draft.filter(|_| scope == "all") {
         config.cookiecloud = draft;
     }
     store::normalize_site_groups(&mut config)?;
     Ok(config)
 }
 
-async fn import_global_cookiecloud(
+fn cookiecloud_for_scope(config: &AppConfig, scope: &str) -> Result<store::CookieCloudConfig, String> {
+    match scope {
+        "all" | "" => Ok(config.cookiecloud.clone()),
+        id => {
+            if config.group(id)?.cookie_mode == store::GroupCookieMode::Manual {
+                return Err("该分组已关闭 CookieCloud 同步".to_string());
+            }
+            Ok(config.for_group(Some(id))?.cookiecloud)
+        }
+    }
+}
+
+async fn import_scoped_cookiecloud(
     state: &State<'_, AppState>,
     config: &AppConfig,
+    scope: &str,
     payload: serde_json::Value,
 ) -> Result<CookieCloudSyncResult, String> {
     let mut summary = CookieCloudSyncResult::default();
     let mut first_error = None;
-    for group_id in config.global_cookiecloud_group_ids() {
+    let groups = if scope == "all" {
+        config.global_cookiecloud_group_ids().map(|id| id.map(str::to_owned)).collect()
+    } else {
+        config.group_ids_for_scope(scope)?
+    };
+    for group_id in groups.iter().map(|id| id.as_deref()) {
         let mut scoped = config.for_group(group_id)?;
         if scoped.sites.is_empty() {
             continue;
@@ -886,15 +954,12 @@ async fn import_global_cookiecloud(
         if state.task_cancel_requested.load(Ordering::SeqCst) {
             return Err(cdp::CDP_CANCELLED.to_string());
         }
-        let group_name = match group_id {
-            Some(id) => config.group(id)?.name.as_str(),
-            None => "未分组站点",
-        };
+        let group_name = config.group_name(group_id);
         scoped.sites = scoped.sites.iter().filter(|site| scoped.can_sync_site(site)).cloned().collect();
         let result = if scoped.sites.is_empty() {
             Err("同域名账号共用全局 CookieCloud，已跳过；可为本组配置独立 UUID".to_string())
         } else {
-            import_cookiecloud_cookies(state, &scoped, payload.clone()).await
+            store::with_group_log(group_name, import_cookiecloud_cookies(state, &scoped, payload.clone())).await
         };
         match result {
             Ok(result) => {
@@ -914,7 +979,7 @@ async fn import_global_cookiecloud(
         }
     }
     if summary.synced_groups == 0 {
-        return Err(first_error.unwrap_or_else(|| "使用默认 CookieCloud 设置的分组没有可同步的站点".to_string()));
+        return Err(first_error.unwrap_or_else(|| "所选范围没有可同步 CookieCloud 的站点".to_string()));
     }
     Ok(summary)
 }
@@ -993,7 +1058,7 @@ async fn import_cookiecloud_cookies(
         let operation = Arc::clone(&state.browser_operation);
         let cdp = CdpClient::new(write_port);
         let session = cdp.browser_session().ok();
-        tauri::async_runtime::spawn(async move {
+        store::spawn_with_group_log(async move {
             tokio::time::sleep(Duration::from_secs(
                 cookiecloud::SYNC_BROWSER_CLOSE_DELAY_SECONDS,
             ))
@@ -1251,12 +1316,24 @@ fn is_connection_refused(message: &str) -> bool {
 }
 
 #[tauri::command]
-pub async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String> {
+pub async fn get_status(state: State<'_, AppState>, scope: Option<String>) -> Result<AppStatus, String> {
     let config = state.config.lock().await.clone();
-    let active_cdp_port = active_cdp_port(&config).await;
+    let scope = scope.as_deref().unwrap_or("all");
+    let group_ids = config.group_ids_for_scope(scope)?;
+    let mut groups = Vec::new();
+    let active_cdp_port = if scope == "all" {
+        for id in group_ids {
+            let active_cdp_port = group_cdp_port(&config, id.as_deref()).await;
+            let next_run = state.scheduler.lock().await.next_run(id.as_deref().unwrap_or("")).await;
+            groups.push(GroupStatus { group_id: id, active_cdp_port, next_run });
+        }
+        groups.iter().find_map(|group| group.active_cdp_port)
+    } else {
+        active_cdp_port(&config, group_ids.iter().map(|id| id.as_deref())).await
+    };
     let cdp_connected = active_cdp_port.is_some();
     let browser_installed = cdp::browser_installed(config.browser);
-    let next_run = state.scheduler.lock().await.next_run().await;
+    let next_run = state.scheduler.lock().await.next_run(scope).await;
     let is_running = *state.task_running.lock().await;
     let cancel_requested = state.task_cancel_requested.load(Ordering::SeqCst);
     let last_result = state.logs.lock().await.iter().last().cloned();
@@ -1269,12 +1346,21 @@ pub async fn get_status(state: State<'_, AppState>) -> Result<AppStatus, String>
         last_result,
         is_running,
         cancel_requested,
+        groups,
     })
 }
 
 #[tauri::command]
-pub async fn run_task(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn run_task(state: State<'_, AppState>, scope: Option<String>) -> Result<(), String> {
     let config = { state.config.lock().await.clone() };
+    let group_id = match scope.as_deref().unwrap_or_default() {
+        "" => None,
+        id => Some(config.group(id)?.id.clone()),
+    };
+    if !config.sites.iter().any(|site| site.auto_keepalive && site.group_id == group_id) {
+        return Err("该分组没有开启自动保活的站点".to_string());
+    }
+    let group_name = config.group_name(group_id.as_deref()).to_owned();
     let logs = Arc::clone(&state.logs);
     let task_running = Arc::clone(&state.task_running);
     let browser_operation = Arc::clone(&state.browser_operation);
@@ -1282,15 +1368,18 @@ pub async fn run_task(state: State<'_, AppState>) -> Result<(), String> {
     let app_handle = state.app_handle.clone();
     let config_state = Arc::clone(&state.config);
     tauri::async_runtime::spawn(async move {
-        scheduler::run_with_flag(
-            &config,
-            &logs,
-            &task_running,
-            &browser_operation,
-            &task_cancel_requested,
-            false,
-            Some(&app_handle),
-            Some(&config_state),
+        store::with_group_log(
+            &group_name,
+            scheduler::run_with_flag(
+                &config,
+                &logs,
+                &task_running,
+                &browser_operation,
+                &task_cancel_requested,
+                &[group_id],
+                Some(&app_handle),
+                Some(&config_state),
+            ),
         )
         .await;
     });
@@ -1321,6 +1410,11 @@ pub async fn get_logs(state: State<'_, AppState>) -> Result<Vec<LogEntry>, Strin
 }
 
 #[tauri::command]
+pub async fn get_ocr_debug(state: State<'_, AppState>, id: String) -> Result<store::OcrDebugDetails, String> {
+    store::ocr_debug_details(&state.logs, &id).await.ok_or_else(|| "调试详情已清除或过期".to_string())
+}
+
+#[tauri::command]
 pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
     let mut logs = state.logs.lock().await;
     logs.clear();
@@ -1329,55 +1423,83 @@ pub async fn clear_logs(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn clear_browser_data(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_browser_data(state: State<'_, AppState>, scope: String) -> Result<(), String> {
     let _operation = lock_browser_operation(&state)?;
+    let config = state.config.lock().await.clone();
+    let groups = config.group_ids_for_scope(&scope)?;
 
-    let config = state.config.lock().await.for_group(None)?;
-    let site_urls = config
-        .sites
-        .iter()
-        .map(|site| site.url.clone())
-        .collect::<Vec<_>>();
-    let cdp = CdpClient::for_profile(&config);
-    let message = if let Some(active_port) = cdp.available_port().await {
-        CdpClient::new(active_port)
-            .clear_browser_data(&site_urls)
-            .await?;
-        format!(
-            "已通过 CDP 清除专用 {} 浏览器数据：localhost:{}",
-            config.browser.name(),
-            active_port
-        )
-    } else {
-        let cleared = cdp::clear_dedicated_profile_data(config.browser)?;
-        if cleared == 0 {
-            format!("专用 {} 浏览器数据为空，无需清除", config.browser.name())
-        } else {
-            format!(
-                "已清除专用 {} Profile，Cookie、Local Storage 和缓存将在下次启动时重新生成",
-                config.browser.name()
-            )
+    let mut failures = Vec::new();
+    let mut completed = 0;
+    for id in groups.iter().map(|id| id.as_deref()) {
+        let name = id
+            .and_then(|id| config.group(id).ok())
+            .map_or("默认分组", |group| group.name.as_str());
+        let result = match config.for_group(id) {
+            Ok(scoped) => {
+                let cdp = CdpClient::for_profile(&scoped);
+                let urls = scoped.sites.into_iter().map(|site| site.url).collect::<Vec<_>>();
+                cdp.clear_managed_browser_data(&urls).await
+            }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(cleared) => {
+                completed += 1;
+                let status = if cleared {
+                    "浏览器数据已清除"
+                } else {
+                    "没有浏览器数据需要清除"
+                };
+                push_log(&state.logs, LogEntry::success(format!("「{name}」{status}"))).await;
+            }
+            Err(err) => {
+                let message = format!("「{name}」浏览器数据未完全清除：{err}");
+                push_log(&state.logs, LogEntry::error(message.clone())).await;
+                failures.push(message);
+            }
         }
-    };
+    }
 
-    push_log(&state.logs, LogEntry::success(message)).await;
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else if scope == "all" {
+        Err(format!(
+            "已处理 {completed} 个范围，{} 个范围未完全清除。{}",
+            failures.len(),
+            failures.join("；")
+        ))
+    } else {
+        Err(failures.join("；"))
+    }
 }
 
 #[tauri::command]
 pub async fn clear_cookiecloud_data(
     state: State<'_, AppState>,
     config: crate::store::CookieCloudConfig,
+    scope: Option<String>,
 ) -> Result<(), String> {
     let _operation = lock_browser_operation(&state)?;
-    let config = global_cookiecloud_config(&state, Some(config)).await?;
-    cookiecloud::clear_cloud_data(&config.cookiecloud).await?;
+    let scope = scope.as_deref().unwrap_or("all");
+    let saved = cookiecloud_config(&state, scope, Some(config.clone())).await?;
+    let cloud = cookiecloud_for_scope(&saved, scope)?;
+    if scope != "all" {
+        if scope.is_empty() || saved.group(scope)?.cookie_mode != store::GroupCookieMode::Custom {
+            return Err("共享 CookieCloud 数据请在应用设置中清空".to_string());
+        }
+        if cloud != config {
+            return Err("CookieCloud 设置已变更，请重新确认清空范围".to_string());
+        }
+    }
+    cookiecloud::clear_cloud_data(&cloud).await?;
 
-    push_log(
-        &state.logs,
-        LogEntry::success("已清空 CookieCloud 服务器上的 Cookie 和 Local Storage 数据"),
-    )
-    .await;
+    let message = "已清空 CookieCloud 服务器上的 Cookie 和 Local Storage 数据";
+    let message = if scope == "all" {
+        message.to_owned()
+    } else {
+        format!("「{}」{message}", saved.group_name(Some(scope)))
+    };
+    push_log(&state.logs, LogEntry::success(message)).await;
     Ok(())
 }
 
@@ -1564,7 +1686,7 @@ pub async fn import_config(state: State<'_, AppState>, path: String) -> Result<A
 
     store::save_config(&state.app_handle, &config);
 
-    store::set_log_retention(config.log_retention);
+    store::apply_log_settings(&state.logs, config.log_retention, config.ocr_debug_enabled).await;
 
     restart_scheduler(&state, config.clone()).await;
 

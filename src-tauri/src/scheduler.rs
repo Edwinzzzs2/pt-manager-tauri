@@ -8,7 +8,7 @@ use crate::gotify;
 use crate::store::{self, AppConfig, LogEntry, Site};
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone};
 use rand::Rng;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,14 +20,27 @@ const MAX_CONCURRENT_SIGNINS: usize = 4;
 
 pub struct Scheduler {
     handle: Option<JoinHandle<()>>,
-    next_run: Arc<Mutex<Option<DateTime<Local>>>>,
+    next_runs: Arc<Mutex<HashMap<Option<String>, DateTime<Local>>>>,
+}
+
+struct ScheduledBatch {
+    next: DateTime<Local>,
+    cron: CronSpec,
+    offset: i64,
+    group_ids: Vec<Option<String>>,
+}
+
+fn next_runs_for_groups(schedules: &[ScheduledBatch]) -> HashMap<Option<String>, DateTime<Local>> {
+    schedules.iter()
+        .flat_map(|schedule| schedule.group_ids.iter().map(|id| (id.clone(), schedule.next)))
+        .collect()
 }
 
 impl Scheduler {
-    pub fn new(next_run: Arc<Mutex<Option<DateTime<Local>>>>) -> Self {
+    pub fn new() -> Self {
         Self {
             handle: None,
-            next_run,
+            next_runs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -51,35 +64,46 @@ impl Scheduler {
     ) {
         self.stop();
 
-        let next_run = Arc::clone(&self.next_run);
+        let next_runs = Arc::clone(&self.next_runs);
         let app_handle_clone = app_handle.clone();
         let config_state_clone = config_state.clone();
         let handle = tauri::async_runtime::spawn(async move {
-            loop {
-                let Some(next) = next_run_from_cron(&config.cron) else {
-                    {
-                        let mut guard = next_run.lock().await;
-                        *guard = None;
-                    }
-                    push_log(
-                        &logs,
-                        LogEntry::error(format!("Cron 表达式无效：{}", config.cron)),
-                    )
-                    .await;
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    continue;
-                };
-
-                {
-                    let mut guard = next_run.lock().await;
-                    *guard = Some(next);
+            let mut schedules = Vec::new();
+            for ((expression, offset), group_ids) in scheduled_groups(&config) {
+                let schedule = CronSpec::parse(&expression).ok().and_then(|cron| {
+                    Some(ScheduledBatch {
+                        next: next_scheduled_start(&cron, Local::now(), offset)?,
+                        cron,
+                        offset,
+                        group_ids,
+                    })
+                });
+                if let Some(schedule) = schedule {
+                    schedules.push(schedule);
+                } else {
+                    push_log(&logs, LogEntry::error(format!("Cron 表达式无效：{expression}"))).await;
                 }
+            }
+            *next_runs.lock().await = next_runs_for_groups(&schedules);
+            loop {
+                let Some((index, batch)) = schedules.iter().enumerate()
+                    .min_by_key(|(_, schedule)| schedule.next)
+                else { break };
+                let next = batch.next;
 
                 let wait = next
                     .signed_duration_since(Local::now())
                     .to_std()
                     .unwrap_or_else(|_| Duration::from_secs(0));
                 tokio::time::sleep(wait).await;
+
+                let groups = batch.group_ids.clone();
+                if let Some(following) = next_scheduled_start(&batch.cron, Local::now().max(next), batch.offset) {
+                    schedules[index].next = following;
+                } else {
+                    schedules.remove(index);
+                }
+                *next_runs.lock().await = next_runs_for_groups(&schedules);
 
                 // 重建定时器不能中断已经开始的保活或跳过浏览器收尾。
                 let config = config.clone();
@@ -96,7 +120,7 @@ impl Scheduler {
                         &task_running,
                         &browser_operation,
                         &task_cancel_requested,
-                        true,
+                        &groups,
                         app_handle.as_ref(),
                         config_state.as_ref(),
                     )
@@ -108,9 +132,74 @@ impl Scheduler {
         self.handle = Some(handle);
     }
 
-    pub async fn next_run(&self) -> Option<DateTime<Local>> {
-        self.next_run.lock().await.clone()
+    pub async fn next_run(&self, scope: &str) -> Option<DateTime<Local>> {
+        let next = self.next_runs.lock().await;
+        match scope {
+            "all" => next.values().min().copied(),
+            "" => next.get(&None).copied(),
+            id => next.get(&Some(id.to_owned())).copied(),
+        }
     }
+}
+
+fn scheduled_groups(config: &AppConfig) -> BTreeMap<(String, i64), Vec<Option<String>>> {
+    let mut schedules: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for id in config.group_ids() {
+        if !config.sites.iter().any(|site| site.group_id.as_deref() == id && site.auto_keepalive) {
+            continue;
+        }
+        let task = id.and_then(|id| config.group(id).ok()).and_then(|group| group.task.as_ref());
+        let (cron, offset) = task.map_or((&config.cron, config.cron_offset_minutes), |task| {
+            (&task.cron, task.cron_offset_minutes)
+        });
+        let expression = cron.split_whitespace().collect::<Vec<_>>().join(" ");
+        schedules.entry((expression, offset.clamp(0, 1440))).or_default().push(id.map(str::to_owned));
+    }
+    schedules
+}
+
+#[cfg(test)]
+mod grouped_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_and_custom_schedules_only_include_their_enabled_groups() {
+        let custom = "00000000-0000-4000-8000-000000000001";
+        let inherited = "00000000-0000-4000-8000-000000000002";
+        let disabled = "00000000-0000-4000-8000-000000000003";
+        let mut config = AppConfig::default();
+        config.cron = "0 9 * * *".into();
+        config.cron_offset_minutes = 0;
+        config.site_groups = serde_json::from_value(serde_json::json!([
+            { "id": custom, "name": "独立", "cdp_port": 9223, "task": {
+                "cron": "30 19 * * *", "cron_offset_minutes": 0, "visit_duration": 55
+            }},
+            { "id": inherited, "name": "继承", "cdp_port": 9224 },
+            { "id": disabled, "name": "停用", "cdp_port": 9225 }
+        ])).unwrap();
+        config.sites = serde_json::from_value(serde_json::json!([
+            { "id": "1", "name": "未分组站点", "url": "https://example.com", "auto_keepalive": true },
+            { "id": "2", "name": "独立站点", "url": "https://example.org", "group_id": custom, "auto_keepalive": true },
+            { "id": "3", "name": "继承站点", "url": "https://example.net", "group_id": inherited, "auto_keepalive": true },
+            { "id": "4", "name": "停用站点", "url": "https://example.edu", "group_id": disabled, "auto_keepalive": false }
+        ])).unwrap();
+        store::normalize_site_groups(&mut config).unwrap();
+
+        let scheduled = scheduled_groups(&config);
+        assert_eq!(scheduled.len(), 2);
+        assert_eq!(scheduled[&("0 9 * * *".into(), 0)], vec![None, Some(inherited.into())]);
+        assert_eq!(scheduled[&("30 19 * * *".into(), 0)], vec![Some(custom.into())]);
+        assert_eq!(config.group_ids_for_scope(custom).unwrap(), vec![Some(custom.into())]);
+        assert_eq!(config.for_group(Some(custom)).unwrap().visit_duration, 55);
+        assert_eq!(config.for_group(Some(inherited)).unwrap().visit_duration, config.visit_duration);
+    }
+}
+
+fn next_scheduled_start(cron: &CronSpec, after: DateTime<Local>, offset: i64) -> Option<DateTime<Local>> {
+    let scheduled = cron.next_after(after)?;
+    // 延迟计入各自的执行时间，等待中的分组不会占用浏览器任务锁。
+    let delay_seconds = rand::thread_rng().gen_range(0..=offset * 60);
+    scheduled.checked_add_signed(chrono::Duration::seconds(delay_seconds))
 }
 
 pub async fn run_with_flag(
@@ -119,7 +208,7 @@ pub async fn run_with_flag(
     task_running: &Arc<Mutex<bool>>,
     browser_operation: &Arc<Mutex<()>>,
     task_cancel_requested: &Arc<AtomicBool>,
-    apply_random_delay: bool,
+    group_ids: &[Option<String>],
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) {
@@ -142,7 +231,7 @@ pub async fn run_with_flag(
         config,
         logs,
         task_cancel_requested,
-        apply_random_delay,
+        group_ids,
         app_handle,
         config_state,
     )
@@ -158,45 +247,29 @@ pub async fn run_with_flag(
 }
 
 pub fn next_run_from_cron(expr: &str) -> Option<DateTime<Local>> {
-    let cron = CronSpec::parse(expr)?;
+    let cron = CronSpec::parse(expr).ok()?;
     cron.next_after(Local::now())
+}
+
+pub fn describe_cron(expr: &str) -> Result<String, String> {
+    let cron = CronSpec::parse(expr)?;
+    if cron.next_after(Local::now()).is_none() {
+        return Err("未来一年内没有匹配的执行时间，请检查日期、月份和星期".to_string());
+    }
+    Ok(cron.description())
 }
 
 async fn run_keepalive_inner(
     config: &AppConfig,
     logs: &Arc<Mutex<Vec<LogEntry>>>,
     task_cancel_requested: &Arc<AtomicBool>,
-    apply_random_delay: bool,
+    group_ids: &[Option<String>],
     app_handle: Option<&AppHandle>,
     config_state: Option<&Arc<Mutex<AppConfig>>>,
 ) -> bool {
     if config.sites.is_empty() {
         push_log(logs, LogEntry::info("暂无站点配置，保活任务结束")).await;
         return false;
-    }
-
-    let random_delay_minutes = config.cron_offset_minutes.max(0) as u64;
-    if apply_random_delay && random_delay_minutes > 0 {
-        let delay_secs: u64 = rand::thread_rng().gen_range(0..=random_delay_minutes * 60);
-        push_log(
-            logs,
-            LogEntry::info(format!(
-                "随机延迟 {} 秒，等待结束后再准备浏览器并执行保活",
-                delay_secs
-            )),
-        )
-        .await;
-        // 定时随机延迟必须早于 CookieCloud 同步和 CDP 初始化，避免等待期间提前打开浏览器。
-        if sleep_with_cancel(
-            logs,
-            task_cancel_requested,
-            Duration::from_secs(delay_secs),
-            "随机延迟",
-        )
-        .await
-        {
-            return true;
-        }
     }
 
     if !config.ocr_server_url.is_empty() {
@@ -228,7 +301,7 @@ async fn run_keepalive_inner(
     }
     let config = &validated;
     let mut summary = KeepaliveSummary::default();
-    for id in config.group_ids() {
+    for id in group_ids.iter().map(|id| id.as_deref()) {
         if task_cancel_requested.load(Ordering::SeqCst) {
             return true;
         }
@@ -242,16 +315,13 @@ async fn run_keepalive_inner(
         if scoped.sites.is_empty() || (id.is_some() && !scoped.sites.iter().any(|site| site.auto_keepalive)) {
             continue;
         }
-        if !config.site_groups.is_empty() {
-            let message = match id.and_then(|id| config.group(id).ok()) {
-                Some(group) => format!("开始执行分组「{}」", group.name),
-                None => "开始执行未分组站点".to_string(),
-            };
-            push_log(logs, LogEntry::info(message)).await;
-        }
-        let canceled = run_keepalive_group(&scoped, logs, task_cancel_requested, app_handle, config_state, &mut summary).await;
-        // 只清理参与本轮执行的分组，不关闭尚未执行分组的浏览器。
-        close_group_browsers(&scoped, logs).await;
+        let canceled = store::with_group_log(config.group_name(id), async {
+            push_log(logs, LogEntry::info("开始执行保活")).await;
+            let canceled = run_keepalive_group(&scoped, logs, task_cancel_requested, app_handle, config_state, &mut summary).await;
+            // 只清理参与本轮执行的分组，不关闭尚未执行分组的浏览器。
+            close_group_browsers(&scoped, logs).await;
+            canceled
+        }).await;
         if canceled {
             return true;
         }
@@ -473,7 +543,7 @@ async fn sync_cookiecloud_before_keepalive(
         let logs = Arc::clone(logs);
         let cdp = CdpClient::new(active_port);
         let session = cdp.browser_session().ok();
-        tauri::async_runtime::spawn(async move {
+        store::spawn_with_group_log(async move {
             tokio::time::sleep(Duration::from_secs(
                 cookiecloud::SYNC_BROWSER_CLOSE_DELAY_SECONDS,
             ))
@@ -996,7 +1066,7 @@ async fn run_keepalive_batch(
                     let cancel_requested = Arc::clone(task_cancel_requested);
                     let app_handle_clone = app_handle.map(|h| h.clone());
                     let config_state_clone = config_state.map(|s| Arc::clone(s));
-                    login_jobs.push(tauri::async_runtime::spawn(async move {
+                    login_jobs.push(store::spawn_with_group_log(async move {
                         let login_cdp = CdpClient::new(cdp_port);
                         let outcome = try_auto_login_site(
                             &login_site,
@@ -1125,7 +1195,7 @@ async fn run_keepalive_batch(
         }
         let traffic_logs = Arc::clone(logs);
         let cdp_port = cdp.port();
-        traffic_jobs.push(tauri::async_runtime::spawn(async move {
+        traffic_jobs.push(store::spawn_with_group_log(async move {
             let traffic_cdp = CdpClient::new(cdp_port);
             let result = try_read_site_traffic(&site, &traffic_cdp, &tab_id, &traffic_logs).await;
             (site.name, result)
@@ -1163,7 +1233,7 @@ async fn run_keepalive_batch(
         let signin_cancel = Arc::clone(task_cancel_requested);
         let signin_slots = Arc::clone(&signin_slots);
         let cdp_port = cdp.port();
-        signin_jobs.push(tauri::async_runtime::spawn(async move {
+        signin_jobs.push(store::spawn_with_group_log(async move {
             let _permit = signin_slots.acquire().await.expect("签到限流器未关闭");
             let signin_cdp = CdpClient::new(cdp_port);
             let result =
@@ -1348,22 +1418,90 @@ struct CronSpec {
 }
 
 impl CronSpec {
-    fn parse(expr: &str) -> Option<Self> {
+    fn parse(expr: &str) -> Result<Self, String> {
         let parts: Vec<&str> = expr.split_whitespace().collect();
         let fields = match parts.len() {
             5 => vec!["0", parts[0], parts[1], parts[2], parts[3], parts[4]],
             6 => parts,
-            _ => return None,
+            _ => return Err("请输入 5 项（分、时、日、月、周）或 6 项（秒、分、时、日、月、周）".to_string()),
         };
 
-        Some(Self {
-            seconds: parse_cron_field(fields[0], 0, 59)?,
-            minutes: parse_cron_field(fields[1], 0, 59)?,
-            hours: parse_cron_field(fields[2], 0, 23)?,
-            days: parse_cron_field(fields[3], 1, 31)?,
-            months: parse_cron_field(fields[4], 1, 12)?,
-            weekdays: parse_cron_field(fields[5], 0, 7)?,
+        let field = |index, name, min, max| {
+            parse_cron_field(fields[index], min, max)
+                .ok_or_else(|| format!("{name}字段无效，范围为 {min}–{max}"))
+        };
+        Ok(Self {
+            seconds: field(0, "秒", 0, 59)?,
+            minutes: field(1, "分钟", 0, 59)?,
+            hours: field(2, "小时", 0, 23)?,
+            days: field(3, "日期", 1, 31)?,
+            months: field(4, "月份", 1, 12)?,
+            weekdays: field(5, "星期", 0, 7)?,
         })
+    }
+
+    fn description(&self) -> String {
+        let weekdays = (0..7).filter(|day| {
+            self.weekdays.contains(day) || (*day == 0 && self.weekdays.contains(&7))
+        }).collect::<Vec<_>>();
+        let day_names = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+        let week = weekdays.iter().map(|&day| day_names[day as usize]).collect::<Vec<_>>().join("、");
+        let date = match (self.months.len() == 12, self.days.len() == 31) {
+            (true, true) if weekdays.len() == 7 => "每天".to_string(),
+            (true, true) => format!("每逢{week}"),
+            (true, false) => format!("每月{}日", cron_value_ranges(&self.days)),
+            (false, true) => format!("每年{}月的每一天", cron_value_ranges(&self.months)),
+            (false, false) => format!("每年{}月的{}日", cron_value_ranges(&self.months), cron_value_ranges(&self.days)),
+        };
+        let date = if weekdays.len() < 7 && (self.months.len() < 12 || self.days.len() < 31) {
+            format!("{date}（且为{week}）")
+        } else {
+            date
+        };
+
+        if self.hours.len() * self.minutes.len() * self.seconds.len() <= 12 {
+            let mut times = Vec::new();
+            for hour in &self.hours {
+                for minute in &self.minutes {
+                    for second in &self.seconds {
+                        let time = if self.seconds == [0] {
+                            format!("{hour:02}:{minute:02}")
+                        } else {
+                            format!("{hour:02}:{minute:02}:{second:02}")
+                        };
+                        times.push(time);
+                    }
+                }
+            }
+            return format!("{date} {} 触发", times.join("、"));
+        }
+
+        if self.hours.len() == 24 && self.seconds == [0] {
+            if self.minutes.len() == 60 {
+                return format!("{date}每分钟触发");
+            }
+            if self.minutes.len() == 1 {
+                return format!("{date}每小时的第 {} 分钟触发", self.minutes[0]);
+            }
+            let step = self.minutes[1];
+            if step > 0 && 60 % step == 0 && self.minutes.iter().copied().eq((0..60).step_by(step as usize)) {
+                return format!("{date}每隔 {step} 分钟触发");
+            }
+        }
+
+        let fields = [
+            ("小时", &self.hours, 24),
+            ("分钟", &self.minutes, 60),
+            ("秒", &self.seconds, 60),
+        ];
+        let matching = fields.iter().filter(|(_, values, count)| values.len() != *count)
+            .map(|(name, values, _)| format!("{name}为 {}", cron_value_ranges(values)))
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            format!("{date}每秒触发")
+        } else {
+            format!("{date}，{}时触发", matching.join("，"))
+        }
     }
 
     /// 从当前时间向后扫描一年内的候选时间，覆盖 MVP 所需的日/周/分钟级调度。
@@ -1414,6 +1552,22 @@ impl CronSpec {
     }
 }
 
+fn cron_value_ranges(values: &[u32]) -> String {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < values.len() {
+        let start = values[index];
+        let mut end = start;
+        index += 1;
+        while index < values.len() && values[index] == end + 1 {
+            end = values[index];
+            index += 1;
+        }
+        ranges.push(if start == end { start.to_string() } else { format!("{start}–{end}") });
+    }
+    ranges.join("、")
+}
+
 fn parse_cron_field(field: &str, min: u32, max: u32) -> Option<Vec<u32>> {
     let mut values = Vec::new();
 
@@ -1458,6 +1612,28 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Option<Vec<u32>> {
     values.sort_unstable();
     values.dedup();
     Some(values)
+}
+
+#[cfg(test)]
+mod cron_description_tests {
+    use super::{describe_cron, CronSpec};
+
+    #[test]
+    fn distinguishes_five_and_six_field_expressions() {
+        assert_eq!(describe_cron("0 5,19 * * *").unwrap(), "每天 05:00、19:00 触发");
+        assert_eq!(describe_cron("0 8 17 * * *").unwrap(), "每天 17:08 触发");
+        assert_eq!(describe_cron("30 8 17 * * *").unwrap(), "每天 17:08:30 触发");
+        assert_eq!(describe_cron("*/15 * * * *").unwrap(), "每天每隔 15 分钟触发");
+    }
+
+    #[test]
+    fn describes_date_intersection_and_rejects_invalid_schedules() {
+        let spec = CronSpec::parse("0 9 1 * 1,7").unwrap();
+        assert_eq!(spec.description(), "每月1日（且为周日、周一） 09:00 触发");
+        assert!(describe_cron("0 24 * * *").unwrap_err().contains("小时字段"));
+        assert!(describe_cron("*/0 * * * *").unwrap_err().contains("分钟字段"));
+        assert!(describe_cron("0 8 30 2 *").unwrap_err().contains("未来一年内"));
+    }
 }
 
 async fn push_log(logs: &Arc<Mutex<Vec<LogEntry>>>, entry: LogEntry) {
