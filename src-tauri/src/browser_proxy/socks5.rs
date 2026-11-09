@@ -1,4 +1,3 @@
-use crate::store::BrowserProxyConfig;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 
@@ -6,10 +5,11 @@ pub(super) fn connect(
     stream: &mut (impl Read + Write),
     host: &str,
     port: u16,
-    config: &BrowserProxyConfig,
+    username: &str,
+    password: &str,
 ) -> Result<(), String> {
     // RFC 1928: only offer the method selected by the user's configuration.
-    let method = if config.username.is_empty() { 0 } else { 2 };
+    let method = if username.is_empty() { 0 } else { 2 };
     stream.write_all(&[5, 1, method]).map_err(io_error)?;
     let mut selection = [0; 2];
     stream.read_exact(&mut selection).map_err(io_error)?;
@@ -17,7 +17,7 @@ pub(super) fn connect(
         return Err("SOCKS5 代理不支持当前认证方式，请检查用户名和密码设置".to_string());
     }
     if method == 2 {
-        authenticate(stream, &config.username, &config.password)?;
+        authenticate(stream, username, password)?;
     }
 
     let mut request = vec![5, 1, 0];

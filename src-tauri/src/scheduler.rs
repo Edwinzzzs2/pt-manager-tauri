@@ -148,7 +148,14 @@ fn scheduled_groups(config: &AppConfig) -> BTreeMap<(String, i64), Vec<Option<St
         if !config.sites.iter().any(|site| site.group_id.as_deref() == id && site.auto_keepalive) {
             continue;
         }
-        let task = id.and_then(|id| config.group(id).ok()).and_then(|group| group.task.as_ref());
+        let group = id.and_then(|id| config.group(id).ok());
+        if group.is_some_and(|group| !group.scheduled_keepalive) {
+            continue;
+        }
+        let task = group.and_then(|group| group.task.as_ref());
+        if task.is_none() && !config.default_scheduled_keepalive {
+            continue;
+        }
         let (cron, offset) = task.map_or((&config.cron, config.cron_offset_minutes), |task| {
             (&task.cron, task.cron_offset_minutes)
         });
@@ -175,13 +182,13 @@ mod grouped_schedule_tests {
                 "cron": "30 19 * * *", "cron_offset_minutes": 0, "visit_duration": 55
             }},
             { "id": inherited, "name": "继承", "cdp_port": 9224 },
-            { "id": disabled, "name": "停用", "cdp_port": 9225 }
+            { "id": disabled, "name": "停用", "cdp_port": 9225, "scheduled_keepalive": false }
         ])).unwrap();
         config.sites = serde_json::from_value(serde_json::json!([
             { "id": "1", "name": "未分组站点", "url": "https://example.com", "auto_keepalive": true },
             { "id": "2", "name": "独立站点", "url": "https://example.org", "group_id": custom, "auto_keepalive": true },
             { "id": "3", "name": "继承站点", "url": "https://example.net", "group_id": inherited, "auto_keepalive": true },
-            { "id": "4", "name": "停用站点", "url": "https://example.edu", "group_id": disabled, "auto_keepalive": false }
+            { "id": "4", "name": "停用站点", "url": "https://example.edu", "group_id": disabled, "auto_keepalive": true }
         ])).unwrap();
         store::normalize_site_groups(&mut config).unwrap();
 
@@ -192,6 +199,12 @@ mod grouped_schedule_tests {
         assert_eq!(config.group_ids_for_scope(custom).unwrap(), vec![Some(custom.into())]);
         assert_eq!(config.for_group(Some(custom)).unwrap().visit_duration, 55);
         assert_eq!(config.for_group(Some(inherited)).unwrap().visit_duration, config.visit_duration);
+        assert!(config.for_group(Some(disabled)).unwrap().sites[0].auto_keepalive);
+
+        config.default_scheduled_keepalive = false;
+        let scheduled = scheduled_groups(&config);
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[&("30 19 * * *".into(), 0)], vec![Some(custom.into())]);
     }
 }
 

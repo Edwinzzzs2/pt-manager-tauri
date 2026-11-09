@@ -126,7 +126,7 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
     config.min_login_attempts_remaining = config.min_login_attempts_remaining.clamp(1, 20);
     config.update_check_interval_hours = config.update_check_interval_hours.clamp(1, 168);
     config.update_proxy_url = updater::normalize_proxy_url(&config.update_proxy_url)?;
-    if scheduler::next_run_from_cron(&config.cron).is_none() {
+    if config.default_scheduled_keepalive && scheduler::next_run_from_cron(&config.cron).is_none() {
         return Err("默认保活计划的 Cron 表达式无效".to_string());
     }
     store::normalize_site_groups(&mut config)?;
@@ -1526,11 +1526,12 @@ pub fn open_browser_proxy_guide() -> Result<(), String> {
 pub async fn test_browser_proxy(
     state: State<'_, AppState>,
     config: store::BrowserProxyConfig,
-) -> Result<String, String> {
+    site_url: Option<String>,
+) -> Result<crate::browser_proxy::ProxyTestResult, String> {
     if *state.task_running.lock().await {
         return Err("保活任务执行中，请结束后再测试代理".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || crate::browser_proxy::test_connection(config))
+    tauri::async_runtime::spawn_blocking(move || crate::browser_proxy::test_connection(config, site_url))
         .await
         .map_err(|err| format!("代理测试未能完成：{err}"))?
 }

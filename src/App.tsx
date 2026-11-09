@@ -51,7 +51,10 @@ import {
 import "./App.css";
 import { CronField, CronPreviewText, useCronPreview } from "./components/CronField";
 import { VersionCard, type UpdatePhase } from "./components/VersionCard";
-import { cookieModeLabels, SiteGroupDialog, SiteGroupOptions, SiteGroupTabs, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup } from "./components/SiteGroups";
+import { BrowserProxyFields, cookieModeLabels, normalizeBrowserProxyLinks, SiteGroupDialog, SiteGroupOptions, SiteGroupTabs, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup } from "./components/SiteGroups";
+
+type ProxyProbe = { Ok: string } | { Err: string };
+type BrowserProxyTestResult = { exit: ProxyProbe; site: ProxyProbe | null };
 
 type Site = {
   id: string;
@@ -141,6 +144,7 @@ type AppConfig = {
   startup_group_id: string | null;
   cron: string;
   cron_offset_minutes: number;
+  default_scheduled_keepalive: boolean;
   cdp_port: number;
   browser: "chrome" | "edge";
   browser_proxy: BrowserProxyConfig;
@@ -230,6 +234,7 @@ const defaultConfig: AppConfig = {
   startup_group_id: null,
   cron: "0 9 * * *",
   cron_offset_minutes: 30,
+  default_scheduled_keepalive: true,
   cdp_port: 9222,
   browser: "chrome",
   browser_proxy: { enabled: false, server_url: "", username: "", password: "" },
@@ -344,7 +349,8 @@ function App() {
   const [gotifyTestBusy, setGotifyTestBusy] = useState(false);
   const [barkTestBusy, setBarkTestBusy] = useState(false);
   const [browserProxyTestBusy, setBrowserProxyTestBusy] = useState(false);
-  const [browserProxyTestResult, setBrowserProxyTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [browserProxyTestResult, setBrowserProxyTestResult] = useState<BrowserProxyTestResult | null>(null);
+  const [browserProxyTestSiteId, setBrowserProxyTestSiteId] = useState("");
   const [browserDataClearBusy, setBrowserDataClearBusy] = useState(false);
   const [browserDataScope, setBrowserDataScope] = useState<string | null>(null);
   const [cancelBusy, setCancelBusy] = useState(false);
@@ -372,7 +378,14 @@ function App() {
   const siteGroup = config.site_groups.find((group) => group.id === selectedSiteGroup);
   const settingsGroup = config.site_groups.find((group) => group.id === selectedSettingsGroup);
   const settingsScope = settingsGroup?.id ?? "";
-  const settingsScopeRef = useRef(settingsScope);
+  const proxyTestRevision = useRef(0);
+  const proxyTestSites = config.sites.filter((site) => (site.group_id ?? "") === settingsScope);
+  const proxyTestSite = proxyTestSites.find((site) => site.id === browserProxyTestSiteId);
+  const proxyTestSelection = {
+    sites: proxyTestSites,
+    selectedId: proxyTestSite?.id ?? "",
+    onChange: setBrowserProxyTestSiteId,
+  };
   const siteScope = siteGroup?.id ?? "";
   const taskGroup = activeTab === "settings" ? settingsGroup : siteGroup;
   const taskScope = taskGroup?.id ?? "";
@@ -386,14 +399,17 @@ function App() {
   const lastVisibleLog = useMemo(() => logs[logs.length - 1], [logs]);
 
   useEffect(() => {
-    settingsScopeRef.current = settingsScope;
+    proxyTestRevision.current += 1;
     setBrowserProxyTestResult(null);
   }, [
     settingsScope,
+    proxyTestSite?.id,
+    proxyTestSite?.url,
     settingsDraft.browser_proxy.enabled,
     settingsDraft.browser_proxy.server_url,
     settingsDraft.browser_proxy.username,
     settingsDraft.browser_proxy.password,
+    settingsDraft.browser_proxy.first_hop,
     settingsGroup?.browser_proxy,
   ]);
 
@@ -996,6 +1012,8 @@ function App() {
     setBusy(true);
     setError(null);
     try {
+      next.browser_proxy = normalizeBrowserProxyLinks(next.browser_proxy);
+      setSettingsDraft((draft) => ({ ...draft, browser_proxy: next.browser_proxy }));
       await invoke("save_config", { config: next });
       setConfig(next);
       setSettingsDraft(next);
@@ -1048,17 +1066,18 @@ function App() {
   }
 
   async function testBrowserProxy(proxy: BrowserProxyConfig) {
-    const scope = settingsScope;
+    const revision = proxyTestRevision.current;
     setBrowserProxyTestBusy(true);
     setBrowserProxyTestResult(null);
     setError(null);
     try {
-      const message = await invoke<string>("test_browser_proxy", {
-        config: proxy,
+      const result = await invoke<BrowserProxyTestResult>("test_browser_proxy", {
+        config: normalizeBrowserProxyLinks(proxy),
+        siteUrl: proxyTestSite?.url ?? null,
       });
-      if (scope === settingsScopeRef.current) setBrowserProxyTestResult({ ok: true, message });
+      if (revision === proxyTestRevision.current) setBrowserProxyTestResult(result);
     } catch (err) {
-      if (scope === settingsScopeRef.current) setBrowserProxyTestResult({ ok: false, message: String(err) });
+      if (revision === proxyTestRevision.current) setBrowserProxyTestResult({ exit: { Err: String(err) }, site: null });
     } finally {
       setBrowserProxyTestBusy(false);
     }
@@ -1346,6 +1365,7 @@ function App() {
               cookieSyncBusy={cookieSyncBusy}
               browserProxyTestBusy={browserProxyTestBusy}
               browserProxyTestResult={browserProxyTestResult}
+              proxyTestSelection={proxyTestSelection}
               onTestProxy={() => testBrowserProxy(settingsGroup.browser_proxy)}
               onSyncCookieCloud={syncCookieCloud}
               onClearCookieCloud={clearCookieCloudData}
@@ -1361,11 +1381,13 @@ function App() {
               barkTestBusy={barkTestBusy}
               browserProxyTestBusy={browserProxyTestBusy}
               browserProxyTestResult={browserProxyTestResult}
+              proxyTestSelection={proxyTestSelection}
               draft={settingsDraft}
               onChange={setSettingsDraft}
               onOpenBrowserData={() => setBrowserDataScope("")}
               onClearCookieCloudData={clearCookieCloudData}
               onOpenBrowserProxyGuide={openBrowserProxyGuide}
+              onProxyAddressError={showError}
               onSave={saveSettings}
               onSyncCookieCloud={syncCookieCloud}
               onTestGotify={testGotify}
@@ -1397,6 +1419,7 @@ function App() {
           initialId={settingsGroup?.id ?? ""}
           startupGroupId={config.startup_group_id}
           defaultPort={config.cdp_port}
+          defaultScheduleEnabled={config.default_scheduled_keepalive}
           defaultTask={{
             cron: config.cron,
             cron_offset_minutes: config.cron_offset_minutes,
@@ -1571,7 +1594,7 @@ function Dashboard({
   const browserConnected = !!status?.cdp_connected;
   const latestResult = status?.last_result ?? lastLog;
   const groups = [
-    { id: null, name: "默认分组", cdp_port: config.cdp_port, browser_proxy: config.browser_proxy },
+    { id: null, name: "默认分组", cdp_port: config.cdp_port, browser_proxy: config.browser_proxy, scheduled_keepalive: config.default_scheduled_keepalive, task: null },
     ...config.site_groups,
   ];
   const groupStatuses = status?.groups ?? [];
@@ -1617,14 +1640,17 @@ function Dashboard({
             const sites = config.sites.filter((site) => (site.group_id ?? null) === group.id);
             const groupStatus = groupStatuses.find((item) => item.group_id === group.id);
             const port = groupStatus?.active_cdp_port;
+            const scheduleEnabled = group.scheduled_keepalive && (!!group.task || config.default_scheduled_keepalive);
             return (
               <li className="dashboard-group-row" key={group.id ?? "default"}>
                 <strong>{group.name}</strong>
                 <dl className="scope-settings-grid">
                   <div><dt>站点 / 自动保活</dt><dd>{sites.length} / {sites.filter((site) => site.auto_keepalive).length}</dd></div>
                   <div><dt>浏览器</dt><dd>{port ? `已连接 · ${port}` : `待连接 · ${group.cdp_port}`}</dd></div>
-                  <div><dt>网络出口</dt><dd>{group.browser_proxy.enabled ? "代理" : "直连"}</dd></div>
-                  <div><dt>下次保活</dt><dd>{formatDate(groupStatus?.next_run)}</dd></div>
+                  <div><dt>网络出口</dt><dd>{group.browser_proxy.enabled
+                    ? group.browser_proxy.first_hop ? "两跳 SOCKS5" : "代理"
+                    : "直连"}</dd></div>
+                  <div><dt>下次保活</dt><dd>{scheduleEnabled ? formatDate(groupStatus?.next_run) : "定时已关闭"}</dd></div>
                 </dl>
               </li>
             );
@@ -2921,9 +2947,61 @@ function SitesPanel({
   );
 }
 
+type ProxyTestSelection = {
+  sites: Site[];
+  selectedId: string;
+  onChange: (id: string) => void;
+};
+
+function ProxyTestDetails({ selection, result, disabled }: {
+  selection: ProxyTestSelection;
+  result: BrowserProxyTestResult | null;
+  disabled: boolean;
+}) {
+  const results = result ? [
+    { label: "出口检测", probe: result.exit },
+    ...(result.site ? [{ label: "站点检测", probe: result.site }] : []),
+  ] : [];
+  return (
+    <>
+      {selection.sites.length > 0 && (
+        <label>
+          <span>同时测试站点</span>
+          <select disabled={disabled} value={selection.selectedId} onChange={(event) => selection.onChange(event.target.value)}>
+            <option value="">仅检测出口 IP</option>
+            {selection.sites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
+          </select>
+        </label>
+      )}
+      {results.map(({ label, probe }) => {
+        const ok = "Ok" in probe;
+        return (
+          <p className={`proxy-test-result ${ok ? "success" : "error"}`} key={label} role="status">
+            {ok ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+            <span>{label} · {ok ? probe.Ok : probe.Err}</span>
+          </p>
+        );
+      })}
+    </>
+  );
+}
+
+function proxyAddressLabel(value: string) {
+  try {
+    const address = new URL(value);
+    if (address.protocol === "http:" || address.protocol === "https:") return address.origin;
+    if (["socks5:", "socks5h:"].includes(address.protocol) && address.hostname && address.port) {
+      return `${address.protocol}//${address.host}`;
+    }
+  } catch {
+    // 用户手动编辑的地址可能无法解析。
+  }
+  return "地址未配置或无效";
+}
+
 function GroupSettingsPanel({
   config, group, siteCount, busy, cookieSyncBusy, browserProxyTestBusy, browserProxyTestResult,
-  onTestProxy, onSyncCookieCloud, onClearCookieCloud, onOpenBrowserData,
+  proxyTestSelection, onTestProxy, onSyncCookieCloud, onClearCookieCloud, onOpenBrowserData,
 }: {
   config: AppConfig;
   group: SiteGroup;
@@ -2931,27 +3009,17 @@ function GroupSettingsPanel({
   busy: boolean;
   cookieSyncBusy: boolean;
   browserProxyTestBusy: boolean;
-  browserProxyTestResult: { ok: boolean; message: string } | null;
+  browserProxyTestResult: BrowserProxyTestResult | null;
+  proxyTestSelection: ProxyTestSelection;
   onTestProxy: () => void;
   onSyncCookieCloud: () => void;
   onClearCookieCloud: () => void;
   onOpenBrowserData: () => void;
 }) {
   const task = group.task ?? config;
+  const scheduleEnabled = group.scheduled_keepalive && (!!group.task || config.default_scheduled_keepalive);
   const cronPreview = useCronPreview(task.cron);
   const proxy = group.browser_proxy;
-  let proxyAddress = "地址未配置或无效";
-  if (proxy.enabled) {
-    try {
-      const address = new URL(proxy.server_url);
-      if (address.protocol === "http:" || address.protocol === "https:") proxyAddress = address.origin;
-      else if (["socks5:", "socks5h:"].includes(address.protocol) && address.hostname && address.port) {
-        proxyAddress = `${address.protocol}//${address.hostname}:${address.port}`;
-      }
-    } catch {
-      // 配置文件也可能由用户手动编辑，摘要不显示无效地址。
-    }
-  }
   const cookiecloud = group.cookie_mode === "custom" ? group.cookiecloud : config.cookiecloud;
   const canSync = group.cookie_mode !== "manual" && siteCount > 0
     && !!(cookiecloud.server_url.trim() && cookiecloud.uuid.trim() && cookiecloud.password);
@@ -2974,13 +3042,17 @@ function GroupSettingsPanel({
         <section className="panel settings-card">
           <div className="panel-heading"><h2>保活计划</h2></div>
           <dl className="scope-settings-grid">
-            <div><dt>计划来源</dt><dd>{group.task ? "本组独立计划" : "默认设置"}</dd></div>
+            <div><dt>保活计划</dt><dd>{scheduleEnabled
+              ? group.task ? "本组独立计划" : "默认设置"
+              : group.scheduled_keepalive ? "默认定时保活已关闭" : "本组定时保活已关闭"}</dd></div>
+            {scheduleEnabled && <>
             <div>
               <dt>Cron 表达式</dt>
               <dd>{task.cron}</dd>
               <dd><CronPreviewText preview={cronPreview} /></dd>
             </div>
             <div><dt>随机延迟上限</dt><dd>{task.cron_offset_minutes} 分钟</dd></div>
+            </>}
             <div><dt>页面停留时间</dt><dd>{task.visit_duration} 秒</dd></div>
           </dl>
         </section>
@@ -3002,17 +3074,21 @@ function GroupSettingsPanel({
             <div><dt>浏览器</dt><dd>{config.browser === "edge" ? "Microsoft Edge" : "Google Chrome"}</dd></div>
             <div><dt>调试端口</dt><dd>{group.cdp_port}</dd></div>
             <div>
-              <dt>{proxy.enabled ? "本组代理地址" : "网络出口"}</dt>
-              <dd>{proxy.enabled ? proxyAddress : "直连"}</dd>
-              {proxy.enabled && (
+              <dt>{proxy.enabled && proxy.first_hop ? "最终出口" : "网络出口"}</dt>
+              <dd>{proxy.enabled ? proxyAddressLabel(proxy.server_url) : "直连"}</dd>
+              {proxy.enabled && proxy.first_hop && (
+                <dd className="field-hint">前置代理 · {proxyAddressLabel(proxy.first_hop.server_url)}</dd>
+              )}
+              {proxy.enabled && !proxy.first_hop && (
                 <dd className="field-hint">{proxy.username.trim() ? `认证账号：${proxy.username}` : "无需账号认证"}</dd>
               )}
             </div>
           </dl>
-          {browserProxyTestResult && (
-            <p className={`proxy-test-result ${browserProxyTestResult.ok ? "success" : "error"}`} role="status">
-              {browserProxyTestResult.message}
-            </p>
+          {proxy.enabled && (
+            <div className="settings-form">
+              <ProxyTestDetails selection={proxyTestSelection} result={browserProxyTestResult}
+                disabled={busy || browserProxyTestBusy} />
+            </div>
           )}
         </section>
 
@@ -3166,11 +3242,13 @@ function SettingsPanel({
   barkTestBusy,
   browserProxyTestBusy,
   browserProxyTestResult,
+  proxyTestSelection,
   draft,
   onChange,
   onOpenBrowserData,
   onClearCookieCloudData,
   onOpenBrowserProxyGuide,
+  onProxyAddressError,
   onSave,
   onSyncCookieCloud,
   onTestGotify,
@@ -3187,12 +3265,14 @@ function SettingsPanel({
   gotifyTestBusy: boolean;
   barkTestBusy: boolean;
   browserProxyTestBusy: boolean;
-  browserProxyTestResult: { ok: boolean; message: string } | null;
+  browserProxyTestResult: BrowserProxyTestResult | null;
+  proxyTestSelection: ProxyTestSelection;
   draft: AppConfig;
   onChange: (config: AppConfig) => void;
   onOpenBrowserData: () => void;
   onClearCookieCloudData: () => void;
   onOpenBrowserProxyGuide: () => void;
+  onProxyAddressError: (message: string) => void;
   onSave: () => void;
   onSyncCookieCloud: () => void;
   onTestGotify: () => void;
@@ -3203,7 +3283,6 @@ function SettingsPanel({
   onExportConfig: () => void;
 }) {
   const [showProxyPassword, setShowProxyPassword] = useState(false);
-  const [showBrowserProxyPassword, setShowBrowserProxyPassword] = useState(false);
   const [showCookiePassword, setShowCookiePassword] = useState(false);
   const [showGotifyToken, setShowGotifyToken] = useState(false);
   const [showBarkKey, setShowBarkKey] = useState(false);
@@ -3315,6 +3394,12 @@ function SettingsPanel({
           </div>
 
           <div className="settings-form keepalive-settings-form">
+          <SettingsToggle
+            label="启用默认定时保活"
+            checked={draft.default_scheduled_keepalive}
+            onChange={(checked) => onChange({ ...draft, default_scheduled_keepalive: checked })}
+          />
+          <p className="field-hint">关闭后，默认分组和沿用默认计划的分组只支持手动保活。</p>
           <label>
             <span>专用浏览器</span>
             <select
@@ -3325,12 +3410,12 @@ function SettingsPanel({
               <option value="edge">Microsoft Edge</option>
             </select>
           </label>
-          <CronField
+          {draft.default_scheduled_keepalive && <CronField
             value={draft.cron}
             preview={cronPreview}
             onChange={(cron) => onChange({ ...draft, cron })}
-          />
-          <label>
+          />}
+          {draft.default_scheduled_keepalive && <label>
             <span className="label-with-help">
               随机延迟上限（分钟）
               <span
@@ -3352,7 +3437,7 @@ function SettingsPanel({
               type="number"
               value={draft.cron_offset_minutes}
             />
-          </label>
+          </label>}
           <label>
             <span>保活页面停留时间（秒）</span>
             <input
@@ -3425,72 +3510,18 @@ function SettingsPanel({
                 value={draft.cdp_port}
               />
             </label>
-            <SettingsToggle
-              label="启用浏览器代理"
-              checked={draft.browser_proxy.enabled}
-              disabled={taskRunning || browserProxyTestBusy}
-              onText="通过代理"
-              offText="直连"
-              onChange={(enabled) => {
-                if (!enabled) setShowBrowserProxyPassword(false);
-                onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, enabled } });
-              }}
-            />
-            {draft.browser_proxy.enabled && (
-              <>
-                <label className="proxy-address-field">
-                  <span>HTTP / HTTPS / SOCKS5 代理地址</span>
-                  <input
-                    disabled={taskRunning || browserProxyTestBusy}
-                    onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
-                    placeholder="http://服务器IP:3128"
-                    value={draft.browser_proxy.server_url}
-                  />
-                </label>
-                <label>
-                  <span>代理用户名（可选）</span>
-                  <input
-                    autoComplete="off"
-                    disabled={taskRunning || browserProxyTestBusy}
-                    onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, username: event.target.value } })}
-                    value={draft.browser_proxy.username}
-                  />
-                </label>
-                <label>
-                  <span>代理密码（可选）</span>
-                  <div className="password-field">
-                    <input
-                      autoComplete="new-password"
-                      disabled={taskRunning || browserProxyTestBusy}
-                      onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, password: event.target.value } })}
-                      type={showBrowserProxyPassword ? "text" : "password"}
-                      value={draft.browser_proxy.password}
-                    />
-                    <button
-                      aria-label={showBrowserProxyPassword ? "隐藏浏览器代理密码" : "显示浏览器代理密码"}
-                      onClick={() => setShowBrowserProxyPassword((value) => !value)}
-                      type="button"
-                    >
-                      {showBrowserProxyPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                    </button>
-                  </div>
-                </label>
-              </>
-            )}
+            <BrowserProxyFields proxy={draft.browser_proxy} disabled={taskRunning || browserProxyTestBusy}
+              onChange={(browser_proxy) => onChange({ ...draft, browser_proxy })}
+              onError={onProxyAddressError} />
             <p className="field-hint">
-              这里的端口和代理用于默认分组。启用代理后，保活、登录、签到及每日福利都会通过该代理访问站点。
-              支持 HTTP、HTTPS 和 SOCKS5。SOCKS5 地址示例为 socks5://proxy.example.com:1080。
-              可先测试当前填写的配置，无需保存；测试会单独发送代理请求。保存后请关闭专用浏览器，再执行任务使新配置生效。
+              这里的端口和代理用于默认分组。保活、登录、签到及每日福利都使用所选的网络出口。
+              单代理支持 HTTP、HTTPS 和 SOCKS5。两跳 SOCKS5 由前置代理连接最终出口。
+              可先测试当前填写的配置，无需保存。保存后请关闭专用浏览器，再执行任务使新配置生效。
             </p>
-            {browserProxyTestResult ? (
-              <p
-                className={`proxy-test-result ${browserProxyTestResult.ok ? "success" : "error"}`}
-                role={browserProxyTestResult.ok ? "status" : "alert"}
-              >
-                {browserProxyTestResult.ok ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
-                <span>{browserProxyTestResult.message}</span>
-              </p>
-            ) : null}
+            {draft.browser_proxy.enabled && (
+              <ProxyTestDetails selection={proxyTestSelection} result={browserProxyTestResult}
+                disabled={taskRunning || browserProxyTestBusy} />
+            )}
           </div>
         </section>
 
@@ -3958,7 +3989,7 @@ function SettingsPanel({
       </div>
 
       <div className="settings-actions settings-actions-bottom">
-        <button className="primary-action settings-save" disabled={busy || cronPreview.state !== "valid"} onClick={onSave} type="button">
+        <button className="primary-action settings-save" disabled={busy || (draft.default_scheduled_keepalive && cronPreview.state !== "valid")} onClick={onSave} type="button">
           <Save size={18} />
           <span>保存默认设置</span>
         </button>

@@ -42,9 +42,24 @@ pub fn normalize_config(config: &mut BrowserProxyConfig) -> Result<(), String> {
     if !config.enabled {
         return Ok(());
     }
-    let url = reqwest::Url::parse(&config.server_url)
+    let chain = config.first_hop.is_some();
+    normalize_endpoint(&mut config.server_url, &config.username, &config.password, chain)
+        .map_err(|err| if chain { format!("最终出口：{err}") } else { err })?;
+    if let Some(first_hop) = &mut config.first_hop {
+        first_hop.username = first_hop.username.trim().to_string();
+        normalize_endpoint(&mut first_hop.server_url, &first_hop.username, &first_hop.password, true)
+            .map_err(|err| format!("前置代理：{err}"))?;
+    }
+    Ok(())
+}
+
+fn normalize_endpoint(address: &mut String, username: &str, password: &str, socks_only: bool) -> Result<(), String> {
+    let url = reqwest::Url::parse(address.trim().trim_end_matches('/'))
         .map_err(|_| "浏览器代理地址格式错误，请填写 协议://地址:端口".to_string())?;
     let socks = matches!(url.scheme(), "socks5" | "socks5h");
+    if socks_only && !socks {
+        return Err("两跳代理要求使用 SOCKS5，请填写 socks5://地址:端口".to_string());
+    }
     if !(socks || matches!(url.scheme(), "http" | "https"))
         || url.host_str().is_none()
         || !url.port_or_known_default().is_some_and(|port| port != 0)
@@ -60,17 +75,17 @@ pub fn normalize_config(config: &mut BrowserProxyConfig) -> Result<(), String> {
         return Err("浏览器代理地址不能包含路径、查询参数或片段".to_string());
     }
     if socks {
-        if config.username.is_empty() != config.password.is_empty()
-            || config.username.len() > 255
-            || config.password.len() > 255
+        if username.is_empty() != password.is_empty()
+            || username.len() > 255
+            || password.len() > 255
         {
             return Err("SOCKS5 认证需要同时填写用户名和密码，每项最多 255 字节".to_string());
         }
-    } else if config.username.contains(':') || (config.username.is_empty() && !config.password.is_empty())
+    } else if username.contains(':') || (username.is_empty() && !password.is_empty())
     {
         return Err("代理用户名不能含冒号；填写代理密码时也必须填写用户名".to_string());
     }
-    config.server_url = url.as_str().trim_end_matches('/').to_string();
+    *address = url.as_str().trim_end_matches('/').to_string();
     Ok(())
 }
 
@@ -133,10 +148,71 @@ pub fn remove_group_relay(group: &str) {
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct ProxyTestResult {
+    exit: Result<String, String>,
+    site: Option<Result<String, String>>,
+}
+
 /// 用独立的回环监听器走实际浏览器转发路径，测试草稿配置时不替换正在使用的代理。
-pub fn test_connection(mut config: BrowserProxyConfig) -> Result<String, String> {
+pub fn test_connection(mut config: BrowserProxyConfig, site_url: Option<String>) -> Result<ProxyTestResult, String> {
     config.enabled = true;
     normalize_config(&mut config)?;
+    let exit = test_request(&config, "https://ifconfig.me/ip", Duration::from_secs(20))
+        .and_then(|response| {
+            if !response.status().is_success() {
+                return Err(format!("出口检测服务返回 HTTP {}", response.status().as_u16()));
+            }
+            let ip = response.text()
+                .map_err(|err| err.without_url().to_string())?
+                .trim()
+                .parse::<IpAddr>()
+                .map_err(|_| "出口检测服务未返回有效 IP".to_string())?;
+            Ok(format!("出口 IP：{ip}"))
+        });
+    let site = site_url.as_deref().map(|url| test_site(&config, url));
+    Ok(ProxyTestResult { exit, site })
+}
+
+fn test_site(config: &BrowserProxyConfig, site_url: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(site_url).map_err(|_| "站点地址无效".to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for redirect in 0..=5 {
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("站点测试仅支持无内嵌账号的 HTTP 或 HTTPS 地址".to_string());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("站点访问超时".to_string());
+        }
+        let response = test_request(config, url.as_str(), remaining)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(format!("站点可访问，HTTP {}", status.as_u16()));
+        }
+        if !matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Err(format!("站点返回 HTTP {}", status.as_u16()));
+        }
+        if redirect == 5 {
+            return Err("站点跳转次数过多".to_string());
+        }
+        url = response.headers().get(reqwest::header::LOCATION)
+            .and_then(|location| location.to_str().ok())
+            .and_then(|location| url.join(location).ok())
+            .ok_or_else(|| "站点返回了无效的跳转地址".to_string())?;
+    }
+    Err("站点跳转次数过多".to_string())
+}
+
+fn test_request(
+    config: &BrowserProxyConfig,
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::blocking::Response, String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|err| format!("创建代理测试通道失败：{err}"))?;
     listener
@@ -149,17 +225,18 @@ pub fn test_connection(mut config: BrowserProxyConfig) -> Result<String, String>
     let proxy = reqwest::Proxy::all(&address).map_err(|err| err.to_string())?;
     let client = reqwest::blocking::Client::builder()
         .proxy(proxy)
-        .timeout(Duration::from_secs(20))
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| format!("创建代理测试请求失败：{err}"))?;
     let (result_sender, result_receiver) = mpsc::channel();
     let (accepted_sender, accepted_receiver) = mpsc::channel();
+    let config = config.clone();
     thread::Builder::new()
         .name("proxy-test".to_string())
         .spawn(move || {
             // 测试请求可能在连接前失败；限时等待可避免后台线程永久卡在 accept。
-            let deadline = Instant::now() + Duration::from_secs(22);
+            let deadline = Instant::now() + timeout + Duration::from_secs(2);
             let result = loop {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
@@ -184,26 +261,19 @@ pub fn test_connection(mut config: BrowserProxyConfig) -> Result<String, String>
         .map_err(|err| format!("启动代理测试失败：{err}"))?;
 
     let response = client
-        .get("https://ifconfig.me/ip")
+        .get(url)
         .send()
         .map_err(|err| test_request_error(err, &result_receiver))?;
     // 显式确认请求进入回环转发器，避免系统直连产生看似成功的结果。
     if accepted_receiver.try_recv().is_err() {
         return Err("测试请求没有经过程序的浏览器代理".to_string());
     }
-    if !response.status().is_success() {
+    if response.status() == reqwest::StatusCode::BAD_GATEWAY {
         if let Ok(Err(message)) = result_receiver.recv_timeout(Duration::from_millis(200)) {
             return Err(message);
         }
-        return Err(format!("代理出口检测失败：HTTP {}", response.status()));
     }
-    let ip = response
-        .text()
-        .map_err(|err| test_request_error(err, &result_receiver))?
-        .trim()
-        .parse::<IpAddr>()
-        .map_err(|_| "代理出口检测服务未返回有效 IP".to_string())?;
-    Ok(format!("代理连接成功，出口 IP：{ip}"))
+    Ok(response)
 }
 
 fn test_request_error(
@@ -213,7 +283,7 @@ fn test_request_error(
     if let Ok(Err(message)) = result_receiver.recv_timeout(Duration::from_millis(200)) {
         return message;
     }
-    format!("代理出口检测失败：{error}")
+    format!("代理请求失败：{}", error.without_url())
 }
 
 fn accept_connections(listener: TcpListener, config: BrowserProxyConfig, stopped: Arc<AtomicBool>) {
@@ -395,7 +465,19 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
     let tunnel = first_line.starts_with("CONNECT ");
     let target = first_line.split_whitespace().nth(1).unwrap_or("未知目标");
     let proxy = reqwest::Url::parse(&config.server_url).map_err(|_| "代理地址无效".to_string())?;
-    let mut upstream = connect_upstream(&proxy)?;
+    let mut upstream = if let Some(first) = &config.first_hop {
+        let first_url = reqwest::Url::parse(&first.server_url).map_err(|_| "前置代理地址无效".to_string())?;
+        let mut stream = connect_upstream(&first_url).map_err(|err| format!("连接前置代理失败：{err}"))?;
+        let host = proxy.host_str().ok_or_else(|| "最终出口缺少主机".to_string())?;
+        let port = proxy.port().ok_or_else(|| "最终出口缺少端口".to_string())?;
+        stream.set_read_timeout(Some(CONNECT_RESPONSE_TIMEOUT)).map_err(|err| err.to_string())?;
+        stream.set_write_timeout(Some(CONNECT_RESPONSE_TIMEOUT)).map_err(|err| err.to_string())?;
+        socks5::connect(&mut stream, host, port, &first.username, &first.password)
+            .map_err(|err| format!("前置代理连接最终出口失败：{err}"))?;
+        stream
+    } else {
+        connect_upstream(&proxy)?
+    };
     if matches!(proxy.scheme(), "socks5" | "socks5h") {
         return forward_socks5(client, upstream, config, &headers, &tail, tunnel);
     }
@@ -480,7 +562,8 @@ fn forward_socks5(
 
     upstream.set_read_timeout(Some(CONNECT_RESPONSE_TIMEOUT)).map_err(|err| err.to_string())?;
     upstream.set_write_timeout(Some(CONNECT_RESPONSE_TIMEOUT)).map_err(|err| err.to_string())?;
-    socks5::connect(&mut upstream, host, port, config)?;
+    socks5::connect(&mut upstream, host, port, &config.username, &config.password)
+        .map_err(|err| if config.first_hop.is_some() { format!("最终出口连接目标站点失败：{err}") } else { err })?;
     upstream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|err| err.to_string())?;
     upstream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|err| err.to_string())?;
 
@@ -600,6 +683,7 @@ mod tests {
             server_url: format!("http://127.0.0.1:{port}"),
             username: "unit-user".to_string(),
             password: "unit-password".to_string(),
+            first_hop: None,
         }
     }
 
@@ -701,6 +785,81 @@ mod tests {
             server.join().unwrap();
             relay.join().unwrap();
         }
+    }
+
+    #[test]
+    fn chained_socks5_connects_to_exit_before_authenticating_with_it() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = test_config(upstream.local_addr().unwrap().port());
+        config.first_hop = Some(store::Socks5Endpoint {
+            server_url: config.server_url.replace("http://", "socks5://"),
+            username: "front".to_string(),
+            password: "first".to_string(),
+        });
+        config.server_url = "socks5://exit.example.test:1081".to_string();
+        normalize_config(&mut config).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            for (auth, destination) in [
+                (&b"\x01\x05front\x05first"[..], &b"\x05\x01\x00\x03\x11exit.example.test\x04\x39"[..]),
+                (&b"\x01\x09unit-user\x0dunit-password"[..], &b"\x05\x01\x00\x03\x0cexample.test\x01\xbb"[..]),
+            ] {
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [5, 1, 2]);
+                stream.write_all(&[5, 2]).unwrap();
+                let mut actual = vec![0; auth.len()];
+                stream.read_exact(&mut actual).unwrap();
+                assert_eq!(&actual[..], auth);
+                stream.write_all(&[1, 0]).unwrap();
+                let mut actual = vec![0; destination.len()];
+                stream.read_exact(&mut actual).unwrap();
+                assert_eq!(&actual[..], destination);
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+            }
+            let mut payload = [0; 4];
+            stream.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").unwrap();
+        });
+        let local = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut browser = TcpStream::connect(local.local_addr().unwrap()).unwrap();
+        browser.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let relay = thread::spawn(move || {
+            let (mut client, _) = local.accept().unwrap();
+            forward_request(&mut client, &config).unwrap();
+        });
+        browser.write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\nping").unwrap();
+        let mut response = String::new();
+        browser.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "HTTP/1.1 200 Connection Established\r\n\r\npong");
+        server.join().unwrap();
+        relay.join().unwrap();
+    }
+
+    #[test]
+    fn site_test_checks_the_redirect_destination_through_the_proxy() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = test_config(upstream.local_addr().unwrap().port());
+        let server = thread::spawn(move || {
+            for (path, response) in [
+                ("index.php", "HTTP/1.1 302 Found\r\nLocation: /login.php\r\nContent-Length: 0\r\n\r\n"),
+                ("login.php", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"),
+            ] {
+                let (mut stream, _) = upstream.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let (headers, _) = read_headers(&mut stream).unwrap();
+                assert!(headers.starts_with(&format!("GET http://example.test/{path} HTTP/1.1\r\n")));
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        assert_eq!(
+            test_site(&config, "http://example.test/index.php"),
+            Err("站点返回 HTTP 403".to_string())
+        );
+        server.join().unwrap();
     }
 
     #[test]

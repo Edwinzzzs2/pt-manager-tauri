@@ -1141,6 +1141,13 @@ select:focus {
   font-size: 13px;
 }
 
+.app-dialog-error.site-group-error {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 18px;
+  overflow-wrap: anywhere;
+}
+
 .app-dialog-footer {
   justify-content: flex-end;
   border-top: 1px solid var(--color-border);
@@ -1584,6 +1591,10 @@ button.update-skip-button {
 
 .proxy-address-field {
   grid-column: 1 / -1;
+}
+
+.settings-form > label.proxy-address-field {
+  grid-template-rows: auto 38px auto;
 }
 
 .updater-settings-form input:disabled {

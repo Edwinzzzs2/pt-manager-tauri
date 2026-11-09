@@ -71,6 +71,8 @@ pub struct AppConfig {
     #[serde(skip)]
     cookiecloud_blocked_sites: Vec<String>,
     pub cron: String,
+    #[serde(default = "default_scheduled_keepalive")]
+    pub default_scheduled_keepalive: bool,
     /// Cron 触发后随机延迟的最大分钟数；0 表示不延迟。
     #[serde(default)]
     pub cron_offset_minutes: i64,
@@ -125,6 +127,16 @@ pub enum BrowserKind {
 #[serde(default)]
 pub struct BrowserProxyConfig {
     pub enabled: bool,
+    pub server_url: String,
+    pub username: String,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_hop: Option<Socks5Endpoint>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Socks5Endpoint {
     pub server_url: String,
     pub username: String,
     pub password: String,
@@ -183,6 +195,8 @@ pub struct SiteGroup {
     pub cookie_auto_import: bool,
     #[serde(default)]
     pub cookie_auto_upload: bool,
+    #[serde(default = "default_scheduled_keepalive")]
+    pub scheduled_keepalive: bool,
     #[serde(default)]
     pub task: Option<GroupTaskConfig>,
 }
@@ -399,7 +413,7 @@ pub fn normalize_site_groups(config: &mut AppConfig) -> Result<(), String> {
             .map_err(|err| format!("分组「{}」：{err}", group.name))?;
         if let Some(task) = &mut group.task {
             task.cron = task.cron.split_whitespace().collect::<Vec<_>>().join(" ");
-            if crate::scheduler::next_run_from_cron(&task.cron).is_none() {
+            if group.scheduled_keepalive && crate::scheduler::next_run_from_cron(&task.cron).is_none() {
                 return Err(format!("分组「{}」的 Cron 表达式无效", group.name));
             }
             task.cron_offset_minutes = task.cron_offset_minutes.clamp(0, 1440);
@@ -517,6 +531,7 @@ impl Default for AppConfig {
             cookiecloud_blocked_sites: vec![],
             cron: "0 9 * * *".to_string(),
             cron_offset_minutes: 30,
+            default_scheduled_keepalive: true,
             cdp_port: 9222,
             browser: BrowserKind::default(),
             browser_proxy: BrowserProxyConfig::default(),
@@ -566,6 +581,10 @@ fn default_update_check_interval_hours() -> u16 {
 }
 
 fn default_auto_keepalive() -> bool {
+    true
+}
+
+fn default_scheduled_keepalive() -> bool {
     true
 }
 
@@ -1116,6 +1135,7 @@ mod site_group_tests {
                 },
                 cookie_auto_import: false,
                 cookie_auto_upload: false,
+                scheduled_keepalive: true,
                 task: None,
             }],
             ..Default::default()

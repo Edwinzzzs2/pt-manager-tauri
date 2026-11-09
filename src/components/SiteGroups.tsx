@@ -1,13 +1,161 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { XCircle } from "lucide-react";
+import { Eye, EyeOff, XCircle } from "lucide-react";
 import { CronField, CronPreviewText, useCronPreview } from "./CronField";
 
-export type BrowserProxyConfig = {
-  enabled: boolean;
+type ProxyEndpoint = {
   server_url: string;
   username: string;
   password: string;
 };
+
+export type BrowserProxyConfig = ProxyEndpoint & {
+  enabled: boolean;
+  first_hop?: ProxyEndpoint | null;
+};
+
+function splitSocks5ProxyLink(value: string) {
+  const input = value.trim();
+  if (!/^socks5h?:\/\//i.test(input)) return null;
+
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error("SOCKS5 链接格式不正确，请检查代理地址和端口");
+  }
+  if (!url.hostname || !url.port || url.port === "0" || !["", "/"].includes(url.pathname) || url.search) {
+    throw new Error("SOCKS5 链接需要填写有效的地址和端口，地址不能带路径或查询参数");
+  }
+  const server_url = `${url.protocol}//${url.host}`;
+  if (!url.username && !url.password) return { server_url };
+  try {
+    return {
+      server_url,
+      username: decodeURIComponent(url.username),
+      password: decodeURIComponent(url.password),
+    };
+  } catch {
+    throw new Error("SOCKS5 链接里的账号或密码编码无效，请分开填写");
+  }
+}
+
+export function normalizeBrowserProxyLinks(proxy: BrowserProxyConfig): BrowserProxyConfig {
+  if (!proxy.enabled) return proxy;
+  const first = proxy.first_hop;
+  return {
+    ...proxy,
+    ...splitSocks5ProxyLink(proxy.server_url),
+    first_hop: first ? { ...first, ...splitSocks5ProxyLink(first.server_url) } : null,
+  };
+}
+
+export function BrowserProxyFields({
+  proxy, onChange, onError, disabled, required,
+}: {
+  proxy: BrowserProxyConfig;
+  onChange: (proxy: BrowserProxyConfig) => void;
+  onError: (message: string) => void;
+  disabled?: boolean;
+  required?: boolean;
+}) {
+  const first = proxy.first_hop;
+  const mode = !proxy.enabled ? "direct" : first ? "chain" : "single";
+  return (
+    <>
+      <label>
+        <span>网络出口</span>
+        <select disabled={disabled} value={mode} onChange={(event) => {
+          const value = event.target.value;
+          onChange({
+            ...proxy,
+            enabled: value !== "direct",
+            first_hop: value === "chain" ? first ?? { server_url: "", username: "", password: "" }
+              : value === "single" ? null : first,
+          });
+        }}>
+          <option value="direct">直连</option>
+          <option value="single">单代理</option>
+          <option value="chain">两跳 SOCKS5</option>
+        </select>
+      </label>
+      {proxy.enabled && first && (
+        <ProxyEndpointFields endpoint={first} label="① 前置代理" socksOnly disabled={disabled} required={required}
+          onChange={(first_hop) => onChange({ ...proxy, first_hop })} onError={onError} />
+      )}
+      {proxy.enabled && (
+        <ProxyEndpointFields endpoint={proxy} label={first ? "② 最终出口" : "代理"} socksOnly={!!first}
+          disabled={disabled} required={required} onChange={(endpoint) => onChange({ ...proxy, ...endpoint })}
+          onError={onError} />
+      )}
+    </>
+  );
+}
+
+function ProxyEndpointFields({ endpoint, label, socksOnly, onChange, onError, disabled, required }: {
+  endpoint: ProxyEndpoint;
+  label: string;
+  socksOnly: boolean;
+  onChange: (endpoint: ProxyEndpoint) => void;
+  onError: (message: string) => void;
+  disabled?: boolean;
+  required?: boolean;
+}) {
+  const [showPassword, setShowPassword] = useState(false);
+
+  function fillProxyLink(value: string) {
+    try {
+      const fields = splitSocks5ProxyLink(value);
+      if (!fields) return false;
+      if ("username" in fields) setShowPassword(false);
+      if (fields.server_url !== endpoint.server_url || "username" in fields) {
+        onChange({ ...endpoint, ...fields });
+      }
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+    return true;
+  }
+
+  return (
+    <>
+      <label className="proxy-address-field">
+        <span>{label}地址</span>
+        <input
+          autoComplete="off"
+          disabled={disabled}
+          inputMode="url"
+          onChange={(event) => onChange({ ...endpoint, server_url: event.target.value })}
+          onBlur={(event) => fillProxyLink(event.currentTarget.value)}
+          onPaste={(event) => {
+            if (fillProxyLink(event.clipboardData.getData("text"))) {
+              event.preventDefault();
+            }
+          }}
+          placeholder={socksOnly ? "socks5://proxy.example.com:1080" : "http://proxy.example.com:3128"}
+          required={required}
+          value={endpoint.server_url}
+        />
+        <small>粘贴完整 SOCKS5 链接，或输入后离开地址框，即可自动拆分地址、用户名和密码。</small>
+      </label>
+      <label>
+        <span>{label}用户名 <small>选填</small></span>
+        <input autoComplete="off" disabled={disabled} value={endpoint.username}
+          onChange={(event) => onChange({ ...endpoint, username: event.target.value })} />
+      </label>
+      <label>
+        <span>{label}密码 <small>选填</small></span>
+        <div className="password-field">
+          <input autoComplete="new-password" disabled={disabled} type={showPassword ? "text" : "password"}
+            value={endpoint.password} onChange={(event) => onChange({ ...endpoint, password: event.target.value })} />
+          <button type="button" aria-label={`${showPassword ? "隐藏" : "显示"}${label}密码`}
+            onClick={() => setShowPassword((value) => !value)}>
+            {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+          </button>
+        </div>
+      </label>
+    </>
+  );
+}
 
 export type CookieCloudConfig = {
   server_url: string;
@@ -24,6 +172,7 @@ export type SiteGroup = {
   cookiecloud: CookieCloudConfig;
   cookie_auto_import: boolean;
   cookie_auto_upload: boolean;
+  scheduled_keepalive: boolean;
   task?: GroupTaskConfig | null;
 };
 
@@ -81,6 +230,7 @@ export function SiteGroupDialog({
   startupGroupId,
   defaultPort,
   defaultTask,
+  defaultScheduleEnabled,
   countSites,
   onSave,
   onRemove,
@@ -91,6 +241,7 @@ export function SiteGroupDialog({
   startupGroupId: string | null;
   defaultPort: number;
   defaultTask: GroupTaskConfig;
+  defaultScheduleEnabled: boolean;
   countSites: (id: string) => number;
   onSave: (group: SiteGroup, showOnStartup: boolean) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
@@ -117,6 +268,7 @@ export function SiteGroupDialog({
       cookiecloud: emptyCookieCloud,
       cookie_auto_import: false,
       cookie_auto_upload: false,
+      scheduled_keepalive: true,
       task: null,
     };
   }
@@ -149,11 +301,11 @@ export function SiteGroupDialog({
     const group = draft.cookie_mode === "custom"
       ? draft
       : { ...draft, cookiecloud: emptyCookieCloud, cookie_auto_import: false, cookie_auto_upload: false };
-    void apply(() => onSave(group, showOnStartup));
-  }
-
-  function proxyField(key: "server_url" | "username" | "password", value: string) {
-    setDraft((current) => ({ ...current, browser_proxy: { ...current.browser_proxy, [key]: value } }));
+    void apply(() => {
+      const browser_proxy = normalizeBrowserProxyLinks(group.browser_proxy);
+      setDraft((current) => ({ ...current, browser_proxy }));
+      return onSave({ ...group, browser_proxy }, showOnStartup);
+    });
   }
 
   function cookieField(key: keyof CookieCloudConfig, value: string) {
@@ -213,16 +365,24 @@ export function SiteGroupDialog({
             </label>
             <label className="site-secret-field">
               <span>保活计划</span>
-              <select value={task ? "custom" : "inherit"} onChange={(event) => {
+              <select value={draft.scheduled_keepalive ? task ? "custom" : "inherit" : "off"} onChange={(event) => {
+                const mode = event.target.value;
+                if (mode === "off") {
+                  setDraft({ ...draft, scheduled_keepalive: false });
+                  return;
+                }
                 const savedTask = groups.find((group) => group.id === draft.id)?.task;
-                const task = event.target.value === "custom" ? { ...(savedTask ?? defaultTask) } : null;
-                setDraft({ ...draft, task });
+                const task = mode === "custom" ? { ...(draft.task ?? savedTask ?? defaultTask) } : null;
+                setDraft({ ...draft, scheduled_keepalive: true, task });
               }}>
                 <option value="inherit">沿用默认设置的计划</option>
                 <option value="custom">单独设置计划</option>
+                <option value="off">关闭定时保活</option>
               </select>
             </label>
-            {task ? (
+            {!draft.scheduled_keepalive ? (
+              <p className="site-group-hint site-secret-field">本组不会按计划自动执行，仍可手动保活。</p>
+            ) : task ? (
               <>
                 <CronField
                   className="site-secret-field"
@@ -243,37 +403,19 @@ export function SiteGroupDialog({
                   } />
                 </label>
               </>
+            ) : !defaultScheduleEnabled ? (
+              <p className="site-group-hint site-secret-field">默认定时保活已关闭。可单独为本组设置计划。</p>
             ) : (
               <p className="site-group-hint site-secret-field">
                 <CronPreviewText preview={cronPreview} /> · 随机延迟最多 {defaultTask.cron_offset_minutes} 分钟 · 停留 {defaultTask.visit_duration} 秒
               </p>
             )}
-            <label className="site-secret-field">
-              <span>网络出口</span>
-              <select value={draft.browser_proxy.enabled ? "proxy" : "direct"} onChange={(event) => setDraft({
-                ...draft, browser_proxy: { ...draft.browser_proxy, enabled: event.target.value === "proxy" },
-              })}>
-                <option value="direct">直连</option>
-                <option value="proxy">指定代理</option>
-              </select>
-            </label>
-            {draft.browser_proxy.enabled && (
-              <>
-                <label className="site-secret-field">
-                  <span>代理地址</span>
-                  <input required type="url" placeholder="socks5://proxy.example.com:1080" value={draft.browser_proxy.server_url} onChange={(event) => proxyField("server_url", event.target.value)} />
-                  <small>支持 HTTP、HTTPS 和 SOCKS5。SOCKS5 请填写端口，有认证时同时填写用户名和密码。</small>
-                </label>
-                <label>
-                  <span>代理用户名 <small>选填</small></span>
-                  <input autoComplete="off" value={draft.browser_proxy.username} onChange={(event) => proxyField("username", event.target.value)} />
-                </label>
-                <label>
-                  <span>代理密码 <small>选填</small></span>
-                  <input type="password" autoComplete="new-password" value={draft.browser_proxy.password} onChange={(event) => proxyField("password", event.target.value)} />
-                </label>
-              </>
-            )}
+            <BrowserProxyFields required disabled={saving} proxy={draft.browser_proxy}
+              onChange={(browser_proxy) => {
+                setDraft((current) => ({ ...current, browser_proxy }));
+                setError(null);
+              }}
+              onError={setError} />
             <label className="site-secret-field">
               <span>CookieCloud</span>
               <select value={draft.cookie_mode} onChange={(event) => setDraft({ ...draft, cookie_mode: event.target.value as SiteGroup["cookie_mode"] })}>
@@ -324,8 +466,8 @@ export function SiteGroupDialog({
               每组使用独立的浏览器数据。同一站点的不同账号请放到不同组。默认分组使用「默认设置」里的浏览器配置。
             </p>
           </fieldset>
-          {error && <p className="app-dialog-error" role="alert">{error}</p>}
         </div>
+        {error && <p className="app-dialog-error site-group-error" role="alert">{error}</p>}
         <footer className="app-dialog-footer site-group-footer">
           {draft.id && (
             <button
@@ -339,7 +481,7 @@ export function SiteGroupDialog({
             </button>
           )}
           <button className="ghost" disabled={saving} onClick={close} type="button">取消</button>
-          <button className="primary-action" disabled={saving || (!!task && cronPreview.state !== "valid")} type="submit">{saving ? "保存中…" : "保存分组"}</button>
+          <button className="primary-action" disabled={saving || (draft.scheduled_keepalive && !!task && cronPreview.state !== "valid")} type="submit">{saving ? "保存中…" : "保存分组"}</button>
         </footer>
       </form>
     </dialog>
