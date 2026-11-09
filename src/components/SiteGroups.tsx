@@ -261,7 +261,8 @@ export function SiteGroupDialog({
               <>
                 <label className="site-secret-field">
                   <span>代理地址</span>
-                  <input required type="url" placeholder="http://proxy.example.com:8080" value={draft.browser_proxy.server_url} onChange={(event) => proxyField("server_url", event.target.value)} />
+                  <input required type="url" placeholder="socks5://proxy.example.com:1080" value={draft.browser_proxy.server_url} onChange={(event) => proxyField("server_url", event.target.value)} />
+                  <small>支持 HTTP、HTTPS 和 SOCKS5。SOCKS5 请填写端口，有认证时同时填写用户名和密码。</small>
                 </label>
                 <label>
                   <span>代理用户名 <small>选填</small></span>

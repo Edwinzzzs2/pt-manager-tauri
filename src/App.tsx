@@ -2945,6 +2945,9 @@ function GroupSettingsPanel({
     try {
       const address = new URL(proxy.server_url);
       if (address.protocol === "http:" || address.protocol === "https:") proxyAddress = address.origin;
+      else if (["socks5:", "socks5h:"].includes(address.protocol) && address.hostname && address.port) {
+        proxyAddress = `${address.protocol}//${address.hostname}:${address.port}`;
+      }
     } catch {
       // 配置文件也可能由用户手动编辑，摘要不显示无效地址。
     }
@@ -3436,7 +3439,7 @@ function SettingsPanel({
             {draft.browser_proxy.enabled && (
               <>
                 <label className="proxy-address-field">
-                  <span>HTTP / HTTPS 代理地址</span>
+                  <span>HTTP / HTTPS / SOCKS5 代理地址</span>
                   <input
                     disabled={taskRunning || browserProxyTestBusy}
                     onChange={(event) => onChange({ ...draft, browser_proxy: { ...draft.browser_proxy, server_url: event.target.value } })}
@@ -3476,7 +3479,7 @@ function SettingsPanel({
             )}
             <p className="field-hint">
               这里的端口和代理用于默认分组。启用代理后，保活、登录、签到及每日福利都会通过该代理访问站点。
-              支持 HTTP 和 HTTPS 代理；HTTPS 会加密到代理服务器的连接并校验证书。
+              支持 HTTP、HTTPS 和 SOCKS5。SOCKS5 地址示例为 socks5://proxy.example.com:1080。
               可先测试当前填写的配置，无需保存；测试会单独发送代理请求。保存后请关闭专用浏览器，再执行任务使新配置生效。
             </p>
             {browserProxyTestResult ? (

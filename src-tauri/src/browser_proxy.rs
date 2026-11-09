@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod https;
+mod socks5;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 256;
@@ -42,22 +43,30 @@ pub fn normalize_config(config: &mut BrowserProxyConfig) -> Result<(), String> {
         return Ok(());
     }
     let url = reqwest::Url::parse(&config.server_url)
-        .map_err(|_| "浏览器代理地址格式错误，请填写 http:// 或 https://地址:端口".to_string())?;
-    if !matches!(url.scheme(), "http" | "https")
+        .map_err(|_| "浏览器代理地址格式错误，请填写 协议://地址:端口".to_string())?;
+    let socks = matches!(url.scheme(), "socks5" | "socks5h");
+    if !(socks || matches!(url.scheme(), "http" | "https"))
         || url.host_str().is_none()
-        || url.port_or_known_default().is_none()
+        || !url.port_or_known_default().is_some_and(|port| port != 0)
     {
         return Err(
-            "浏览器代理支持 HTTP 和 HTTPS，请填写 http:// 或 https://地址:端口".to_string(),
+            "浏览器代理支持 HTTP、HTTPS 和 SOCKS5。SOCKS5 请填写 socks5://地址:端口".to_string(),
         );
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("请将代理用户名和密码填写到独立的认证输入框".to_string());
     }
-    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
         return Err("浏览器代理地址不能包含路径、查询参数或片段".to_string());
     }
-    if config.username.contains(':') || (config.username.is_empty() && !config.password.is_empty())
+    if socks {
+        if config.username.is_empty() != config.password.is_empty()
+            || config.username.len() > 255
+            || config.password.len() > 255
+        {
+            return Err("SOCKS5 认证需要同时填写用户名和密码，每项最多 255 字节".to_string());
+        }
+    } else if config.username.contains(':') || (config.username.is_empty() && !config.password.is_empty())
     {
         return Err("代理用户名不能含冒号；填写代理密码时也必须填写用户名".to_string());
     }
@@ -244,14 +253,14 @@ fn accept_connections(listener: TcpListener, config: BrowserProxyConfig, stopped
     }
 }
 
-fn connect_upstream(config: &BrowserProxyConfig) -> Result<TcpStream, String> {
-    let url = reqwest::Url::parse(&config.server_url).map_err(|_| "代理地址无效".to_string())?;
+fn connect_upstream(url: &reqwest::Url) -> Result<TcpStream, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "代理地址缺少主机".to_string())?
         .trim_start_matches('[')
         .trim_end_matches(']');
-    let addresses = (host, url.port_or_known_default().unwrap_or(80))
+    let port = url.port_or_known_default().ok_or_else(|| "代理地址缺少端口".to_string())?;
+    let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|_| "无法解析浏览器代理服务器地址".to_string())?;
     for address in addresses {
@@ -338,7 +347,7 @@ fn write_browser_response(
     }
 }
 
-fn upstream_headers(headers: &str, config: &BrowserProxyConfig, tunnel: bool) -> String {
+fn upstream_headers(headers: &str, config: Option<&BrowserProxyConfig>, tunnel: bool) -> String {
     let mut lines = headers.split("\r\n");
     let mut result = format!("{}\r\n", lines.next().unwrap_or_default());
     for line in lines.filter(|line| !line.is_empty()) {
@@ -352,14 +361,17 @@ fn upstream_headers(headers: &str, config: &BrowserProxyConfig, tunnel: bool) ->
         result.push_str(line);
         result.push_str("\r\n");
     }
-    if !config.username.is_empty() {
+    if let Some(config) = config.filter(|config| !config.username.is_empty()) {
         let token = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", config.username, config.password));
         result.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
     }
     // HTTP 每个请求都要补认证，要求上游关闭连接，避免下一次请求沿用未经处理的头。
     if !tunnel {
-        result.push_str("Connection: close\r\nProxy-Connection: close\r\n");
+        result.push_str("Connection: close\r\n");
+        if config.is_some() {
+            result.push_str("Proxy-Connection: close\r\n");
+        }
     }
     result.push_str("\r\n");
     result
@@ -382,15 +394,19 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
     let first_line = headers.lines().next().unwrap_or_default();
     let tunnel = first_line.starts_with("CONNECT ");
     let target = first_line.split_whitespace().nth(1).unwrap_or("未知目标");
-    let mut upstream = connect_upstream(config)?;
+    let proxy = reqwest::Url::parse(&config.server_url).map_err(|_| "代理地址无效".to_string())?;
+    let mut upstream = connect_upstream(&proxy)?;
+    if matches!(proxy.scheme(), "socks5" | "socks5h") {
+        return forward_socks5(client, upstream, config, &headers, &tail, tunnel);
+    }
     upstream
-        .write_all(upstream_headers(&headers, config, tunnel).as_bytes())
+        .write_all(upstream_headers(&headers, Some(config), tunnel).as_bytes())
         .map_err(|_| "发送浏览器代理请求失败".to_string())?;
     upstream
         .write_all(&tail)
         .map_err(|_| "发送浏览器代理数据失败".to_string())?;
     if !tunnel {
-        return forward_http_response(client, upstream);
+        return forward_http_response(client, upstream, true);
     }
     // CONNECT 只需等待代理建立目标连接；后续隧道读写仍沿用较长的普通超时。
     upstream
@@ -431,7 +447,72 @@ fn forward_request(client: &mut TcpStream, config: &BrowserProxyConfig) -> Resul
     Ok(())
 }
 
-fn forward_http_response(client: &mut TcpStream, mut upstream: TcpStream) -> Result<(), String> {
+fn forward_socks5(
+    client: &mut TcpStream,
+    mut upstream: TcpStream,
+    config: &BrowserProxyConfig,
+    headers: &str,
+    tail: &[u8],
+    tunnel: bool,
+) -> Result<(), String> {
+    let (request_line, remaining_headers) = headers.split_once("\r\n")
+        .ok_or_else(|| "浏览器代理请求头无效".to_string())?;
+    let mut fields = request_line.split_whitespace();
+    let (Some(method), Some(target), Some(version), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err("浏览器代理请求行无效".to_string());
+    };
+    let destination = if tunnel {
+        if target.contains(['/', '\\', '@', '?', '#']) {
+            return Err("浏览器代理 CONNECT 目标无效".to_string());
+        }
+        reqwest::Url::parse(&format!("https://{target}"))
+    } else {
+        reqwest::Url::parse(target)
+    }.map_err(|_| "浏览器代理请求地址无效".to_string())?;
+    if !tunnel && destination.scheme() != "http" {
+        return Err("SOCKS5 转发 HTTPS 请求时需要 CONNECT 隧道".to_string());
+    }
+    let host = destination.host_str().ok_or_else(|| "代理请求缺少目标主机".to_string())?;
+    let port = destination.port_or_known_default().filter(|port| *port != 0)
+        .ok_or_else(|| "代理请求缺少有效目标端口".to_string())?;
+
+    upstream.set_read_timeout(Some(CONNECT_RESPONSE_TIMEOUT)).map_err(|err| err.to_string())?;
+    upstream.set_write_timeout(Some(CONNECT_RESPONSE_TIMEOUT)).map_err(|err| err.to_string())?;
+    socks5::connect(&mut upstream, host, port, config)?;
+    upstream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|err| err.to_string())?;
+    upstream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|err| err.to_string())?;
+
+    if tunnel {
+        if !write_browser_response(
+            client,
+            b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            "返回 SOCKS5 隧道状态失败",
+        )? {
+            return Ok(());
+        }
+    } else {
+        // The target server receives an origin-form request, without proxy credentials.
+        let mut path = destination.path().to_owned();
+        if let Some(query) = destination.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        let headers = format!("{method} {path} {version}\r\n{remaining_headers}");
+        upstream.write_all(upstream_headers(&headers, None, false).as_bytes())
+            .map_err(|err| format!("发送 SOCKS5 转发请求失败：{err}"))?;
+    }
+    upstream.write_all(tail).map_err(|err| format!("发送 SOCKS5 转发数据失败：{err}"))?;
+    if tunnel {
+        relay_streams(client, upstream);
+        Ok(())
+    } else {
+        forward_http_response(client, upstream, false)
+    }
+}
+
+fn forward_http_response(client: &mut TcpStream, mut upstream: TcpStream, proxy_response: bool) -> Result<(), String> {
     let mut request_client = client.try_clone().map_err(|err| err.to_string())?;
     let mut request_upstream = upstream.try_clone().map_err(|err| err.to_string())?;
     // POST 请求体可能大于首个缓冲区；读取响应时必须同时发送剩余请求体，避免互相等待。
@@ -447,7 +528,7 @@ fn forward_http_response(client: &mut TcpStream, mut upstream: TcpStream) -> Res
                 .lines()
                 .next()
                 .and_then(|line| line.split_whitespace().nth(1));
-            if status == Some("407") {
+            if proxy_response && status == Some("407") {
                 return Err("浏览器代理认证失败，请检查代理用户名和密码".to_string());
             }
             if !write_browser_response(client, headers.as_bytes(), "返回浏览器代理响应失败")?
@@ -529,7 +610,10 @@ mod tests {
         let mut config = test_config(3128);
         normalize_config(&mut config).unwrap();
         for invalid in [
-            "socks5://proxy.example:3128",
+            "socks4://proxy.example:3128",
+            "socks5://proxy.example",
+            "socks5://proxy.example:0",
+            "socks5://user:secret@proxy.example:1080",
             "http://user:secret@proxy.example:3128",
             "http://proxy.example:3128/path",
         ] {
@@ -539,6 +623,84 @@ mod tests {
         config.server_url = "https://proxy.example:443/".to_string();
         normalize_config(&mut config).unwrap();
         assert_eq!(config.server_url, "https://proxy.example");
+        config.server_url = "socks5://proxy.example:1080/".to_string();
+        normalize_config(&mut config).unwrap();
+        assert_eq!(config.server_url, "socks5://proxy.example:1080");
+        config.password.clear();
+        assert!(normalize_config(&mut config).is_err());
+    }
+
+    #[test]
+    fn socks5_translates_browser_http_and_connect_requests() {
+        let host = b"example.test";
+        for (tunnel, scheme) in [(false, "socks5h"), (true, "socks5")] {
+            let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = upstream.local_addr().unwrap().port();
+            let mut config = test_config(port);
+            config.server_url = format!("{scheme}://127.0.0.1:{port}");
+            if !tunnel {
+                config.username.clear();
+                config.password.clear();
+            }
+            normalize_config(&mut config).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = upstream.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let method = if tunnel { 2 } else { 0 };
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [5, 1, method]);
+                stream.write_all(&[5, method]).unwrap();
+                if tunnel {
+                    let expected = b"\x01\x09unit-user\x0dunit-password";
+                    let mut auth = vec![0; expected.len()];
+                    stream.read_exact(&mut auth).unwrap();
+                    assert_eq!(auth, expected);
+                    stream.write_all(&[1, 0]).unwrap();
+                }
+                let mut request = [0; 19];
+                stream.read_exact(&mut request).unwrap();
+                assert_eq!(&request[..5], &[5, 1, 0, 3, host.len() as u8]);
+                assert_eq!(&request[5..17], host);
+                let expected_port = if tunnel { 443_u16 } else { 80 };
+                assert_eq!(request[17..], expected_port.to_be_bytes());
+                stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                if tunnel {
+                    let mut payload = [0; 4];
+                    stream.read_exact(&mut payload).unwrap();
+                    assert_eq!(&payload, b"ping");
+                    stream.write_all(b"pong").unwrap();
+                } else {
+                    let (headers, mut body) = read_headers(&mut stream).unwrap();
+                    assert!(headers.starts_with("POST /login?next=%2F HTTP/1.1\r\n"));
+                    assert!(!headers.contains("Proxy-Authorization"));
+                    assert!(!headers.contains("Proxy-Connection"));
+                    let buffered = body.len();
+                    body.resize(4, 0);
+                    stream.read_exact(&mut body[buffered..]).unwrap();
+                    assert_eq!(&body, b"test");
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").unwrap();
+                }
+            });
+            let local = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut browser = TcpStream::connect(local.local_addr().unwrap()).unwrap();
+            browser.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let relay = thread::spawn(move || {
+                let (mut client, _) = local.accept().unwrap();
+                forward_request(&mut client, &config).unwrap();
+            });
+            if tunnel {
+                browser.write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\nping").unwrap();
+            } else {
+                browser.write_all(b"POST http://example.test/login?next=%2F HTTP/1.1\r\nHost: example.test\r\nContent-Length: 4\r\nProxy-Authorization: Basic unused\r\nProxy-Connection: keep-alive\r\n\r\ntest").unwrap();
+            }
+            let mut response = String::new();
+            browser.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
+            assert!(response.ends_with(if tunnel { "pong" } else { "OK" }));
+            server.join().unwrap();
+            relay.join().unwrap();
+        }
     }
 
     #[test]
