@@ -3655,7 +3655,7 @@ function SettingsPanel({
                 <h2>验证码识别</h2>
                 <span
                   className="help-tip"
-                  data-tooltip="当前兼容 Edwinzzzs2/ocrRead（基于 ddddocr）的 HTTP API，主要识别常见单行图片验证码中的中文、英文、数字及部分特殊字符，并支持颜色过滤。本应用会调用 /status、/initialize 和 /ocr；目标检测、滑块匹配等接口由服务提供但不会在本站点登录流程中自动调用。保存设置时会检查 /status；OCR 未加载时自动调用 /initialize。服务重启后，下次识别也会自动重新检查。"
+                  data-tooltip="兼容 Edwinzzzs2/ocrRead（基于 ddddocr）。普通图片验证码使用文字识别。豆瓣的腾讯拼图使用滑块匹配，需在 OCR 服务中启用滑块识别。匹配失败时可在专用浏览器里手动验证。"
                   tabIndex={0}
                 >
                   <HelpCircle size={16} />

@@ -79,6 +79,77 @@ pub fn recognize(server_url: &str, image_base64: &str) -> Result<RecognitionResu
     })
 }
 
+pub fn match_slider(
+    server_url: &str,
+    piece_base64: &str,
+    background_base64: &str,
+) -> Result<(f64, f64), String> {
+    let piece = normalize_image_base64(piece_base64)?;
+    let bytes = STANDARD.decode(&piece).map_err(|_| "滑块图片 Base64 格式无效".to_string())?;
+    let image = image::load_from_memory(&bytes).map_err(|_| "滑块图片格式无效".to_string())?;
+    let payload = request_json(
+        server_url,
+        "POST",
+        "/slide-match",
+        Some(serde_json::json!({
+            "target_image": piece,
+            "background_image": normalize_image_base64(background_base64)?,
+            "simple_target": false,
+        })),
+        Duration::from_secs(12),
+    )?;
+    slider_target(&payload, (image.width(), image.height()))
+}
+
+fn slider_target(payload: &Value, (width, height): (u32, u32)) -> Result<(f64, f64), String> {
+    if payload.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err("OCR 服务未能匹配滑块，请确认服务已启用滑块识别".to_string());
+    }
+    let target = payload.pointer("/data/target").and_then(Value::as_array)
+        .filter(|coordinates| matches!(coordinates.len(), 2 | 4))
+        .ok_or_else(|| "OCR 未返回有效的滑块缺口坐标".to_string())?;
+    // 新版接口返回缺口中心；旧版 ddddocr 返回边框和裁去透明边缘的偏移。
+    if target.len() == 2 {
+        let center_x = target[0].as_f64();
+        let center_y = target[1].as_f64();
+        return center_x.zip(center_y)
+            .map(|(x, y)| (x - f64::from(width) / 2.0, y - f64::from(height) / 2.0))
+            .ok_or_else(|| "OCR 未返回有效的滑块缺口坐标".to_string());
+    }
+    let x = target[0].as_f64().zip(payload.pointer("/data/target_x").and_then(Value::as_f64));
+    let y = target[1].as_f64().zip(payload.pointer("/data/target_y").and_then(Value::as_f64));
+    let (Some((left, inset_x)), Some((top, inset_y))) = (x, y) else {
+        return Err("OCR 未返回有效的滑块缺口坐标".to_string());
+    };
+    Ok((left - inset_x, top - inset_y))
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::slider_target;
+    use serde_json::json;
+
+    #[test]
+    fn converts_center_coordinates_from_the_running_ocr_service() {
+        let response = json!({
+            "success": true,
+            "data": { "target": [227, 65], "target_x": 227, "target_y": 65 }
+        });
+        assert_eq!(slider_target(&response, (59, 59)).unwrap(), (197.5, 35.5));
+    }
+
+    #[test]
+    fn preserves_legacy_bounding_box_offsets() {
+        let response = json!({
+            "success": true,
+            "data": { "target": [204, 42, 251, 89], "target_x": 6, "target_y": 6 }
+        });
+        assert_eq!(slider_target(&response, (59, 59)).unwrap(), (198.0, 36.0));
+        assert!(slider_target(&json!({"success": false}), (59, 59)).is_err());
+        assert!(slider_target(&json!({"success": true, "data": {"target": [0, "bad"]}}), (59, 59)).is_err());
+    }
+}
+
 fn normalize_image_base64(value: &str) -> Result<String, String> {
     let encoded = value
         .trim()

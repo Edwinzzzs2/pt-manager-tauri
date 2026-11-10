@@ -1,5 +1,6 @@
 mod common;
 mod dian115;
+mod douban;
 mod hdkylin;
 mod jying;
 mod mteam;
@@ -13,6 +14,7 @@ use crate::cdp::{CdpClient, CdpProgress};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteAdapter {
     Dian115,
+    Douban,
     Jying,
     MTeam,
     Hdkylin,
@@ -39,7 +41,9 @@ impl SiteAdapter {
             .next()
             .unwrap_or_default()
             .trim_start_matches("www.");
-        if host == "m.dian115.com" {
+        if host == "douban.com" || host.ends_with(".douban.com") {
+            Self::Douban
+        } else if host == "m.dian115.com" {
             Self::Dian115
         } else if host == "jying.top" {
             Self::Jying
@@ -92,6 +96,21 @@ impl CdpClient {
         progress: Option<&CdpProgress>,
     ) -> Result<LoginOutcome, LoginError> {
         match SiteAdapter::from_url(request.site_url) {
+            SiteAdapter::Douban => self
+                .login_douban(
+                    tab_id,
+                    request.site_url,
+                    request.username,
+                    request.password,
+                    request.ocr_config.as_ref().map(|(url, _)| url.as_str()),
+                    progress,
+                )
+                .await
+                .map(|logged_in| LoginOutcome {
+                    state: if logged_in { LoginState::LoggedIn } else { LoginState::AlreadyLoggedIn },
+                    remaining_attempts: None,
+                })
+                .map_err(|message| LoginError { message, remaining_attempts: None }),
             SiteAdapter::Jying => self
                 .login_jying(
                     tab_id,
@@ -237,6 +256,9 @@ mod tests {
 
     #[test]
     fn selects_special_adapters_before_nexusphp_fallback() {
+        assert_eq!(SiteAdapter::from_url("https://movie.douban.com/"), SiteAdapter::Douban);
+        assert_eq!(SiteAdapter::from_url("https://accounts.douban.com/passport/login"), SiteAdapter::Douban);
+        assert_eq!(SiteAdapter::from_url("https://movie.douban.com.example/"), SiteAdapter::NexusPhp);
         assert_eq!(SiteAdapter::from_url("https://jying.top/"), SiteAdapter::Jying);
         assert_eq!(SiteAdapter::from_url("https://www.jying.top/login"), SiteAdapter::Jying);
         assert_eq!(SiteAdapter::from_url("https://jying.top.evil.example/"), SiteAdapter::NexusPhp);
