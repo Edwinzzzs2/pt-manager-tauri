@@ -1,4 +1,4 @@
-use crate::store::{self, AppConfig, BrowserKind, LogEntry};
+use crate::store::{self, AppConfig, BrowserEnvironment, BrowserKind, LogEntry};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 // 登录适配器作为 CDP 的子模块，可以复用内部 WebSocket，同时不向业务层暴露传输细节。
-mod login;
+mod environment;
 mod jying;
+mod login;
 mod qingwa_bonus;
 mod proxy_check;
 mod signin;
@@ -49,6 +50,7 @@ pub struct CdpClient {
     proxy_address: Option<Option<String>>,
     profile_group: Option<String>,
     require_managed_profile: bool,
+    environment: BrowserEnvironment,
 }
 
 pub struct CdpLaunchResult {
@@ -126,13 +128,23 @@ impl CdpClient {
     }
 
     pub fn with_browser(port: u16, browser: BrowserKind) -> Self {
-        Self { port, browser, proxy_address: None, profile_group: None, require_managed_profile: false }
+        Self {
+            port,
+            browser,
+            proxy_address: None,
+            profile_group: None,
+            require_managed_profile: false,
+            environment: BrowserEnvironment::default(),
+        }
     }
 
     pub fn for_profile(config: &AppConfig) -> Self {
         Self {
             profile_group: config.profile_group.clone(),
-            require_managed_profile: config.profile_group.is_some() || !config.site_groups.is_empty(),
+            require_managed_profile: config.profile_group.is_some()
+                || !config.site_groups.is_empty()
+                || !config.browser_environment.is_default(),
+            environment: config.browser_environment.clone(),
             ..Self::with_browser(config.cdp_port, config.browser)
         }
     }
@@ -153,6 +165,10 @@ impl CdpClient {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn at_port(&self, port: u16) -> Self {
+        Self { port, ..self.clone() }
     }
 
     fn primary_profile(&self) -> PathBuf {
@@ -288,6 +304,8 @@ impl CdpClient {
         initial_urls: &[String],
         progress: Option<&CdpProgress>,
     ) -> Result<CdpLaunchResult, String> {
+        // 自定义环境先启动空白浏览器，站点由调用方通过 open_tab 应用设置后再打开。
+        let initial_urls = if self.environment.is_default() { initial_urls } else { &[] };
         self.validate_existing_proxy().await?;
         let proxy_address = self.proxy_address.as_ref().and_then(|address| address.as_deref());
         if proxy_address.is_some() {
@@ -426,7 +444,14 @@ impl CdpClient {
 
     /// 在所选浏览器中打开新标签页，返回 tab ID。
     pub async fn open_tab(&self, url: &str) -> Result<String, String> {
-        let encoded = encode_cdp_target_url(url);
+        let custom_environment = !self.environment.is_default() && url != "about:blank";
+        let target = if custom_environment {
+            let _ = self.list_tabs();
+            "about:blank"
+        } else {
+            url
+        };
+        let encoded = encode_cdp_target_url(target);
         let response = self.request(
             "PUT",
             &format!("/json/new?{}", encoded),
@@ -437,24 +462,37 @@ impl CdpClient {
         }
 
         let tab = serde_json::from_str::<CdpTab>(&response.body).map_err(|err| err.to_string())?;
+        if custom_environment {
+            if let Err(error) = environment::navigate(self.port, &tab, &self.environment, url) {
+                let _ = self.close_tab(&tab.id).await;
+                return Err(error);
+            }
+        }
         Ok(tab.id)
+    }
+
+    fn list_tabs(&self) -> Result<Vec<CdpTab>, String> {
+        let requested_at = Instant::now();
+        let response = self.request("GET", "/json/list", Duration::from_secs(5))?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("CDP 返回 HTTP {}", response.status));
+        }
+        let tabs: Vec<CdpTab> = serde_json::from_str(&response.body).map_err(|err| err.to_string())?;
+        environment::retain_open_tabs(self.port, &tabs, requested_at);
+        Ok(tabs)
     }
 
     /// 查找已经打开到相同站点的标签页，避免启动后重复打开同一个站点。
     pub async fn find_tab_for_url(&self, url: &str) -> Option<String> {
-        let response = self
-            .request("GET", "/json/list", Duration::from_secs(5))
-            .ok()?;
-        if !(200..300).contains(&response.status) {
-            return None;
-        }
+        self.find_site_tab(url, |tab| environment::matches(self.port, &tab.id, &self.environment))
+    }
 
-        let tabs = serde_json::from_str::<Vec<CdpTab>>(&response.body).ok()?;
+    fn find_site_tab(&self, url: &str, can_reuse: impl Fn(&CdpTab) -> bool) -> Option<String> {
         let expected_host = host_from_url(url)?;
-        tabs.into_iter()
+        self.list_tabs().ok()?.into_iter()
             .filter(|tab| tab.tab_type.as_deref() == Some("page"))
             .find(|tab| {
-                tab.url
+                can_reuse(tab) && tab.url
                     .as_deref()
                     .and_then(host_from_url)
                     .map(|host| host == expected_host)
@@ -514,7 +552,7 @@ impl CdpClient {
             let Some(host) = host_from_url(&origin) else {
                 continue;
             };
-            let Some(tab_id) = self.find_tab_for_url(&origin).await else {
+            let Some(tab_id) = self.find_site_tab(&origin, |_| true) else {
                 continue;
             };
             let Some(websocket_url) = self.websocket_url_for_tab(&tab_id)? else {
@@ -622,16 +660,8 @@ impl CdpClient {
     /// Cookie 写入后，对浏览器中已打开的目标站点页面执行刷新，
     /// 使新 Cookie 立即生效——否则用户看到的仍是旧的未登录状态。
     pub async fn reload_tabs_for_sites(&self, site_urls: &[String]) {
-        let response = match self.request("GET", "/json/list", Duration::from_secs(5)) {
-            Ok(resp) => resp,
-            Err(_) => return,
-        };
-        if !(200..300).contains(&response.status) {
+        let Ok(tabs) = self.list_tabs() else {
             return;
-        }
-        let tabs = match serde_json::from_str::<Vec<CdpTab>>(&response.body) {
-            Ok(tabs) => tabs,
-            Err(_) => return,
         };
 
         for tab in tabs
@@ -845,6 +875,7 @@ impl CdpClient {
             Duration::from_secs(10),
         )?;
         if (200..300).contains(&response.status) {
+            environment::remove_tab(self.port, tab_id);
             Ok(())
         } else {
             Err(format!("CDP 返回 HTTP {}", response.status))
@@ -855,6 +886,7 @@ impl CdpClient {
     pub async fn close_browser(&self) -> Result<(), String> {
         let mut websocket = CdpWebSocket::connect(&self.browser_session()?, Duration::from_secs(10))?;
         websocket.call("Browser.close", serde_json::json!({}))?;
+        environment::remove_browser(self.port);
         Ok(())
     }
 

@@ -442,7 +442,7 @@ async fn run_keepalive_group(
                 LogEntry::info(format!("已复用自动 CDP 端口 localhost:{}", active_port)),
             )
             .await;
-            cdp = CdpClient::new(active_port);
+            cdp = cdp.at_port(active_port);
         }
     } else {
         push_log(
@@ -459,7 +459,7 @@ async fn run_keepalive_group(
             .await
         {
             Ok(result) => {
-                cdp = CdpClient::new(result.port);
+                cdp = cdp.at_port(result.port);
                 launched_with_initial_sites = result.opened_initial_urls > 0;
                 launched_browser = result.launched;
                 push_log(logs, LogEntry::info(result.message)).await;
@@ -532,9 +532,9 @@ async fn sync_cookiecloud_before_keepalive(
                 .port
         }
     };
-    let active_cdp = CdpClient::new(active_port);
+    let active_cdp = cdp.at_port(active_port);
     let imported_cookies = active_cdp.set_cookies(&sync_data.cookies).await?.len();
-    let (imported_storages, opened_sync_tabs) = CdpClient::new(active_port)
+    let (imported_storages, opened_sync_tabs) = active_cdp
         .set_local_storage_with_opened_tabs(&sync_data.local_storages)
         .await?;
     let imported_storages = imported_storages
@@ -548,9 +548,7 @@ async fn sync_cookiecloud_before_keepalive(
         .filter(|s| s.auto_keepalive)
         .map(|s| s.url.clone())
         .collect();
-    CdpClient::new(active_port)
-        .reload_tabs_for_sites(&site_urls)
-        .await;
+    active_cdp.reload_tabs_for_sites(&site_urls).await;
 
     if !opened_sync_tabs.is_empty() {
         let logs = Arc::clone(logs);

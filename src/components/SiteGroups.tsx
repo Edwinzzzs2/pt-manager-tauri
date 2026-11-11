@@ -163,11 +163,57 @@ export type CookieCloudConfig = {
   password: string;
 };
 
+export type BrowserEnvironment = {
+  timezone: string;
+  language: string;
+};
+
+export function normalizeBrowserEnvironment(settings: BrowserEnvironment): BrowserEnvironment {
+  const timezone = settings.timezone.trim();
+  const language = settings.language.trim();
+  try {
+    if (timezone) new Intl.DateTimeFormat(undefined, { timeZone: timezone });
+  } catch {
+    throw new Error("浏览器时区无效，请填写 America/New_York 这类时区名称");
+  }
+  try {
+    return { timezone, language: language ? Intl.getCanonicalLocales(language)[0] : "" };
+  } catch {
+    throw new Error("浏览器语言无效，请填写 en-US 这类语言代码");
+  }
+}
+
+export function BrowserEnvironmentFields({ settings, onChange, disabled, hintClassName }: {
+  settings: BrowserEnvironment;
+  onChange: (settings: BrowserEnvironment) => void;
+  disabled?: boolean;
+  hintClassName: string;
+}) {
+  return (
+    <>
+      <label>
+        <span>浏览器时区</span>
+        <input autoComplete="off" disabled={disabled} spellCheck={false} placeholder="例如 America/New_York"
+          value={settings.timezone} onChange={(event) => onChange({ ...settings, timezone: event.target.value })} />
+      </label>
+      <label>
+        <span>浏览器语言</span>
+        <input autoComplete="off" disabled={disabled} spellCheck={false} placeholder="例如 en-US"
+          value={settings.language} onChange={(event) => onChange({ ...settings, language: event.target.value })} />
+      </label>
+      <p className={hintClassName}>
+        应用于 PT Manager 打开的站点页面。留空时沿用浏览器默认环境。保活计划仍按本机时区执行。
+      </p>
+    </>
+  );
+}
+
 export type SiteGroup = {
   id: string;
   name: string;
   cdp_port: number;
   browser_proxy: BrowserProxyConfig;
+  browser_environment: BrowserEnvironment;
   cookie_mode: "manual" | "inherit" | "custom";
   cookiecloud: CookieCloudConfig;
   cookie_auto_import: boolean;
@@ -264,6 +310,7 @@ export function SiteGroupDialog({
       name: "",
       cdp_port: port,
       browser_proxy: { enabled: false, server_url: "", username: "", password: "" },
+      browser_environment: { timezone: "", language: "" },
       cookie_mode: "manual",
       cookiecloud: emptyCookieCloud,
       cookie_auto_import: false,
@@ -302,9 +349,10 @@ export function SiteGroupDialog({
       ? draft
       : { ...draft, cookiecloud: emptyCookieCloud, cookie_auto_import: false, cookie_auto_upload: false };
     void apply(() => {
+      const browser_environment = normalizeBrowserEnvironment(group.browser_environment);
       const browser_proxy = normalizeBrowserProxyLinks(group.browser_proxy);
-      setDraft((current) => ({ ...current, browser_proxy }));
-      return onSave({ ...group, browser_proxy }, showOnStartup);
+      setDraft((current) => ({ ...current, browser_proxy, browser_environment }));
+      return onSave({ ...group, browser_proxy, browser_environment }, showOnStartup);
     });
   }
 
@@ -416,6 +464,12 @@ export function SiteGroupDialog({
                 setError(null);
               }}
               onError={setError} />
+            <BrowserEnvironmentFields settings={draft.browser_environment}
+              hintClassName="site-group-hint site-secret-field"
+              onChange={(browser_environment) => {
+                setDraft((current) => ({ ...current, browser_environment }));
+                setError(null);
+              }} />
             <label className="site-secret-field">
               <span>CookieCloud</span>
               <select value={draft.cookie_mode} onChange={(event) => setDraft({ ...draft, cookie_mode: event.target.value as SiteGroup["cookie_mode"] })}>

@@ -51,7 +51,11 @@ import {
 import "./App.css";
 import { CronField, CronPreviewText, useCronPreview } from "./components/CronField";
 import { VersionCard, type UpdatePhase } from "./components/VersionCard";
-import { BrowserProxyFields, cookieModeLabels, normalizeBrowserProxyLinks, SiteGroupDialog, SiteGroupOptions, SiteGroupTabs, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup } from "./components/SiteGroups";
+import {
+  BrowserEnvironmentFields, BrowserProxyFields, cookieModeLabels, normalizeBrowserEnvironment,
+  normalizeBrowserProxyLinks, SiteGroupDialog, SiteGroupOptions, SiteGroupTabs,
+  type BrowserEnvironment, type BrowserProxyConfig, type CookieCloudConfig, type SiteGroup,
+} from "./components/SiteGroups";
 
 type ProxyProbe = { Ok: string } | { Err: string };
 type BrowserProxyTestResult = { exit: ProxyProbe; site: ProxyProbe | null };
@@ -148,6 +152,7 @@ type AppConfig = {
   cdp_port: number;
   browser: "chrome" | "edge";
   browser_proxy: BrowserProxyConfig;
+  browser_environment: BrowserEnvironment;
   visit_duration: number;
   random_delay: boolean;
   auto_launch: boolean;
@@ -238,6 +243,7 @@ const defaultConfig: AppConfig = {
   cdp_port: 9222,
   browser: "chrome",
   browser_proxy: { enabled: false, server_url: "", username: "", password: "" },
+  browser_environment: { timezone: "", language: "" },
   visit_duration: 30,
   random_delay: true,
   auto_launch: false,
@@ -1012,6 +1018,7 @@ function App() {
     setBusy(true);
     setError(null);
     try {
+      next.browser_environment = normalizeBrowserEnvironment(next.browser_environment);
       next.browser_proxy = normalizeBrowserProxyLinks(next.browser_proxy);
       setSettingsDraft((draft) => ({ ...draft, browser_proxy: next.browser_proxy }));
       await invoke("save_config", { config: next });
@@ -3083,6 +3090,8 @@ function GroupSettingsPanel({
                 <dd className="field-hint">{proxy.username.trim() ? `认证账号：${proxy.username}` : "无需账号认证"}</dd>
               )}
             </div>
+            <div><dt>浏览器时区</dt><dd>{group.browser_environment.timezone || "跟随浏览器"}</dd></div>
+            <div><dt>浏览器语言</dt><dd>{group.browser_environment.language || "跟随浏览器"}</dd></div>
           </dl>
           {proxy.enabled && (
             <div className="settings-form">
@@ -3513,6 +3522,9 @@ function SettingsPanel({
             <BrowserProxyFields proxy={draft.browser_proxy} disabled={taskRunning || browserProxyTestBusy}
               onChange={(browser_proxy) => onChange({ ...draft, browser_proxy })}
               onError={onProxyAddressError} />
+            <BrowserEnvironmentFields settings={draft.browser_environment} disabled={taskRunning}
+              hintClassName="field-hint"
+              onChange={(browser_environment) => onChange({ ...draft, browser_environment })} />
             <p className="field-hint">
               这里的端口和代理用于默认分组。保活、登录、签到及每日福利都使用所选的网络出口。
               单代理支持 HTTP、HTTPS 和 SOCKS5。两跳 SOCKS5 由前置代理连接最终出口。

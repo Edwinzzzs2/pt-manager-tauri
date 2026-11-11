@@ -81,6 +81,8 @@ pub struct AppConfig {
     pub browser: BrowserKind,
     #[serde(default)]
     pub browser_proxy: BrowserProxyConfig,
+    #[serde(default)]
+    pub browser_environment: BrowserEnvironment,
     pub visit_duration: u64,
     pub random_delay: bool,
     #[serde(default = "default_auto_launch")]
@@ -188,6 +190,8 @@ pub struct SiteGroup {
     #[serde(default)]
     pub browser_proxy: BrowserProxyConfig,
     #[serde(default)]
+    pub browser_environment: BrowserEnvironment,
+    #[serde(default)]
     pub cookie_mode: GroupCookieMode,
     #[serde(default)]
     pub cookiecloud: CookieCloudConfig,
@@ -199,6 +203,49 @@ pub struct SiteGroup {
     pub scheduled_keepalive: bool,
     #[serde(default)]
     pub task: Option<GroupTaskConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserEnvironment {
+    pub timezone: String,
+    pub language: String,
+}
+
+impl BrowserEnvironment {
+    pub fn is_default(&self) -> bool {
+        self.timezone.is_empty() && self.language.is_empty()
+    }
+
+    pub fn normalize(&mut self) -> Result<(), String> {
+        self.timezone = self.timezone.trim().to_string();
+        self.language = self.language.trim().to_string();
+        if !self.timezone.is_empty()
+            && (self.timezone.len() > 80
+                || !self.timezone.split('/').all(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+')
+                    })
+                }))
+        {
+            return Err("请填写有效的浏览器时区，例如 America/New_York".to_string());
+        }
+        if !self.language.is_empty() {
+            let mut parts = self.language.split('-');
+            let primary = parts.next().unwrap_or_default();
+            if self.language.len() > 64
+                || !(2..=8).contains(&primary.len())
+                || !primary.bytes().all(|byte| byte.is_ascii_alphabetic())
+                || !parts.all(|part| {
+                    (1..=8).contains(&part.len())
+                        && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            {
+                return Err("请填写有效的浏览器语言，例如 en-US".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +345,7 @@ impl AppConfig {
             scoped.profile_group = Some(group.id.clone());
             scoped.cdp_port = group.cdp_port;
             scoped.browser_proxy = group.browser_proxy.clone();
+            scoped.browser_environment = group.browser_environment.clone();
             if let Some(task) = &group.task {
                 scoped.cron = task.cron.clone();
                 scoped.cron_offset_minutes = task.cron_offset_minutes;
@@ -383,6 +431,7 @@ fn valid_group_id(id: &str) -> bool {
 pub fn normalize_site_groups(config: &mut AppConfig) -> Result<(), String> {
     use std::collections::HashSet;
 
+    config.browser_environment.normalize()?;
     let mut ids = HashSet::new();
     let mut names = HashSet::from(["未分组".to_string()]);
     let mut ports = HashSet::from([config.cdp_port]);
@@ -410,6 +459,8 @@ pub fn normalize_site_groups(config: &mut AppConfig) -> Result<(), String> {
             return Err(format!("分组「{}」的调试端口无效或已被其他分组使用", group.name));
         }
         crate::browser_proxy::normalize_config(&mut group.browser_proxy)
+            .map_err(|err| format!("分组「{}」：{err}", group.name))?;
+        group.browser_environment.normalize()
             .map_err(|err| format!("分组「{}」：{err}", group.name))?;
         if let Some(task) = &mut group.task {
             task.cron = task.cron.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -535,6 +586,7 @@ impl Default for AppConfig {
             cdp_port: 9222,
             browser: BrowserKind::default(),
             browser_proxy: BrowserProxyConfig::default(),
+            browser_environment: BrowserEnvironment::default(),
             visit_duration: 30,
             random_delay: true,
             auto_launch: default_auto_launch(),
@@ -1127,6 +1179,7 @@ mod site_group_tests {
                     server_url: "http://proxy.example.net:8080".to_string(),
                     ..Default::default()
                 },
+                browser_environment: BrowserEnvironment::default(),
                 cookie_mode: GroupCookieMode::Custom,
                 cookiecloud: CookieCloudConfig {
                     server_url: "https://cookie.example.net".to_string(),
@@ -1207,13 +1260,22 @@ mod site_group_tests {
         assert!(reloaded.startup_group_id.is_none());
 
         saved.as_object_mut().unwrap().remove("startup_group_id");
+        saved.as_object_mut().unwrap().remove("browser_environment");
+        saved["site_groups"][0].as_object_mut().unwrap().remove("browser_environment");
         let legacy: AppConfig = serde_json::from_value(saved).unwrap();
         assert!(legacy.startup_group_id.is_none());
+        assert!(legacy.browser_environment.is_default());
+        assert!(legacy.site_groups[0].browser_environment.is_default());
     }
 
     #[test]
     fn same_domain_accounts_use_their_own_runtime_config() {
         let mut config = grouped_config();
+        config.browser_environment.language = "zh-CN".to_string();
+        config.site_groups[0].browser_environment = BrowserEnvironment {
+            timezone: " America/New_York ".to_string(),
+            language: "en-US".to_string(),
+        };
         normalize_site_groups(&mut config).unwrap();
         let default = config.for_group(None).unwrap();
         let proxied = config.for_group(Some(PROXY_GROUP)).unwrap();
@@ -1225,6 +1287,10 @@ mod site_group_tests {
         assert_eq!(proxied.cdp_port, 9223);
         assert!(!default.browser_proxy.enabled);
         assert!(proxied.browser_proxy.enabled);
+        assert_eq!(default.browser_environment.language, "zh-CN");
+        assert!(default.browser_environment.timezone.is_empty());
+        assert_eq!(proxied.browser_environment.language, "en-US");
+        assert_eq!(proxied.browser_environment.timezone, "America/New_York");
         assert_eq!(proxied.profile_group.as_deref(), Some(PROXY_GROUP));
         assert_eq!(proxied.cookiecloud.uuid, "proxy-vault");
         assert!(!proxied.auto_sync_cookie);

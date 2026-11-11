@@ -102,10 +102,13 @@ pub async fn save_config(state: State<'_, AppState>, mut config: AppConfig) -> R
             return Err("请填写 1 到 65535 之间的浏览器调试端口".to_string());
         }
         crate::browser_proxy::normalize_config(&mut config.browser_proxy)?;
-        if (current.cdp_port != config.cdp_port || current.browser_proxy != config.browser_proxy)
+        config.browser_environment.normalize()?;
+        if (current.cdp_port != config.cdp_port
+            || current.browser_proxy != config.browser_proxy
+            || current.browser_environment != config.browser_environment)
             && CdpClient::for_profile(&current.for_group(None)?).available_port().await.is_some()
         {
-            return Err("请关闭默认分组的专用浏览器，再修改代理或调试端口".to_string());
+            return Err("请关闭默认分组的专用浏览器，再修改代理、调试端口或浏览器环境".to_string());
         }
         for site in &mut config.sites {
             if let Some(saved_site) = current.sites.iter().find(|saved| saved.id == site.id) {
@@ -360,10 +363,12 @@ pub async fn save_site_group(
         next.site_groups.push(group);
     } else {
         let current = config.group(&group.id)?;
-        if (current.cdp_port != group.cdp_port || current.browser_proxy != group.browser_proxy)
+        if (current.cdp_port != group.cdp_port
+            || current.browser_proxy != group.browser_proxy
+            || current.browser_environment != group.browser_environment)
             && CdpClient::for_profile(&config.for_group(Some(&group.id))?).available_port().await.is_some()
         {
-            return Err("请关闭该分组的专用浏览器，再修改代理或调试端口".to_string());
+            return Err("请关闭该分组的专用浏览器，再修改代理、调试端口或浏览器环境".to_string());
         }
         let index = next.site_groups.iter().position(|current| current.id == group.id)
             .ok_or_else(|| "所选站点分组已不存在".to_string())?;
@@ -430,7 +435,7 @@ async fn test_site_login_in_group(state: &AppState, config: AppConfig, site: sto
 
     let mut cdp = CdpClient::with_config(&config)?;
     if let Some(active_port) = cdp.available_port().await {
-        cdp = CdpClient::new(active_port);
+        cdp = cdp.at_port(active_port);
     } else {
         let progress = CdpProgress::new(
             Arc::clone(&state.logs),
@@ -439,7 +444,7 @@ async fn test_site_login_in_group(state: &AppState, config: AppConfig, site: sto
         let result = cdp
             .ensure_available_with_progress(&[site.url.clone()], &progress)
             .await?;
-        cdp = CdpClient::new(result.port);
+        cdp = cdp.at_port(result.port);
     }
 
     let tab_id = match cdp.find_tab_for_url(&site.url).await {
@@ -699,7 +704,7 @@ async fn recognize_site_captcha_in_group(state: &AppState, config: AppConfig, si
             config.browser.name()
         )
     })?;
-    cdp = CdpClient::new(active_port);
+    cdp = cdp.at_port(active_port);
     let tab_id = cdp
         .find_tab_for_url(&site.url)
         .await
@@ -1040,16 +1045,15 @@ async fn import_cookiecloud_cookies(
             return Err(format!("Cookie 已拉取，但写入浏览器失败：{}", err));
         }
     };
-    let (imported_local_storages, opened_sync_tabs) = CdpClient::new(write_port)
+    let active_cdp = cdp.at_port(write_port);
+    let (imported_local_storages, opened_sync_tabs) = active_cdp
         .set_local_storage_with_opened_tabs(&sync_data.local_storages)
         .await
         .map_err(|err| format!("Local Storage 已拉取，但写入浏览器失败：{}", err))?;
 
     // Cookie/Local Storage 写入成功后，刷新所选浏览器中已打开的站点页面。
     let site_urls: Vec<String> = config.sites.iter().map(|s| s.url.clone()).collect();
-    CdpClient::new(write_port)
-        .reload_tabs_for_sites(&site_urls)
-        .await;
+    active_cdp.reload_tabs_for_sites(&site_urls).await;
 
     // 分组浏览器保留给后续单站测试，仅收回同步打开的标签页。
     let launched_sync_browser = launched_sync_browser && config.profile_group.is_none();
