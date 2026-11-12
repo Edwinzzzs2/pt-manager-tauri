@@ -791,7 +791,13 @@ async fn try_auto_signin_site(
 ) -> SigninResult {
     let progress = CdpProgress::new(Arc::clone(logs), cancel_requested);
     let result = match cdp
-        .signin_site(tab_id, &site.name, &site.url, Some(&progress))
+        .signin_site(
+            tab_id,
+            &site.name,
+            &site.url,
+            Some(&site.totp_secret),
+            Some(&progress),
+        )
         .await
     {
         Ok(result) => result,

@@ -561,7 +561,7 @@ async fn test_site_login_in_group(state: &AppState, config: AppConfig, site: sto
 
     if site.auto_signin {
         match cdp
-            .signin_site(&tab_id, &site.name, &site.url, Some(&progress))
+            .signin_site(&tab_id, &site.name, &site.url, secret, Some(&progress))
             .await
         {
             Ok(result) => {

@@ -6,9 +6,9 @@ use crate::cdp::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
 use serde::Deserialize;
 use std::time::Duration;
 
-const USERNAME_SELECTOR: &str = ".auth-card input[placeholder=\"请输入用户名或邮箱\"]";
-const PASSWORD_SELECTOR: &str = ".auth-card input[type=\"password\"][placeholder=\"请输入密码\"]";
-const SUBMIT_SELECTOR: &str = ".auth-card button.n-button--primary-type";
+const USERNAME_SELECTOR: &str = "form input[name=\"username\"][autocomplete=\"username\"], .auth-card input[placeholder=\"请输入用户名或邮箱\"]";
+const PASSWORD_SELECTOR: &str = "form input[name=\"password\"][type=\"password\"], .auth-card input[type=\"password\"][placeholder=\"请输入密码\"]";
+const SUBMIT_SELECTOR: &str = "form button.auth-submit[type=\"submit\"], .auth-card button.n-button--primary-type";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,7 +67,7 @@ impl CdpClient {
         if !type_runtime_input(&mut websocket, PASSWORD_SELECTOR, password, 45, 110).await {
             return Err("未找到聚影密码输入框".to_string());
         }
-        // Naive UI 的登录按钮不是 form submit，必须点击它触发 Vue 登录处理器。
+        // 通过站点的登录按钮触发 Vue 表单处理器。
         check_cancel(progress)?;
         if !click_runtime_element(&mut websocket, SUBMIT_SELECTOR) {
             return Err("聚影登录按钮未找到或不可点击".to_string());
@@ -140,8 +140,12 @@ fn ensure_site(state: &LoginPageState) -> Result<(), String> {
 }
 
 fn page_state(websocket: &mut CdpWebSocket) -> Option<LoginPageState> {
+    let expression = LOGIN_STATE_EXPRESSION
+        .replace("__USERNAME__", &serde_json::json!(USERNAME_SELECTOR).to_string())
+        .replace("__PASSWORD__", &serde_json::json!(PASSWORD_SELECTOR).to_string())
+        .replace("__SUBMIT__", &serde_json::json!(SUBMIT_SELECTOR).to_string());
     let response = websocket.call("Runtime.evaluate", serde_json::json!({
-        "expression": LOGIN_STATE_EXPRESSION,
+        "expression": expression,
         "returnByValue": true
     })).ok()?;
     serde_json::from_value(response.get("result")?.get("result")?.get("value")?.clone()).ok()
@@ -154,10 +158,10 @@ fn check_cancel(progress: Option<&CdpProgress>) -> Result<(), String> {
 
 const LOGIN_STATE_EXPRESSION: &str = r#"(() => {
     const clean = el => String(el?.textContent || '').replace(/\s+/g, ' ').trim();
-    const username = document.querySelector('.auth-card input[placeholder="请输入用户名或邮箱"]');
-    const password = document.querySelector('.auth-card input[type="password"][placeholder="请输入密码"]');
-    const submit = document.querySelector('.auth-card button.n-button--primary-type');
-    const account = document.querySelector('header a[href="/profile"]');
+    const username = document.querySelector(__USERNAME__);
+    const password = document.querySelector(__PASSWORD__);
+    const submit = document.querySelector(__SUBMIT__);
+    const account = document.querySelector('header a[href="/profile"], nav a[href="/profile"]');
     const errors = Array.from(document.querySelectorAll('.n-message--error-type, .n-alert--error-type'))
         .map(clean).filter(text => text && text.length < 240);
     return {
@@ -166,7 +170,7 @@ const LOGIN_STATE_EXPRESSION: &str = r#"(() => {
         host: location.hostname.toLowerCase(),
         path: location.pathname,
         loggedIn: Boolean(account) && location.pathname !== '/login' && !password,
-        hasLoginForm: Boolean(username && password && submit),
+        hasLoginForm: location.pathname === '/login' && Boolean(username && password && submit),
         hasVerification: Boolean(document.querySelector(
             'iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], .cf-turnstile, .g-recaptcha, #challenge-stage'
         )),

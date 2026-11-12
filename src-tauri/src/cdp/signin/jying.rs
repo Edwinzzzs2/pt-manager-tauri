@@ -118,8 +118,13 @@ const CHECKIN_STATE_EXPRESSION: &str = r#"(() => {
     const stats = Array.from(document.querySelectorAll('.checkin-grid .soft-stat'));
     const stat = label => clean(stats.find(el => clean(el.querySelector('small')) === label)?.querySelector('strong'));
     const number = label => { const value = stat(label).replace(/,/g, ''); return /^\d+$/.test(value) ? Number(value) : null; };
-    const button = document.querySelector('.checkin-cta button');
+    const base = document.querySelector('.base-checkin');
+    const button = base?.querySelector('.checkin-cta button') || document.querySelector('.checkin-cta button');
     const label = clean(button);
+    const total = clean(base?.querySelector('.checkin-header')).match(/累计\s*([\d,]+)\s*天/);
+    const reward = clean(base).match(/\+\s*([\d,]+)\s*积分/);
+    const status = stat('今日状态');
+    const loaded = Boolean(button && (total || ['未签到', '已完成'].includes(status)));
     const errors = Array.from(document.querySelectorAll('.n-message--error-type, .n-alert--error-type'))
         .map(clean).filter(text => text && text.length < 240);
     return {
@@ -127,21 +132,24 @@ const CHECKIN_STATE_EXPRESSION: &str = r#"(() => {
         blank: location.href === 'about:blank',
         host: location.hostname.toLowerCase(),
         path: location.pathname,
-        hasLoginForm: Boolean(document.querySelector('.auth-card input[type="password"]')),
+        hasLoginForm: location.pathname === '/login' && Boolean(document.querySelector('input[type="password"]')),
         // 签到页加载统计前也会出现按钮，必须等今日状态加载完成后再决定是否点击。
-        loaded: Boolean(button) && ['未签到', '已完成'].includes(stat('今日状态')),
-        alreadySigned: stat('今日状态') === '已完成' && label === '今天已经签到' && Boolean(button?.disabled),
-        canClick: stat('今日状态') === '未签到' && label === '立即签到'
+        loaded,
+        alreadySigned: loaded && (total || status === '已完成') && label === '今天已经签到' && Boolean(button?.disabled),
+        canClick: loaded && (total || status === '未签到') && label === '立即签到'
             && !button?.disabled && !button?.classList.contains('n-button--loading'),
         errorMessage: errors[0] || '',
-        totalDays: number('累计签到'),
-        rewardPoints: number('今日奖励')
+        totalDays: total ? Number(total[1].replace(/,/g, '')) : number('累计签到'),
+        rewardPoints: reward ? Number(reward[1].replace(/,/g, '')) : number('今日奖励')
     };
 })()"#;
 
 const CLICK_CHECKIN_EXPRESSION: &str = r#"(() => {
     // 页面还有幸运奖池等操作，只允许点击每日签到区的“立即签到”。
-    const button = document.querySelector('.checkin-cta button');
+    if (!['https://jying.top', 'https://www.jying.top'].includes(location.origin)
+        || location.pathname !== '/checkin') return false;
+    const button = document.querySelector('.base-checkin .checkin-cta button')
+        || document.querySelector('.checkin-cta button');
     if (!button || button.disabled || button.classList.contains('n-button--loading')
         || button.textContent.trim() !== '立即签到') return false;
     button.click();

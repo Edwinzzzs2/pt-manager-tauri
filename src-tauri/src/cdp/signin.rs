@@ -2,6 +2,7 @@ use super::{CdpClient, CdpProgress, CdpWebSocket, CDP_CANCELLED};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+mod dolby;
 mod jying;
 
 const SIGNIN_WAIT_STEPS: usize = 120;
@@ -67,6 +68,7 @@ struct PageState {
     success: bool,
     already_signed: bool,
     has_login_form: bool,
+    maintenance: bool,
     has_challenge: bool,
     challenge_ready: bool,
     has_interactive_question: bool,
@@ -80,22 +82,12 @@ struct PageState {
     consecutive_days: Option<u32>,
 }
 
-impl PageState {
-    fn is_dolby_two_factor_page(&self) -> bool {
-        reqwest::Url::parse(&self.current_url).is_ok_and(|url| {
-            matches!(url.host_str(), Some("uhddolby.com" | "www.uhddolby.com"))
-                && url.path() == "/take2fa.php"
-        })
-    }
-}
-
-const DOLBY_TWO_FACTOR_REQUIRED: &str = "杜比要求两步验证，请在专用浏览器完成验证后重试签到";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigninAdapter {
     Dian115,
     Jying,
     Hdarea,
+    Hxpt,
     Audiences,
     Hdfans,
     PterClub,
@@ -134,6 +126,8 @@ impl SigninAdapter {
             Self::Jying
         } else if matches!(host_from_url(url).as_deref(), Some("hdarea.club" | "www.hdarea.club")) {
             Self::Hdarea
+        } else if matches!(host_from_url(url).as_deref(), Some("hxpt.org" | "www.hxpt.org")) {
+            Self::Hxpt
         } else if url.to_ascii_lowercase().contains("audiences.me") {
             Self::Audiences
         } else if url.to_ascii_lowercase().contains("hdfans.org") {
@@ -161,6 +155,7 @@ impl SigninAdapter {
             Self::Dian115 => "癫影站点适配",
             Self::Jying => "聚影页面签到适配",
             Self::Hdarea => "HDArea 首页签到适配",
+            Self::Hxpt => "好学 FluxTorrent 签到适配",
             Self::Audiences => "观众站点适配",
             Self::Hdfans => "红豆饭站点适配",
             Self::PterClub => "PTerClub 站点适配",
@@ -186,6 +181,9 @@ impl SigninAdapter {
     fn fallback_url(self, site_url: &str) -> String {
         if self == Self::Dian115 {
             return "https://m.dian115.com/me/signin".to_string();
+        }
+        if self == Self::Hxpt {
+            return "https://www.hxpt.org/checkin".to_string();
         }
         let cleaned = site_url
             .trim()
@@ -229,6 +227,18 @@ impl SigninAdapter {
         };
         format!("{base}/attendance.php")
     }
+
+    fn matches_checkin_page(self, url: &str) -> bool {
+        let (hosts, path): (&[&str], &str) = match self {
+            Self::Dian115 => (&["m.dian115.com"], "/me/signin"),
+            Self::Hxpt => (&["hxpt.org", "www.hxpt.org"], "/checkin"),
+            _ => return true,
+        };
+        reqwest::Url::parse(url).is_ok_and(|url| {
+            url.host_str().is_some_and(|host| hosts.contains(&host))
+                && url.path().trim_end_matches('/') == path
+        })
+    }
 }
 
 impl CdpClient {
@@ -237,6 +247,7 @@ impl CdpClient {
         tab_id: &str,
         site_name: &str,
         site_url: &str,
+        totp_secret: Option<&str>,
         progress: Option<&CdpProgress>,
     ) -> Result<SigninResult, String> {
         let adapter = SigninAdapter::from_url(site_url);
@@ -264,7 +275,7 @@ impl CdpClient {
         }
 
         let page_result = self
-            .signin_site_by_page(tab_id, site_name, site_url, progress)
+            .signin_site_by_page(tab_id, site_name, site_url, totp_secret, progress)
             .await?;
         if page_result.successful() {
             return Ok(page_result);
@@ -304,6 +315,7 @@ impl CdpClient {
         tab_id: &str,
         site_name: &str,
         site_url: &str,
+        totp_secret: Option<&str>,
         progress: Option<&CdpProgress>,
     ) -> Result<SigninResult, String> {
         check_cancel(progress)?;
@@ -313,37 +325,46 @@ impl CdpClient {
         let mut websocket = CdpWebSocket::connect(&websocket_url, Duration::from_secs(10))?;
         let adapter = SigninAdapter::from_url(site_url);
 
-        let initial = inspect_page(&mut websocket)?;
-        if initial.is_dolby_two_factor_page() {
-            return Ok(SigninResult::failure(DOLBY_TWO_FACTOR_REQUIRED));
+        let mut initial = inspect_page(&mut websocket)?;
+        if initial.maintenance {
+            return Ok(SigninResult::failure("骚包正在维护，暂时无法签到"));
         }
-        // 首页“签到已得”表示此前已经签到，应记录为已签到而不是本次签到成功。
-        if initial.home_already_signed && adapter != SigninAdapter::Rousi {
-            return Ok(result_from_state(SigninStatus::AlreadySigned, initial));
+        let is_dolby = dolby::is_site(site_url);
+        let mut verified_dolby = false;
+        if is_dolby && dolby::is_verification_page(&initial.current_url) {
+            initial = dolby::verify(&mut websocket, totp_secret, progress).await?;
+            verified_dolby = true;
         }
-        if initial.success {
-            let status = if adapter == SigninAdapter::Dian115 {
-                SigninStatus::AlreadySigned
-            } else {
-                SigninStatus::Success
-            };
-            return Ok(result_from_state(status, initial));
-        }
-        // Rousi 首页只显示连续天数，进入经济页后才能同时读取新版累计签到统计。
-        if initial.already_signed && adapter != SigninAdapter::Rousi {
-            return Ok(result_from_state(SigninStatus::AlreadySigned, initial));
-        }
-        let initially_already_signed = initial.home_already_signed;
-
-        let target_url = match initial.entry_url.filter(|url| same_site(url, site_url)) {
-            Some(url) => url,
-            None if initial.nexusphp_like || matches!(adapter, SigninAdapter::Rousi | SigninAdapter::Dian115) => {
-                adapter.fallback_url(site_url)
+        let initial_on_checkin_page = adapter.matches_checkin_page(&initial.current_url);
+        if initial_on_checkin_page {
+            // Rousi 首页只显示连续天数，进入经济页后才能读取累计签到统计。
+            if adapter != SigninAdapter::Rousi && (initial.home_already_signed || initial.already_signed) {
+                return Ok(result_from_state(SigninStatus::AlreadySigned, initial));
             }
-            None => {
-                return Ok(SigninResult::failure(
-                    "页面中未找到站内签到入口，且当前站点不是通用 NexusPHP 签到结构，需要添加站点专用适配",
-                ));
+            if initial.success {
+                let status = if matches!(adapter, SigninAdapter::Dian115 | SigninAdapter::Hxpt) {
+                    initial.message.clear();
+                    SigninStatus::AlreadySigned
+                } else {
+                    SigninStatus::Success
+                };
+                return Ok(result_from_state(status, initial));
+            }
+        }
+        let initially_already_signed = initial_on_checkin_page && initial.home_already_signed;
+
+        let dedicated_page = matches!(adapter, SigninAdapter::Dian115 | SigninAdapter::Hxpt);
+        let target_url = if dedicated_page {
+            adapter.fallback_url(site_url)
+        } else {
+            match initial.entry_url.filter(|url| same_site(url, site_url)) {
+                Some(url) => url,
+                None if initial.nexusphp_like || adapter == SigninAdapter::Rousi => adapter.fallback_url(site_url),
+                None => {
+                    return Ok(SigninResult::failure(
+                        "页面中未找到站内签到入口，且当前站点不是通用 NexusPHP 签到结构，需要添加站点专用适配",
+                    ));
+                }
             }
         };
         if let Some(progress) = progress {
@@ -356,28 +377,52 @@ impl CdpClient {
         }
 
         websocket.call("Page.enable", serde_json::json!({}))?;
-        websocket.call("Page.navigate", serde_json::json!({ "url": target_url }))?;
+        if !dedicated_page || !initial_on_checkin_page {
+            websocket.call("Page.navigate", serde_json::json!({ "url": target_url }))?;
+        }
 
         let mut challenge_logged = false;
         let mut clicked_action_key = String::new();
         let mut ready_steps = 0usize;
+        let ready_limit = if dedicated_page { 40 } else { 16 };
         for _ in 0..SIGNIN_WAIT_STEPS {
             check_cancel(progress)?;
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let state = match inspect_page(&mut websocket) {
+            let mut state = match inspect_page(&mut websocket) {
                 Ok(state) => state,
                 Err(_) => continue,
             };
             if !state.ready {
                 continue;
             }
-            if state.is_dolby_two_factor_page() {
-                return Ok(SigninResult::failure(DOLBY_TWO_FACTOR_REQUIRED));
+            if state.maintenance {
+                return Ok(SigninResult::failure("骚包正在维护，暂时无法签到"));
+            }
+            if !adapter.matches_checkin_page(&state.current_url) && !state.has_login_form {
+                continue;
+            }
+            if is_dolby && dolby::is_verification_page(&state.current_url) {
+                if verified_dolby {
+                    return Ok(SigninResult::failure("杜比再次要求两步验证，请在专用浏览器完成验证后重试签到"));
+                }
+                state = dolby::verify(&mut websocket, totp_secret, progress).await?;
+                verified_dolby = true;
+                clicked_action_key.clear();
+                ready_steps = 0;
+                if !state.success && !state.already_signed && !state.home_already_signed
+                    && !dolby::same_page(&state.current_url, &target_url)
+                {
+                    websocket.call("Page.navigate", serde_json::json!({ "url": target_url }))?;
+                    continue;
+                }
             }
             ready_steps += 1;
 
             if state.success {
-                let status = if initially_already_signed {
+                let status = if initially_already_signed || (dedicated_page && clicked_action_key.is_empty()) {
+                    if dedicated_page {
+                        state.message.clear();
+                    }
                     SigninStatus::AlreadySigned
                 } else {
                     SigninStatus::Success
@@ -385,7 +430,13 @@ impl CdpClient {
                 return Ok(result_from_state(status, state));
             }
             if state.already_signed || state.home_already_signed {
-                return Ok(result_from_state(SigninStatus::AlreadySigned, state));
+                let status = if dedicated_page && !clicked_action_key.is_empty() {
+                    state.message.clear();
+                    SigninStatus::Success
+                } else {
+                    SigninStatus::AlreadySigned
+                };
+                return Ok(result_from_state(status, state));
             }
             if state.has_login_form {
                 return Ok(SigninResult::failure(
@@ -438,7 +489,7 @@ impl CdpClient {
                     continue;
                 }
             }
-            if ready_steps >= 16 && !state.has_challenge {
+            if ready_steps >= ready_limit && !state.has_challenge {
                 if adapter == SigninAdapter::Dian115 {
                     return Ok(SigninResult::failure(if clicked_action_key.is_empty() {
                         "癫影签到页未找到可用的“普通签到”按钮，也未识别到今日签到结果"
@@ -626,6 +677,9 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
     };
     const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
     const bodyText = clean(document.body?.innerText || '');
+    const path = location.pathname.replace(/\/$/, '');
+    const dian115Page = location.hostname === 'm.dian115.com' && path === '/me/signin';
+    const hxptPage = ['hxpt.org', 'www.hxpt.org'].includes(location.hostname) && path === '/checkin';
     const elements = Array.from(document.querySelectorAll('a, button, input[type="submit"], input[type="button"]'));
     const textOf = (el) => clean(
         el.innerText
@@ -659,11 +713,13 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         || Boolean(accountHeader && signedPattern.test(clean(accountHeader.innerText)));
     const actionCandidates = elements.map((el, index) => ({ el, index, text: textOf(el) })).filter(({ el, text }) => {
         if (!visible(el) || el.tagName === 'A' || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+        if (dian115Page) {
+            return text === '普通签到' || (el.matches('button.signin-mode.is-solid') && /^普通签到\s/.test(text));
+        }
         const selectedNavigation = el.getAttribute('aria-pressed') === 'true'
             || el.getAttribute('aria-selected') === 'true'
             || el.dataset?.state === 'active';
-        return (exactActionPattern.test(text)
-            || (location.hostname === 'm.dian115.com' && text === '普通签到'))
+        return exactActionPattern.test(text)
             && !/(登录|登入|login)/i.test(text)
             && !selectedNavigation;
     }).sort((left, right) => Number(/^立即/i.test(right.text)) - Number(/^立即/i.test(left.text)));
@@ -714,24 +770,29 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
     const hasLoginForm = Boolean(document.querySelector('input[type="password"]'))
         && (Boolean(document.querySelector('form[action*="login" i], input[name="username" i], input[name="uid" i]'))
             || (location.hostname === 'm.dian115.com' && location.pathname === '/login'
-                && Boolean(document.querySelector('input[type="email"]'))));
+                && Boolean(document.querySelector('input[type="email"]')))
+            || (['hxpt.org', 'www.hxpt.org'].includes(location.hostname) && path === '/login'));
     const nexusphpLike = Boolean(document.querySelector(
         'a[href*="torrents.php"], a[href*="userdetails.php"], a[href*="attendance.php"], a[href*="logout.php"]'
     ));
     const hasInteractiveQuestion = Boolean(document.querySelector('input[type="radio"], select[name*="answer" i], input[name*="answer" i]'));
     const completedAttendancePattern = /第\s*\d+\s*次(?:签到|簽到).{0,80}(?:已)?(?:连续|連續)(?:签到|簽到)\s*\d+\s*(?:天|日)/i;
-    const dian115Result = location.hostname === 'm.dian115.com'
-        ? Array.from(document.querySelectorAll('div.mt-6.rounded.p-4.text-left'))
+    const dian115Result = dian115Page
+        ? Array.from(document.querySelectorAll('.signin-result, div.mt-6.rounded.p-4.text-left'))
             .map((el) => clean(el.textContent))
-            .find((text) => /^(普通签到|运气签到).{0,15}[+\-]\d+\s*积分\s*余额\s*\d+/i.test(text)) || ''
+            .find((text) => /^(普通签到|运气签到)[^\d+\-]{0,15}[+\-]\d[\d,]*\s*(?:积分\s*)?余额\s*\d/i.test(text)) || ''
         : '';
-    const dian115Award = dian115Result.match(/([+\-]\d+)\s*积分/);
+    const dian115Award = dian115Result.match(/([+\-]\d[\d,]*)/);
+    const dian115Signed = dian115Page && elements.some((el) => visible(el)
+        && el.matches('button.signin-mode.is-solid') && /^签到完成(?:\s|$)/.test(textOf(el)));
+    const hxptSigned = hxptPage && /(?:^|\n)\s*(?:今日已签到|已签到|(?:already\s+)?checked[ -]?in(?:\s+today)?)\s*(?:\n|$)/i
+        .test(document.querySelector('main')?.innerText || '');
     // HDDolby 的重复签到页仍保留页头“签到已得”，应优先采用正文的“今天已经签到过了”。
     const explicitAlreadySigned = /(?:今天|今日|本日).{0,8}已(?:经|經)?(?:签到|簽到)|请勿重[复複]刷新/i.test(bodyText);
-    const success = location.hostname === 'm.dian115.com'
+    const success = dian115Page
         ? Boolean(dian115Result)
         : !explicitAlreadySigned && (successPattern.test(bodyText) || completedAttendancePattern.test(bodyText));
-    const alreadySigned = !success && signedPattern.test(bodyText);
+    const alreadySigned = !success && (dian115Signed || hxptSigned || signedPattern.test(bodyText));
     const explicitFailure = failurePattern.test(bodyText);
     const resultMessage = Array.from(document.querySelectorAll('h1, h2, h3, .message, .alert, .attendance-card__title'))
         .map((el) => clean(el.textContent))
@@ -748,6 +809,8 @@ const SIGNIN_STATE_EXPRESSION: &str = r#"(() => {
         success,
         alreadySigned,
         hasLoginForm,
+        maintenance: ['ptsbao.club', 'www.ptsbao.club'].includes(location.hostname)
+            && /站点关闭维护中|站點關閉維護中/.test(bodyText),
         hasChallenge,
         challengeReady,
         hasInteractiveQuestion,
@@ -950,7 +1013,21 @@ const API_SIGNIN_EXPRESSION: &str = r#"(async () => {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiSigninKind, SigninAdapter};
+    use super::{dolby, ApiSigninKind, SigninAdapter};
+
+    #[test]
+    fn dolby_two_factor_requires_the_exact_https_site_and_path() {
+        assert!(dolby::is_verification_page("https://uhddolby.com/take2fa.php?returnto=%2F"));
+        assert!(dolby::is_verification_page("https://www.uhddolby.com/take2fa.php"));
+        assert!(!dolby::is_verification_page("http://www.uhddolby.com/take2fa.php"));
+        assert!(!dolby::is_verification_page("https://www.uhddolby.com:8443/take2fa.php"));
+        assert!(!dolby::is_verification_page("https://uhddolby.com.example/take2fa.php"));
+        assert!(!dolby::is_verification_page("https://uhddolby.com/attendance.php"));
+        assert!(dolby::same_page(
+            "https://uhddolby.com/attendance.php",
+            "https://www.uhddolby.com/attendance.php",
+        ));
+    }
 
     #[test]
     fn selects_jying_page_without_api_fallback() {
@@ -976,6 +1053,16 @@ mod tests {
         let adapter = SigninAdapter::from_url("https://m.dian115.com/");
         assert_eq!(adapter, SigninAdapter::Dian115);
         assert_eq!(adapter.fallback_url("https://m.dian115.com/"), "https://m.dian115.com/me/signin");
+    }
+
+    #[test]
+    fn selects_hxpt_checkin_on_the_exact_site() {
+        let adapter = SigninAdapter::from_url("https://www.hxpt.org/");
+        assert_eq!(adapter, SigninAdapter::Hxpt);
+        assert_eq!(adapter.fallback_url("https://www.hxpt.org/"), "https://www.hxpt.org/checkin");
+        assert!(adapter.matches_checkin_page("https://www.hxpt.org/checkin"));
+        assert!(!adapter.matches_checkin_page("https://www.hxpt.org/"));
+        assert!(!adapter.matches_checkin_page("https://www.hxpt.org.example/checkin"));
     }
 
     #[test]

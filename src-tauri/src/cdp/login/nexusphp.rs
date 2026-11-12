@@ -66,6 +66,9 @@ impl CdpClient {
                     return Err((CDP_CANCELLED.to_string(), last_remaining_attempts));
                 }
                 if let Some(current) = nexus_login_page_state(&mut websocket) {
+                    if current.maintenance {
+                        return Err((format!("{} 正在维护，暂时无法登录", site_name), last_remaining_attempts));
+                    }
                     if let Some(rem) = current.remaining_attempts {
                         last_remaining_attempts = Some(rem);
                     }
@@ -624,6 +627,9 @@ impl CdpClient {
                 let Some(current) = nexus_login_page_state(&mut websocket) else {
                     continue;
                 };
+                if current.maintenance {
+                    return Err((format!("{} 正在维护，暂时无法登录", site_name), last_remaining_attempts));
+                }
                 if let Some(rem) = current.remaining_attempts {
                     last_remaining_attempts = Some(rem);
                 }

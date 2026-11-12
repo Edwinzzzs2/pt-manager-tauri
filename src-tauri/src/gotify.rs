@@ -6,6 +6,9 @@ use std::time::Duration;
 
 const REPORT_SCHEMA: &str = "pt-manager.keepalive.report";
 const REPORT_VERSION: u8 = 1;
+const SUCCESS_NAMES_FIRST: usize = 3;
+const SUCCESS_NAMES_LAST: usize = 2;
+const SUCCESS_DETAIL_LIMIT: usize = 3;
 
 fn human_value(value: &str) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -27,6 +30,45 @@ fn human_optional(value: Option<&str>) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(human_value)
         .unwrap_or_else(|| "未获取".to_string())
+}
+
+fn summarize_success_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let names: Vec<_> = names.collect();
+    if names.is_empty() {
+        return "无".to_string();
+    }
+    let limit = SUCCESS_NAMES_FIRST + SUCCESS_NAMES_LAST;
+    if names.len() <= limit {
+        return names
+            .into_iter()
+            .map(human_value)
+            .collect::<Vec<_>>()
+            .join("、");
+    }
+
+    let first = names[..SUCCESS_NAMES_FIRST]
+        .iter()
+        .map(|name| human_value(name))
+        .collect::<Vec<_>>()
+        .join("、");
+    let last = names[names.len() - SUCCESS_NAMES_LAST..]
+        .iter()
+        .map(|name| human_value(name))
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("{first}、…省略 {} 项…、{last}", names.len() - limit)
+}
+
+fn append_success_details(lines: &mut Vec<String>, details: impl ExactSizeIterator<Item = String>) {
+    let count = details.len();
+    if count == 0 {
+        lines.push("- 无".to_string());
+        return;
+    }
+    lines.extend(details.take(SUCCESS_DETAIL_LIMIT));
+    if count > SUCCESS_DETAIL_LIMIT {
+        lines.push(format!("- …另有 {} 项", count - SUCCESS_DETAIL_LIMIT));
+    }
 }
 
 fn signin_status_code(status: SigninStatus) -> &'static str {
@@ -71,42 +113,24 @@ fn build_report(
         .filter(|(_, result)| !result.successful())
         .collect::<Vec<_>>();
 
-    let login_success_names = if login_success_sites.is_empty() {
-        "无".to_string()
-    } else {
-        login_success_sites
+    let login_success_names =
+        summarize_success_names(login_success_sites.iter().map(|name| name.as_str()));
+    let signin_success_names =
+        summarize_success_names(successful_signins.iter().map(|(name, _)| name.as_str()));
+    let traffic_for_site = |name: &str| {
+        traffic_results
             .iter()
-            .map(|name| human_value(name))
-            .collect::<Vec<_>>()
-            .join("、")
+            .find(|(traffic_name, _)| traffic_name == name)
+            .map(|(_, traffic)| traffic)
     };
-    let login_failed_names = if failed_sites.is_empty() {
-        "无".to_string()
-    } else {
-        failed_sites
-            .iter()
-            .map(|(name, _)| human_value(name))
-            .collect::<Vec<_>>()
-            .join("、")
-    };
-    let signin_success_names = if successful_signins.is_empty() {
-        "无".to_string()
-    } else {
-        successful_signins
-            .iter()
-            .map(|(name, _)| human_value(name))
-            .collect::<Vec<_>>()
-            .join("、")
-    };
-    let signin_failed_names = if failed_signins.is_empty() {
-        "无".to_string()
-    } else {
-        failed_signins
-            .iter()
-            .map(|(name, _)| human_value(name))
-            .collect::<Vec<_>>()
-            .join("、")
-    };
+    let traffic_details: Vec<_> = login_success_sites
+        .iter()
+        .filter_map(|name| {
+            traffic_for_site(name)
+                .filter(|traffic| traffic.available())
+                .map(|traffic| (*name, traffic))
+        })
+        .collect();
 
     let mut lines = vec![
         "## 1. 登录与流量".to_string(),
@@ -115,27 +139,22 @@ fn build_report(
             login_success_sites.len(),
             login_success_names
         ),
-        format!("❌ **失败 {}**：{}", failed_sites.len(), login_failed_names),
+        format!("❌ **失败 {}**", failed_sites.len()),
         String::new(),
         "**流量明细**".to_string(),
     ];
-    if login_success_sites.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for name in &login_success_sites {
-            let traffic = traffic_results
-                .iter()
-                .find(|(traffic_name, _)| traffic_name == *name)
-                .map(|(_, traffic)| traffic);
-            lines.push(format!(
+    append_success_details(
+        &mut lines,
+        traffic_details.into_iter().map(|(name, traffic)| {
+            format!(
                 "- **{}**　↑{}　↓{}　比 {}",
                 human_value(name),
-                human_optional(traffic.and_then(|value| value.upload.as_deref())),
-                human_optional(traffic.and_then(|value| value.download.as_deref())),
-                human_optional(traffic.and_then(|value| value.ratio.as_deref()))
-            ));
-        }
-    }
+                human_optional(traffic.upload.as_deref()),
+                human_optional(traffic.download.as_deref()),
+                human_optional(traffic.ratio.as_deref())
+            )
+        }),
+    );
     lines.push(String::new());
     lines.push("**登录失败原因**".to_string());
     if failed_sites.is_empty() {
@@ -155,32 +174,23 @@ fn build_report(
         successful_signins.len(),
         signin_success_names
     ));
-    lines.push(format!(
-        "❌ **失败 {}**：{}",
-        failed_signins.len(),
-        signin_failed_names
-    ));
+    lines.push(format!("❌ **失败 {}**", failed_signins.len()));
     lines.push(String::new());
     lines.push("**签到成功明细**".to_string());
-    if successful_signins.is_empty() {
-        lines.push("- 无".to_string());
-    } else {
-        for (name, result) in &successful_signins {
-            lines.push(format!(
-                "- **{}**　{}　连续 {}　累计 {}",
+    append_success_details(
+        &mut lines,
+        successful_signins.iter().map(|(name, result)| {
+            format!(
+                "- **{}**　{}　累计 {}",
                 human_value(name),
                 signin_status_label(result.status),
-                result
-                    .consecutive_days
-                    .map(|days| format!("{days} 天"))
-                    .unwrap_or_else(|| "未获取".to_string()),
                 result
                     .total_days
                     .map(|days| format!("{days} 天"))
                     .unwrap_or_else(|| "未获取".to_string())
-            ));
-        }
-    }
+            )
+        }),
+    );
     lines.push(String::new());
     lines.push("**签到失败原因**".to_string());
     if failed_signins.is_empty() {
@@ -198,10 +208,7 @@ fn build_report(
     let login_success_json = login_success_sites
         .iter()
         .map(|name| {
-            let traffic = traffic_results
-                .iter()
-                .find(|(traffic_name, _)| traffic_name == *name)
-                .map(|(_, traffic)| traffic);
+            let traffic = traffic_for_site(name);
             json!({
                 "site": name,
                 "upload": traffic.and_then(|value| value.upload.as_deref()),
@@ -445,7 +452,7 @@ mod tests {
             concat!(
                 "## 1. 登录与流量\n",
                 "✅ **成功 1**：观众\n",
-                "❌ **失败 1**：失败站\n",
+                "❌ **失败 1**\n",
                 "\n",
                 "**流量明细**\n",
                 "- **观众**　↑10 TB　↓5 TB　比 2\n",
@@ -455,10 +462,10 @@ mod tests {
                 "\n",
                 "## 2. 签到\n",
                 "✅ **成功 1**：观众\n",
-                "❌ **失败 1**：失败站\n",
+                "❌ **失败 1**\n",
                 "\n",
                 "**签到成功明细**\n",
-                "- **观众**　签到成功　连续 7 天　累计 30 天\n",
+                "- **观众**　签到成功　累计 30 天\n",
                 "\n",
                 "**签到失败原因**\n",
                 "- **失败站**：未找到签到入口"
@@ -469,5 +476,78 @@ mod tests {
         assert_eq!(report["login"]["success"][0]["upload"], "10 TB");
         assert_eq!(report["signin"]["success"][0]["consecutive_days"], 7);
         assert_eq!(report["signin"]["failure"][0]["reason"], "未找到签到入口");
+
+        let plain = build_plain_report(
+            &successful_sites,
+            &failed_sites,
+            &signin_results,
+            &traffic_results,
+        );
+        assert!(plain.contains("- 观众　签到成功　累计 30 天"));
+        assert!(!plain.contains("连续"));
+    }
+
+    #[test]
+    fn notification_limits_success_previews_and_keeps_every_failure() {
+        let successful_sites: Vec<_> = (1..=8).map(|index| format!("站点{index}")).collect();
+        let failed_sites: Vec<_> = (1..=6)
+            .map(|index| (format!("故障站{index}"), format!("登录原因{index}")))
+            .collect();
+        let traffic_results: Vec<_> = successful_sites
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    SiteTraffic {
+                        upload: Some("1 TB".to_string()),
+                        download: None,
+                        ratio: None,
+                    },
+                )
+            })
+            .collect();
+        let mut signin_results: Vec<_> = successful_sites
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    SigninResult {
+                        status: SigninStatus::AlreadySigned,
+                        message: "今日已签到".to_string(),
+                        reward: None,
+                        total_days: Some(30),
+                        consecutive_days: None,
+                    },
+                )
+            })
+            .collect();
+        signin_results.extend(failed_sites.iter().enumerate().map(|(index, (name, _))| {
+            (
+                name.clone(),
+                SigninResult::failure(format!("签到原因{}", index + 1)),
+            )
+        }));
+
+        let (message, report) = build_report(
+            &successful_sites,
+            &failed_sites,
+            &signin_results,
+            &traffic_results,
+        );
+        assert_eq!(
+            message
+                .matches("站点1、站点2、站点3、…省略 3 项…、站点7、站点8")
+                .count(),
+            2
+        );
+        assert_eq!(message.matches("- …另有 5 项").count(), 2);
+        assert_eq!(message.matches("↑1 TB").count(), 3);
+        assert_eq!(message.matches("今日已签到　累计 30 天").count(), 3);
+        for (index, (name, reason)) in failed_sites.iter().enumerate() {
+            assert!(message.contains(&format!("- **{name}**：{reason}")));
+            assert!(message.contains(&format!("- **{name}**：签到原因{}", index + 1)));
+        }
+        assert_eq!(report["login"]["success"].as_array().unwrap().len(), 8);
+        assert_eq!(report["signin"]["success"].as_array().unwrap().len(), 8);
     }
 }

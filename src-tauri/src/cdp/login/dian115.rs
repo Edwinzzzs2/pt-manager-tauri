@@ -97,7 +97,8 @@ fn page_state(websocket: &mut CdpWebSocket) -> Option<PageState> {
         const account = document.querySelector('a[href="/me"], a[href^="/me/"], a[href="https://m.dian115.com/me"], button .lucide-wallet-icon');
         const verification = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="recaptcha"], .cf-turnstile, .g-recaptcha');
         const errors = Array.from(document.querySelectorAll('[role="alert"], [data-sonner-toast], .toast-error, .text-destructive'))
-            .map(el => (el.innerText || '').trim()).filter(text => text && text.length < 240);
+            .map(el => (el.innerText || '').trim())
+            .filter(text => text.length < 240 && /失败|失敗|错误|錯誤|无效|無效|不正确|不正確|拒绝|拒絕|failed|invalid/i.test(text));
         return {
             ready: document.readyState === 'interactive' || document.readyState === 'complete',
             path: location.pathname,

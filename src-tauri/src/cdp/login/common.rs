@@ -84,6 +84,7 @@ pub(super) struct NexusLoginPageState {
     pub(super) has_captcha: bool,
     pub(super) has_two_factor: bool,
     pub(super) challenge: bool,
+    pub(super) maintenance: bool,
     pub(super) logged_in: bool,
     pub(super) is_failure_page: bool,
     pub(super) remaining_attempts: Option<u32>,
@@ -107,6 +108,8 @@ pub(super) fn nexus_login_page_state(websocket: &mut CdpWebSocket) -> Option<Nex
             hasCaptcha: Boolean(captcha && captcha.type !== 'hidden'),
             hasTwoFactor: Boolean(two_factor),
             challenge: /just a moment|checking your browser|cloudflare|请稍候/i.test(document.title || '') || Boolean(document.querySelector('#challenge-stage, #challenge-running')),
+            maintenance: ['ptsbao.club', 'www.ptsbao.club'].includes(location.hostname)
+                && /站点关闭维护中|站點關閉維護中/.test(rawBody),
             loggedIn: Boolean(logout) || body.includes('分享率') || body.includes('上传') || body.includes('上傳') || body.includes('下载') || body.includes('下載') || body.includes('魔力') || body.includes('ratio') || body.includes('uploaded') || body.includes('downloaded'),
             isFailurePage: Boolean(isFailurePage),
             remainingAttempts: attempts ? Number(attempts[1]) : null
@@ -129,6 +132,7 @@ pub(super) fn nexus_login_page_state(websocket: &mut CdpWebSocket) -> Option<Nex
         has_captcha: value.get("hasCaptcha")?.as_bool()?,
         has_two_factor: value.get("hasTwoFactor")?.as_bool()?,
         challenge: value.get("challenge")?.as_bool()?,
+        maintenance: value.get("maintenance")?.as_bool()?,
         logged_in: value.get("loggedIn")?.as_bool()?,
         is_failure_page: value.get("isFailurePage")?.as_bool()?,
         remaining_attempts: value
