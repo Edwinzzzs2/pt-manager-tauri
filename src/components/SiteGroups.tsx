@@ -202,7 +202,8 @@ export function BrowserEnvironmentFields({ settings, onChange, disabled, hintCla
           value={settings.language} onChange={(event) => onChange({ ...settings, language: event.target.value })} />
       </label>
       <p className={hintClassName}>
-        应用于 PT Manager 打开的站点页面。留空时沿用浏览器默认环境。保活计划仍按本机时区执行。
+        应用于本组专用浏览器，包括手动打开的标签页和窗口。留空时使用浏览器默认环境。
+        PT Manager 运行期间持续应用；保活计划按本机时区执行。
       </p>
     </>
   );

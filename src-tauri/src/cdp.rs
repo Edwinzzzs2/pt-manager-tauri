@@ -26,6 +26,8 @@ pub use signin::{SigninResult, SigninStatus};
 pub use traffic::SiteTraffic;
 
 const MAX_CDP_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+// 导航可能等待站点响应或重定向，不能沿用本机 CDP 连接的 5～10 秒超时。
+const CDP_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Deserialize, Debug)]
 pub struct CdpTab {
@@ -197,6 +199,7 @@ impl CdpClient {
             .is_available_with_timeout(Duration::from_millis(600))
             .await
         {
+            self.prepare_environment().ok()?;
             return Some(self.port);
         }
 
@@ -212,6 +215,7 @@ impl CdpClient {
                 .is_available_with_timeout(Duration::from_millis(600))
                 .await
             {
+                candidate.prepare_environment().ok()?;
                 return Some(port);
             }
         }
@@ -222,6 +226,13 @@ impl CdpClient {
     /// 检测所选浏览器是否以调试模式运行。
     pub async fn is_available(&self) -> bool {
         self.is_available_with_timeout(Duration::from_secs(3)).await
+    }
+
+    fn prepare_environment(&self) -> Result<(), String> {
+        if self.environment.is_default() {
+            return Ok(());
+        }
+        environment::ensure(self.port, &self.browser_session()?, &self.environment)
     }
 
     async fn is_available_with_timeout(&self, timeout: Duration) -> bool {
@@ -318,6 +329,7 @@ impl CdpClient {
         .await;
         if self.is_available().await {
             check_cancel(progress)?;
+            self.prepare_environment()?;
             log_progress(progress, format!("配置端口 localhost:{} 已响应", self.port)).await;
             let opened_initial_urls = self.ensure_initial_urls(initial_urls, progress).await?;
             return Ok(CdpLaunchResult {
@@ -444,14 +456,9 @@ impl CdpClient {
 
     /// 在所选浏览器中打开新标签页，返回 tab ID。
     pub async fn open_tab(&self, url: &str) -> Result<String, String> {
+        self.prepare_environment()?;
         let custom_environment = !self.environment.is_default() && url != "about:blank";
-        let target = if custom_environment {
-            let _ = self.list_tabs();
-            "about:blank"
-        } else {
-            url
-        };
-        let encoded = encode_cdp_target_url(target);
+        let encoded = encode_cdp_target_url(if custom_environment { "about:blank" } else { url });
         let response = self.request(
             "PUT",
             &format!("/json/new?{}", encoded),
@@ -463,7 +470,7 @@ impl CdpClient {
 
         let tab = serde_json::from_str::<CdpTab>(&response.body).map_err(|err| err.to_string())?;
         if custom_environment {
-            if let Err(error) = environment::navigate(self.port, &tab, &self.environment, url) {
+            if let Err(error) = environment::navigate(&tab, &self.environment, url) {
                 let _ = self.close_tab(&tab.id).await;
                 return Err(error);
             }
@@ -472,27 +479,26 @@ impl CdpClient {
     }
 
     fn list_tabs(&self) -> Result<Vec<CdpTab>, String> {
-        let requested_at = Instant::now();
         let response = self.request("GET", "/json/list", Duration::from_secs(5))?;
         if !(200..300).contains(&response.status) {
             return Err(format!("CDP 返回 HTTP {}", response.status));
         }
         let tabs: Vec<CdpTab> = serde_json::from_str(&response.body).map_err(|err| err.to_string())?;
-        environment::retain_open_tabs(self.port, &tabs, requested_at);
         Ok(tabs)
     }
 
     /// 查找已经打开到相同站点的标签页，避免启动后重复打开同一个站点。
     pub async fn find_tab_for_url(&self, url: &str) -> Option<String> {
-        self.find_site_tab(url, |tab| environment::matches(self.port, &tab.id, &self.environment))
+        self.prepare_environment().ok()?;
+        self.find_site_tab(url)
     }
 
-    fn find_site_tab(&self, url: &str, can_reuse: impl Fn(&CdpTab) -> bool) -> Option<String> {
+    fn find_site_tab(&self, url: &str) -> Option<String> {
         let expected_host = host_from_url(url)?;
         self.list_tabs().ok()?.into_iter()
             .filter(|tab| tab.tab_type.as_deref() == Some("page"))
             .find(|tab| {
-                can_reuse(tab) && tab.url
+                tab.url
                     .as_deref()
                     .and_then(host_from_url)
                     .map(|host| host == expected_host)
@@ -552,7 +558,7 @@ impl CdpClient {
             let Some(host) = host_from_url(&origin) else {
                 continue;
             };
-            let Some(tab_id) = self.find_site_tab(&origin, |_| true) else {
+            let Some(tab_id) = self.find_site_tab(&origin) else {
                 continue;
             };
             let Some(websocket_url) = self.websocket_url_for_tab(&tab_id)? else {
@@ -875,7 +881,6 @@ impl CdpClient {
             Duration::from_secs(10),
         )?;
         if (200..300).contains(&response.status) {
-            environment::remove_tab(self.port, tab_id);
             Ok(())
         } else {
             Err(format!("CDP 返回 HTTP {}", response.status))
@@ -1390,6 +1395,7 @@ fn parse_http_response(raw: &str) -> Result<HttpResponse, String> {
 struct CdpWebSocket {
     stream: TcpStream,
     next_id: u64,
+    attachment_events: Option<std::collections::VecDeque<serde_json::Value>>,
 }
 
 impl CdpWebSocket {
@@ -1421,7 +1427,7 @@ impl CdpWebSocket {
             return Err("CDP WebSocket 握手失败".to_string());
         }
 
-        Ok(Self { stream, next_id: 1 })
+        Ok(Self { stream, next_id: 1, attachment_events: None })
     }
 
     fn call(
@@ -1429,7 +1435,24 @@ impl CdpWebSocket {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        self.call_in_session(method, params, None)
+        if method != "Page.navigate" {
+            return self.call_in_session(method, params, None);
+        }
+
+        let previous_timeout = self.stream.read_timeout().map_err(|err| err.to_string())?;
+        self.stream
+            .set_read_timeout(Some(CDP_NAVIGATION_TIMEOUT))
+            .map_err(|err| err.to_string())?;
+        let result = self.call_in_session(method, params, None);
+        // 包括导航失败的情况，后续页面状态读取仍使用原来的短超时。
+        let restored = self.stream.set_read_timeout(previous_timeout);
+        match result {
+            Ok(response) => {
+                restored.map_err(|err| err.to_string())?;
+                Ok(response)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn call_in_session(
@@ -1456,6 +1479,12 @@ impl CdpWebSocket {
                 .map_err(|err| format!("{method}：{err}"))?;
             let value = serde_json::from_str::<serde_json::Value>(&message)
                 .map_err(|err| format!("CDP WebSocket 响应解析失败：{}", err))?;
+            if value.get("method").and_then(|method| method.as_str()) == Some("Target.attachedToTarget") {
+                if let Some(events) = &mut self.attachment_events {
+                    events.push_back(value);
+                    continue;
+                }
+            }
             if value.get("id").and_then(|value| value.as_u64()) == Some(id) {
                 if let Some(error) = value.get("error") {
                     return Err(format!("CDP 方法 {} 调用失败：{}", method, error));
@@ -1694,7 +1723,10 @@ async fn launch_and_wait(
     )
     .await;
     let _ = fs::remove_file(devtools_port_path(profile_dir));
-    launch_browser(browser, profile_dir, &launch_urls, fixed_port, proxy_address, client.profile_group.is_some())?;
+    launch_browser(
+        browser, profile_dir, &launch_urls, fixed_port, proxy_address,
+        client.profile_group.is_some(), &client.environment,
+    )?;
     log_progress(progress, format!("{} 进程已启动，等待 CDP 响应", mode)).await;
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1740,6 +1772,7 @@ async fn launch_and_wait(
             .await
         {
             check_cancel(progress)?;
+            cdp.prepare_environment()?;
             log_progress(progress, format!("CDP localhost:{} 已响应", port)).await;
             let opened_initial_urls = unique_urls(initial_urls).len();
             if opened_initial_urls > 0 {
@@ -1783,6 +1816,7 @@ fn launch_browser(
     fixed_port: Option<u16>,
     proxy_address: Option<&str>,
     force_direct: bool,
+    environment: &BrowserEnvironment,
 ) -> Result<(), String> {
     let browser_path = find_browser_executable(browser).ok_or_else(|| {
         format!(
@@ -1806,6 +1840,11 @@ fn launch_browser(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--new-window");
+
+    if !environment.language.is_empty() {
+        // 首个导航的请求可能早于 CDP 页面附加，语言从浏览器启动时就统一设置。
+        command.arg(format!("--accept-lang={}", environment.language));
+    }
 
     if let Some(address) = proxy_address {
         // 命令行只包含本地转发地址，上游代理密码不会进入进程参数或浏览器 Profile。
