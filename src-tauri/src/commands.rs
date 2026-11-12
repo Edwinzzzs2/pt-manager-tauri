@@ -447,9 +447,13 @@ async fn test_site_login_in_group(state: &AppState, config: AppConfig, site: sto
         cdp = cdp.at_port(result.port);
     }
 
+    let opening_progress = CdpProgress::new(
+        Arc::clone(&state.logs),
+        Arc::clone(&state.task_cancel_requested),
+    );
     let tab_id = match cdp.find_tab_for_url(&site.url).await {
         Some(tab_id) => tab_id,
-        None => cdp.open_tab(&site.url).await?,
+        None => cdp.open_tab_with_progress(&site.url, Some(&opening_progress)).await?,
     };
     if is_nexusphp && !config.ocr_server_url.is_empty() {
         push_log(&state.logs, LogEntry::info("正在检查并初始化 OCR 服务...")).await;

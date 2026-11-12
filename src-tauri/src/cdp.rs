@@ -456,9 +456,18 @@ impl CdpClient {
 
     /// 在所选浏览器中打开新标签页，返回 tab ID。
     pub async fn open_tab(&self, url: &str) -> Result<String, String> {
+        self.open_tab_with_progress(url, None).await
+    }
+
+    pub async fn open_tab_with_progress(
+        &self,
+        url: &str,
+        progress: Option<&CdpProgress>,
+    ) -> Result<String, String> {
+        check_cancel(progress)?;
         self.prepare_environment()?;
-        let custom_environment = !self.environment.is_default() && url != "about:blank";
-        let encoded = encode_cdp_target_url(if custom_environment { "about:blank" } else { url });
+        // 统一从空白页导航，默认环境也能检查网络错误并重试。
+        let encoded = encode_cdp_target_url("about:blank");
         let response = self.request(
             "PUT",
             &format!("/json/new?{}", encoded),
@@ -469,8 +478,8 @@ impl CdpClient {
         }
 
         let tab = serde_json::from_str::<CdpTab>(&response.body).map_err(|err| err.to_string())?;
-        if custom_environment {
-            if let Err(error) = environment::navigate(&tab, &self.environment, url) {
+        if url.trim() != "about:blank" {
+            if let Err(error) = environment::navigate(&tab, &self.environment, url, progress).await {
                 let _ = self.close_tab(&tab.id).await;
                 return Err(error);
             }
@@ -864,7 +873,7 @@ impl CdpClient {
             }
 
             log_progress(progress, format!("通过 CDP 新建标签页：{}", url)).await;
-            self.open_tab(url)
+            self.open_tab_with_progress(url, progress)
                 .await
                 .map_err(|err| format!("CDP 已连接，但打开站点 {} 失败：{}", url, err))?;
             opened_count += 1;
@@ -1439,9 +1448,18 @@ impl CdpWebSocket {
             return self.call_in_session(method, params, None);
         }
 
+        self.call_with_timeout(method, params, CDP_NAVIGATION_TIMEOUT)
+    }
+
+    fn call_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
         let previous_timeout = self.stream.read_timeout().map_err(|err| err.to_string())?;
         self.stream
-            .set_read_timeout(Some(CDP_NAVIGATION_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(|err| err.to_string())?;
         let result = self.call_in_session(method, params, None);
         // 包括导航失败的情况，后续页面状态读取仍使用原来的短超时。

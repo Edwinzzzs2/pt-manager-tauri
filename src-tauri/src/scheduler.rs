@@ -993,6 +993,7 @@ async fn run_keepalive_batch(
     let mut signin_results = Vec::new();
     let mut traffic_targets: Vec<(Site, String)> = Vec::new();
     let mut traffic_results = Vec::new();
+    let opening_progress = CdpProgress::new(Arc::clone(logs), Arc::clone(task_cancel_requested));
 
     for site in config.sites.iter() {
         if task_cancel_requested.load(Ordering::SeqCst) {
@@ -1052,11 +1053,23 @@ async fn run_keepalive_batch(
         let opened_tab = if launched_with_initial_sites {
             match cdp.find_tab_for_url(&site.url).await {
                 Some(tab_id) => Ok(tab_id),
-                None => cdp.open_tab(&site.url).await,
+                None => cdp.open_tab_with_progress(&site.url, Some(&opening_progress)).await,
             }
         } else {
-            cdp.open_tab(&site.url).await
+            cdp.open_tab_with_progress(&site.url, Some(&opening_progress)).await
         };
+
+        if task_cancel_requested.load(Ordering::SeqCst) {
+            for job in login_jobs {
+                job.abort();
+                let _ = job.await;
+            }
+            if let Ok(tab_id) = &opened_tab {
+                let _ = cdp.close_tab(tab_id).await;
+            }
+            close_opened_tabs_or_browser(cdp, logs, opened_tabs, launched_browser).await;
+            return true;
+        }
 
         match opened_tab {
             Ok(tab_id) => {
