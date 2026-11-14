@@ -171,10 +171,12 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     #[cfg(not(target_os = "windows"))]
     let icon = app.default_window_icon().unwrap().clone();
 
-    let _tray = TrayIconBuilder::with_id("main-tray")
-        .icon(icon)
-        .menu(&menu)
-        .tooltip("PT Manager — 保活运行中")
+    let tray = TrayIconBuilder::with_id("main-tray").icon(icon).menu(&menu);
+    // macOS 原生菜单栏悬停提示偶尔会残留在其他窗口上方。
+    #[cfg(not(target_os = "macos"))]
+    let tray = tray.tooltip("PT Manager — 保活运行中");
+
+    let _tray = tray
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
                 show_main_window(app);
