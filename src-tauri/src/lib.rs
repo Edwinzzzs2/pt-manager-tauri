@@ -172,9 +172,10 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let icon = app.default_window_icon().unwrap().clone();
 
     let tray = TrayIconBuilder::with_id("main-tray").icon(icon).menu(&menu);
-    // macOS 原生菜单栏悬停提示偶尔会残留在其他窗口上方。
+    // macOS 原生菜单栏悬停提示偶尔会残留在其他窗口上方，不注册提示。
+    // 其他平台只显示应用名；固定提示不能代表实际任务运行状态。
     #[cfg(not(target_os = "macos"))]
-    let tray = tray.tooltip("PT Manager — 保活运行中");
+    let tray = tray.tooltip("PT Manager");
 
     let _tray = tray
         .on_menu_event(|app, event| match event.id().as_ref() {
